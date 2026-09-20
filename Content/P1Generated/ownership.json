@@ -1,0 +1,58 @@
+{
+  "recipe_sha256": "00505b9436f1e9d0ed9be2bf72b30df21eeb07a4be33a454fa378c5be910210e",
+  "assets": {
+    "Content/P1Generated/M_Terrain_ClearMidday.uasset": {
+      "class": "Material",
+      "sha256": "d35757e710e015923f3d844c824882f501918670dd015f18b61621584e8a21ce",
+      "properties": {
+        "role": "clear-midday terrain",
+        "slope_aware": true,
+        "altitude_aware": true,
+        "cover_aware": true,
+        "topology_profile_independent": true
+      }
+    },
+    "Content/P1Generated/M_Terrain_LowAngle.uasset": {
+      "class": "Material",
+      "sha256": "8889e04323f251b3dc93fbb05027d6537539e5be770a48430af7cfe2706498bc",
+      "properties": {
+        "role": "low-angle terrain",
+        "slope_aware": true,
+        "altitude_aware": true,
+        "cover_aware": true,
+        "topology_profile_independent": true
+      }
+    },
+    "Content/P1Generated/M_Terrain_Overcast.uasset": {
+      "class": "Material",
+      "sha256": "126a882bf99ad9178015e4f8819bec53f681bf6e14e13985bbb9e5353167b5cf",
+      "properties": {
+        "role": "overcast terrain",
+        "slope_aware": true,
+        "altitude_aware": true,
+        "cover_aware": true,
+        "topology_profile_independent": true
+      }
+    },
+    "Content/P1Generated/M_Overlay.uasset": {
+      "class": "Material",
+      "sha256": "8c7994c1930275f17aff205fc3062149d6a368122d317aa4a0e142c01b4fa0ff",
+      "properties": {
+        "role": "batched overlay and guest dots",
+        "slope_aware": true,
+        "altitude_aware": true,
+        "cover_aware": true,
+        "topology_profile_independent": true
+      }
+    },
+    "Content/P1Generated/P1Terrain.umap": {
+      "class": "World",
+      "sha256": "f9ecbb06ac15b934663f5baa4834210635f043c1deacfff801d468e4fa2f15ad",
+      "properties": {
+        "world": "Runtime-spawned editable terrain",
+        "beauty_scene": false,
+        "game_mode": "/Script/SkiPresentation.SkiBootstrapGameMode"
+      }
+    }
+  }
+}

@@ -6,6 +6,8 @@ public class SkiPresentation : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PublicDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine", "UMG" });
-        PrivateDependencyModuleNames.AddRange(new[] { "SkiApplication", "Slate", "SlateCore" });
+        PrivateDependencyModuleNames.AddRange(new[] {
+            "SkiApplication", "SkiPreparation", "SkiTerrainRuntime", "Slate", "SlateCore", "WebBrowser", "WebBrowserWidget"
+        });
     }
 }

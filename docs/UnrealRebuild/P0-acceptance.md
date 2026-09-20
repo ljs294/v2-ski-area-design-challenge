@@ -1,6 +1,8 @@
 # P0 implementation evidence
 
-P0 is complete and accepted on 2026-09-19. Native checks passed, the owner confirmed the Shipping build works and approved its visuals, and the owner accepted the historical P0 coordinator exception. Sol completed SEC01/SEC02 closeout within the plan's procedural/source-identity and reviewer-tool boundaries. Future routine work defaults to Sol. All changes remain unstaged and uncommitted; the TypeScript application, existing saves and preparation sources are preserved. P1 is not authorized by this acceptance.
+P0 is complete and accepted on 2026-09-19. Native checks passed, the owner confirmed the Shipping build works and approved its visuals, and the owner accepted the historical P0 coordinator exception. Sol completed SEC01/SEC02 closeout within the plan's procedural/source-identity and reviewer-tool boundaries. P0 landed at commit `31af9880e12bd8230508a42ca6789d405e5b4bbe`; the TypeScript application, existing saves and preparation sources are preserved. P1 is not authorized by this acceptance.
+
+Effective 2026-09-20, **Sol High is the main coordination and implementation agent, replacing Astra. Astra is reserved for specific owner-approved escalations.** Terra High may perform a separately authorized non-author review or explicitly assigned bounded work, but is not the routine parent. Project-local model settings are requests rather than proof of effective backend routing.
 
 ## Executed on 2026-09-18
 
@@ -32,7 +34,7 @@ Latest reports: `check.json`, `domain.json`, `build.json`, `assets.json`, `packa
 - SEC02 passed at the actual client/tool boundary: reviewer metadata was read-only/never; initial shell reads were denied; the immutable-source continuation disabled shell, image, app/plugin/browser/editor-MCP and agent routes and executed no tools. This does not claim independent OS/backend attestation.
 
 - Only one bounded Terra High independent review was authorized and executed. The supplied-text review could not independently inspect asset bytes, runtime artifacts, OS isolation or effective backend model routing. No additional reviewer was launched after the fixes.
-- Before/after hashing is not a continuous source lock; the procedural freeze and immutable-review evidence above supply the additional context for SEC01. The owner accepted the historical Astra/xhigh coordinator exception for P0 on 2026-09-19; it does not authorize routine Astra use going forward.
+- Before/after hashing is not a continuous source lock; the procedural freeze and immutable-review evidence above supply the additional context for SEC01. The owner accepted the historical Astra/xhigh coordinator exception for P0 on 2026-09-19. Sol High replaced Astra as the main agent on 2026-09-20; routine Astra use is not authorized going forward.
 - Asset guards have real repeat-run evidence and synthetic overwrite/ownership negative controls. Unrelated dirty editor state was not deliberately introduced on this PC; intended property records are not a full independent property readback.
 - Owner visual acceptance passed on 2026-09-19. Clean-machine/offline execution and broader GPU qualification have not been performed. No new terrain, simulation or other P1 implementation is included.
-- Existing npm/browser suites were not rerun because application runtime code was unchanged. No benchmark, release commit, staging or distribution was performed.
+- Existing npm/browser suites were not rerun because application runtime code was unchanged. No benchmark or distribution was performed during qualification. The user subsequently staged and committed the accepted P0 tree as `31af9880e12bd8230508a42ca6789d405e5b4bbe`.

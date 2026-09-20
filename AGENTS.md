@@ -1,11 +1,11 @@
 # Mountain Planner agent guide
 
-This file is the canonical repository guidance for Codex, Claude Code, and other repository-aware agents. `CLAUDE.md` must contain only `@AGENTS.md`. If a nested `AGENTS.md` is added, add the same-directory `CLAUDE.md` import with it.
+This is the canonical repository guidance. `CLAUDE.md` must contain only `@AGENTS.md`; pair any nested `AGENTS.md` with the same import.
 
 ## Product and entrypoints
 
-- Unreal P0 is authorized; its scope, commands, evidence and blockers are in `docs/UnrealRebuild/README.md`. Native code lives in `Source/`; `Tools/` owns bootstrap tooling. No P1 gameplay is authorized by P0.
-- Use Sol for routine coordination/implementation; reserve Astra for owner-approved escalations. See the Unreal guide.
+- Unreal P1 is authorized by `docs/UnrealRebuild/P1-runbook.md`; no P2 gameplay is authorized. Native code lives in `Source/`; `Tools/` owns bootstrap tooling.
+- Sol High is the main coordination/implementation agent, replacing Astra. Astra requires owner-approved escalation. Terra High requires separate authorization for non-author review or bounded work.
 - Retain the TypeScript app and its contracts below until preparation extraction and native cutover pass. P0 does not retire entrypoints or migrate saves. Only the user stages/commits. Do not install tools or change global Codex settings without approval.
 
 - The supported app is the React 19 and MapLibre renderer entered through `index.html` and `src/app/main.tsx`.

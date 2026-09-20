@@ -4,11 +4,11 @@ P0 is authorized by the owner's request, "Please proceed with implementing P0". 
 
 ## Status
 
-**P0 is complete and accepted on 2026-09-19.** Standalone C++ checks, the editor build, repeatable asset generation, and cooked Development/Shipping startup checks passed. The owner approved the Shipping visuals and the historical P0 coordinator exception. Sol completed SEC01/SEC02 closeout within the plan's procedural/source-identity and reviewer-tool boundaries. See [acceptance evidence](P0-acceptance.md) and the dated reports under `test-results/p0/`. P1 remains separately authorized work.
+**P0 is complete and accepted on 2026-09-19 and landed as commit `31af9880e12bd8230508a42ca6789d405e5b4bbe`.** Standalone C++ checks, the editor build, repeatable asset generation, and cooked Development/Shipping startup checks passed. The owner approved the Shipping visuals and the historical P0 coordinator exception. Sol completed SEC01/SEC02 closeout within the plan's procedural/source-identity and reviewer-tool boundaries. See [acceptance evidence](P0-acceptance.md) and the dated reports under `test-results/p0/`. P1 is governed by [the P1 runbook](P1-runbook.md).
 
 ## Model usage after P0
 
-The owner's 2026-09-19 direction is Sol for routine coordination and implementation, with Astra reserved for a specific owner-approved escalation. Project defaults request Sol High; verify the actual session model before substantial work, because defaults did not change the earlier active Astra thread. Keep task context, logs and agent count bounded. Independent reviewers remain separately scoped; do not launch extra model sessions just to confirm configuration. The P0 exception is historical, not permission to continue routine Astra work. Global Codex settings remain unchanged.
+Effective 2026-09-20, Sol High is the main agent for routine coordination and implementation, replacing Astra. Astra is reserved for a specific owner-approved escalation. Terra High is limited to separately authorized non-author review or explicitly assigned bounded work. Project defaults request Sol High; verify the actual session model before substantial work because configuration labels are not routing evidence. Keep task context, logs and agent count bounded, and do not launch extra model sessions merely to confirm configuration. The P0 Astra exception is historical. Global Codex settings remain unchanged.
 
 | Section | Implemented here | Acceptance / later scope |
 | --- | --- | --- |
