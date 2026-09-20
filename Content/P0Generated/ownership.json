@@ -1,0 +1,33 @@
+{
+  "recipe_sha256": "65dda1909240ea892fa8c24aea4b2758d58ba3d823853ceaf539576a92f4976a",
+  "assets": {
+    "Content/P0Generated/M_Bootstrap.uasset": {
+      "class": "Material",
+      "sha256": "d080cdb76ac1a8d5f248abf16d6e2da94e51d59a02f4505366fab6f34b6da9fb",
+      "properties": {
+        "base_color": [
+          0.06,
+          0.12,
+          0.18
+        ],
+        "role": "P0 sample only"
+      }
+    },
+    "Content/P0Generated/WBP_Bootstrap.uasset": {
+      "class": "WidgetBlueprint",
+      "sha256": "36da46f0a9c8dcdfec7fa7c63620b2ab0c77ea9f1ceaa78f0627c411d0a84507",
+      "properties": {
+        "parent": "/Script/SkiPresentation.SkiBootstrapWidget",
+        "graphs": "No authored gameplay logic"
+      }
+    },
+    "Content/P0Generated/Bootstrap.umap": {
+      "class": "World",
+      "sha256": "41e94b885e8fb5ece9ece7360b843c5d685343268f9146b0945a48a9cf488fbd",
+      "properties": {
+        "world": "Empty bootstrap",
+        "game_mode": "/Script/SkiPresentation.SkiBootstrapGameMode"
+      }
+    }
+  }
+}

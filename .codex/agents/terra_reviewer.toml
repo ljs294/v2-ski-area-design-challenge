@@ -1,0 +1,32 @@
+# Installed role; effective isolation and actual routing still require verification.
+name = "terra_reviewer"
+description = "Fresh non-author review of frozen native P0 inputs"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+developer_instructions = """
+Review only. Do not repair source or assets, spawn workers, or stage/commit.
+Require effective read-only filesystem AND editor/MCP/connector tool access.
+If that isolation cannot be verified, report BLOCKED; do not claim certification.
+Use exact source hashes and actual native/tooling evidence, separating their classes.
+Do not treat configuration labels as effective model-routing proof.
+"""
+
+# Known write-capable MCP route in the inspected user config. Additional tools
+# still require inventory; this single switch is not complete tool isolation.
+[mcp_servers.node_repl]
+# This client validates a complete transport even for disabled role overrides.
+command = "node"
+enabled = false
+
+[features]
+apps = false
+plugins = false
+browser_use = false
+browser_use_external = false
+browser_use_full_cdp_access = false
+in_app_browser = false
+skill_mcp_dependency_install = false
+
+[agents]
+enabled = false

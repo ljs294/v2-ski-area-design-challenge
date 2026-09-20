@@ -4,6 +4,10 @@ This file is the canonical repository guidance for Codex, Claude Code, and other
 
 ## Product and entrypoints
 
+- Unreal P0 is authorized; its scope, commands, evidence and blockers are in `docs/UnrealRebuild/README.md`. Native code lives in `Source/`; `Tools/` owns bootstrap tooling. No P1 gameplay is authorized by P0.
+- Use Sol for routine coordination/implementation; reserve Astra for owner-approved escalations. See the Unreal guide.
+- Retain the TypeScript app and its contracts below until preparation extraction and native cutover pass. P0 does not retire entrypoints or migrate saves. Only the user stages/commits. Do not install tools or change global Codex settings without approval.
+
 - The supported app is the React 19 and MapLibre renderer entered through `index.html` and `src/app/main.tsx`.
 - Electron starts at `electron/main.ts`; `electron/preload.ts` is the only renderer bridge to desktop IPC.
 - The static web build uses `vite.config.web.ts` and the same React entrypoint.

@@ -1,0 +1,20 @@
+{
+  "engine_version": {
+    "MajorVersion": 5,
+    "MinorVersion": 8,
+    "PatchVersion": 2,
+    "Changelist": 56702186,
+    "CompatibleChangelist": 55116800,
+    "IsLicenseeVersion": 0,
+    "IsPromotedBuild": 1,
+    "BranchName": "++UE5+Release-5.8"
+  },
+  "engine_build_version_sha256": "ff99fc3dd98e7c7fd2f5700334bc792dfb7baced3828cdee32940bb69581a6a4",
+  "msvc_family": "14.44.35207",
+  "msvc_version": "14.44.35229",
+  "msvc_compiler_sha256": "fe251ef50a1545b1b0835ee17b1e785459712b38d79e45b5c1d3d28970a36619",
+  "windows_sdk": "10.0.26100.0",
+  "cmake_version": "3.31.6-msvc6",
+  "cmake_sha256": "6fe2e6431b45cf32b9b2f3e50a8efae046a2366eb34d0fb36da027cf56102aec",
+  "qualification": "Standalone C++, editor, assets and packaged Development/Shipping startup passed on this PC; independent review and owner visual acceptance remain separate"
+}

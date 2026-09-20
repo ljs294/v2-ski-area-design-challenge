@@ -29,3 +29,12 @@ dist-web
 dist-weather-lab
 release
 test-results
+
+# Unreal and standalone native build outputs
+/Binaries/
+/Intermediate/
+/Saved/
+/DerivedDataCache/
+/.vs/
+**/__pycache__/
+*.pyc

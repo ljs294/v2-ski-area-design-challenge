@@ -1,0 +1,17 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "p0-msvc",
+      "displayName": "P0 tested Windows x64 toolchain",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "toolset": "v143,version=14.44.35207,host=x64",
+      "binaryDir": "${sourceDir}/test-results/p0/domain-msvc",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_VERSION": "10.0.26100.0"
+      }
+    }
+  ]
+}

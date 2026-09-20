@@ -1,0 +1,4 @@
+{
+  "sources": ["Source/SkiDomain/Private/Core/Revision.cpp"],
+  "headers": ["Source/SkiDomain/Public/SkiDomain/Revision.h"]
+}

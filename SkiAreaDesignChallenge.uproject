@@ -1,0 +1,19 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "5.8",
+  "Category": "Simulation",
+  "Description": "Mountain Planner native bootstrap; P0 only.",
+  "Modules": [
+    { "Name": "SkiDomain", "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "SkiApplication", "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "SkiPresentation", "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "SkiEditor", "Type": "Editor", "LoadingPhase": "PostEngineInit" }
+  ],
+  "Plugins": [
+    { "Name": "PythonScriptPlugin", "Enabled": true, "TargetAllowList": ["Editor"] },
+    { "Name": "EditorScriptingUtilities", "Enabled": true, "TargetAllowList": ["Editor"] },
+    { "Name": "AndroidFileServer", "Enabled": false },
+    { "Name": "UdpMessaging", "Enabled": false },
+    { "Name": "TcpMessaging", "Enabled": false }
+  ]
+}

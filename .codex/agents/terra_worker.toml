@@ -1,0 +1,13 @@
+name = "terra_worker"
+description = "Implements an explicitly assigned and bounded P0 task"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+
+developer_instructions = """
+Read applicable AGENTS.md and docs/UnrealRebuild/README.md. Work only on the assigned
+files and owned assets. P0 does not authorize P1 gameplay. Stop all source and
+editor writes during qualification or review. Preserve the TypeScript app and
+user data. Do not stage, commit, change branches or global settings, install tools,
+or spawn more agents. Report actual checks and blockers; never claim independent
+review of your own work.
+"""

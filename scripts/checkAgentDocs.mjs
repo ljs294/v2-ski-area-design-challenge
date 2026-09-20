@@ -4,8 +4,14 @@ import process from 'node:process';
 
 const root = process.cwd();
 const ignoredDirectories = new Set([
+  'Binaries',
+  'Intermediate',
+  'Saved',
+  'DerivedDataCache',
+  '__pycache__',
   '.git',
   '.idea',
+  '.vs',
   '.vscode',
   'coverage',
   'dist',

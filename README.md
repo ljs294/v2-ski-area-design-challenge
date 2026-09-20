@@ -1,5 +1,7 @@
 # Ski Area Design Challenge
 
+The Unreal replacement is at the P0 bootstrap stage. See [native bootstrap status and commands](docs/UnrealRebuild/README.md). The Electron instructions below remain usable while native preparation and cutover are unqualified.
+
 Build and explore a ski resort on real terrain. Ski Area Design Challenge includes tools for lifts, trails, roads, ponds, and snowmaking, along with map layers, dashboards, weather, and guest simulation.
 
 The desktop app uses Electron, React, and MapLibre. Start with the desktop version for the full experience.
