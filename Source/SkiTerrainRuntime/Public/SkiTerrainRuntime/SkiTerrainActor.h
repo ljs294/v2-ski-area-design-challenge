@@ -8,10 +8,21 @@
 
 class UDynamicMeshComponent;
 class UInstancedStaticMeshComponent;
-class UCameraComponent;
 class UDirectionalLightComponent;
 class USkyLightComponent;
+class USkyAtmosphereComponent;
+class UPostProcessComponent;
 class ULineBatchComponent;
+
+UENUM(BlueprintType)
+enum class ESkiTerrainViewMode : uint8
+{
+    Presentation,
+    Elevation,
+    Slope,
+    Cover,
+    TileLod,
+};
 
 UCLASS()
 class SKITERRAINRUNTIME_API ASkiTerrainActor : public AActor
@@ -28,6 +39,16 @@ public:
     SkiDomain::RayHit QueryCanonical(const FVector& WorldOriginCm, const FVector& WorldDirection) const;
     void SetTerrainSession(TSharedPtr<SkiApplication::TerrainSession> InSession);
     void SetLightingPreset(FName Preset);
+    bool SetLod(uint8 Lod);
+    void SetViewMode(ESkiTerrainViewMode Mode);
+    void SetVerticalExaggeration(float Scale);
+    bool GetValidWorldBounds(FBox& OutBounds) const;
+    bool GetSteepestQuadrantWorldBounds(FBox& OutBounds) const;
+    void ShowTopologyPatch(const SkiDomain::RayHit& Hit);
+    uint8 GetPresentedLod() const noexcept { return PresentedLod; }
+    ESkiTerrainViewMode GetViewMode() const noexcept { return CurrentViewMode; }
+    double GetOriginHeightM() const noexcept { return PresentedOriginHeightM; }
+    TSharedPtr<SkiApplication::TerrainSession> GetTerrainSession() const { return Session; }
 
 private:
     void ClearTiles();
@@ -47,13 +68,16 @@ private:
     TObjectPtr<UInstancedStaticMeshComponent> GuestDots;
 
     UPROPERTY()
-    TObjectPtr<UCameraComponent> TerrainCamera;
-
-    UPROPERTY()
     TObjectPtr<UDirectionalLightComponent> SunLight;
 
     UPROPERTY()
     TObjectPtr<USkyLightComponent> SkyLight;
+
+    UPROPERTY()
+    TObjectPtr<USkyAtmosphereComponent> SkyAtmosphere;
+
+    UPROPERTY()
+    TObjectPtr<UPostProcessComponent> VerificationPostProcess;
 
     UPROPERTY()
     TObjectPtr<ULineBatchComponent> OverlayLines;
@@ -66,4 +90,9 @@ private:
     double PresentedOriginHeightM = 0.0;
     uint8 PresentedLod = 0;
     FName CurrentLightingPreset = TEXT("Midday");
+    ESkiTerrainViewMode CurrentViewMode = ESkiTerrainViewMode::Presentation;
+    FBox ValidLocalBounds = FBox(ForceInit);
+    FBox SteepestLocalBounds = FBox(ForceInit);
+    double MinimumHeightM = 0.0;
+    double MaximumHeightM = 1.0;
 };

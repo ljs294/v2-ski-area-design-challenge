@@ -29,6 +29,60 @@ enum class SourceProfile : uint8
     High,
 };
 
+enum class FailureStage : uint8
+{
+    Validation,
+    Acquisition,
+    Decoding,
+    Derivation,
+    Writing,
+    Verification,
+    Activation,
+};
+
+enum class ProviderProduct : uint8
+{
+    None,
+    CoreElevation,
+    SurroundingElevation,
+    WorldCover,
+    Imagery,
+    VectorContext,
+};
+
+enum class RetryClassification : uint8
+{
+    Retryable,
+    ChangeSelection,
+    NotRetryable,
+};
+
+struct SKIPREPARATION_API ProviderFailure
+{
+    FString Code;
+    FailureStage Stage = FailureStage::Validation;
+    ProviderProduct Product = ProviderProduct::None;
+    RetryClassification Retry = RetryClassification::NotRetryable;
+    FString Summary;
+    int32 HttpStatus = 0;
+    FString ContentType;
+    int64 ResponseBytes = 0;
+    FString ResponseSha256;
+    uint32 Width = 0;
+    uint32 Height = 0;
+    FString Organization;
+    uint16 Compression = 0;
+    uint16 Orientation = 0;
+    uint16 SampleFormat = 0;
+    FString NoData;
+    uint32 MetadataTag = 0;
+    int32 MetadataType = 0;
+    int32 MetadataReadCount = 0;
+    bool MetadataPassCount = false;
+    FString GeoreferenceStatus;
+    FString DiagnosticReceipt;
+};
+
 struct SKIPREPARATION_API Request
 {
     FString Name;
@@ -52,6 +106,7 @@ struct SKIPREPARATION_API Result
     bool Ok = false;
     State FinalState = State::Failed;
     FString Error;
+    TOptional<ProviderFailure> Failure;
     FString PackageDirectory;
     TArray<FString> Warnings;
     SkiDomain::TerrainManifest Manifest;
@@ -81,4 +136,7 @@ public:
 
 SKIPREPARATION_API bool ValidateRequest(const Request& RequestValue, FString& OutError);
 SKIPREPARATION_API const TCHAR* StateName(State Value) noexcept;
+SKIPREPARATION_API const TCHAR* FailureStageName(FailureStage Value) noexcept;
+SKIPREPARATION_API const TCHAR* ProviderProductName(ProviderProduct Value) noexcept;
+SKIPREPARATION_API void InitializePreparationDiagnostics(const FString& DataRoot);
 }

@@ -14,6 +14,11 @@
   "Plugins": [
     { "Name": "PythonScriptPlugin", "Enabled": true, "TargetAllowList": ["Editor"] },
     { "Name": "EditorScriptingUtilities", "Enabled": true, "TargetAllowList": ["Editor"] },
+    { "Name": "ModelContextProtocol", "Enabled": true, "TargetAllowList": ["Editor"] },
+    { "Name": "EditorToolset", "Enabled": true, "TargetAllowList": ["Editor"] },
+    { "Name": "AutomationTestToolset", "Enabled": true, "TargetAllowList": ["Editor"] },
+    { "Name": "SlateInspectorToolset", "Enabled": true, "TargetAllowList": ["Editor"] },
+    { "Name": "UMGToolSet", "Enabled": true, "TargetAllowList": ["Editor"] },
     { "Name": "WebBrowserWidget", "Enabled": true, "PlatformAllowList": ["Win64"] },
     { "Name": "AndroidFileServer", "Enabled": false },
     { "Name": "UdpMessaging", "Enabled": false },

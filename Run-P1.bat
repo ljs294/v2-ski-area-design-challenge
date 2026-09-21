@@ -8,7 +8,7 @@ set "GAME_EXE=%CD%\release\MountainPlanner-P1-Windows\SkiAreaDesignChallenge.exe
 if not exist "%GAME_EXE%" (
   echo No packaged P1 release exists yet. Building it now...
   echo.
-  call Build-P1-Release.bat
+  call Build-P1-Release.bat nopause
   if errorlevel 1 exit /b 1
 )
 

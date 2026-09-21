@@ -4,10 +4,13 @@
 #include "Components/DynamicMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LineBatchComponent.h"
-#include "Camera/CameraComponent.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/SkyLightComponent.h"
+#include "Components/SkyAtmosphereComponent.h"
+#include "Components/PostProcessComponent.h"
 #include "DynamicMesh/DynamicMesh3.h"
+#include "DynamicMesh/DynamicMeshAttributeSet.h"
+#include "DynamicMesh/DynamicMeshOverlay.h"
 #include "Engine/StaticMesh.h"
 #include "Materials/MaterialInterface.h"
 #include "SkiDomain/TerrainTile.h"
@@ -41,15 +44,26 @@ ASkiTerrainActor::ASkiTerrainActor()
     GuestDots = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("GuestDots"));
     GuestDots->SetupAttachment(SceneRoot);
     GuestDots->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-    TerrainCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("TerrainCamera"));
-    TerrainCamera->SetupAttachment(SceneRoot);
     SunLight = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("P1Sun"));
     SunLight->SetupAttachment(SceneRoot);
     SunLight->SetMobility(EComponentMobility::Movable);
     SunLight->SetCastShadows(true);
+    SunLight->SetAtmosphereSunLight(true);
     SkyLight = CreateDefaultSubobject<USkyLightComponent>(TEXT("P1Sky"));
     SkyLight->SetupAttachment(SceneRoot);
     SkyLight->SetMobility(EComponentMobility::Movable);
+    SkyAtmosphere = CreateDefaultSubobject<USkyAtmosphereComponent>(TEXT("VerificationSky"));
+    SkyAtmosphere->SetupAttachment(SceneRoot);
+    VerificationPostProcess = CreateDefaultSubobject<UPostProcessComponent>(TEXT("VerificationExposure"));
+    VerificationPostProcess->SetupAttachment(SceneRoot);
+    VerificationPostProcess->bUnbound = true;
+    VerificationPostProcess->Settings.bOverride_AutoExposureMethod = true;
+    VerificationPostProcess->Settings.AutoExposureMethod = EAutoExposureMethod::AEM_Manual;
+    VerificationPostProcess->Settings.bOverride_AutoExposureBias = true;
+    // Keep verification captures deterministic without the black surround driving
+    // eye adaptation. A modest positive compensation matches the outdoor light
+    // intensities used by the three bounded lighting presets.
+    VerificationPostProcess->Settings.AutoExposureBias = 8.0F;
     OverlayLines = CreateDefaultSubobject<ULineBatchComponent>(TEXT("TerrainOverlays"));
     OverlayLines->SetupAttachment(SceneRoot);
     OverlayLines->SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -87,6 +101,8 @@ bool ASkiTerrainActor::CreateTileComponent(const SkiDomain::TerrainTileMesh& Sou
     Mesh.EnableVertexNormals(FVector3f::UpVector);
     Mesh.EnableVertexUVs(FVector2f::ZeroVector);
     Mesh.EnableVertexColors(FVector3f(0.42F, 0.40F, 0.34F));
+    TArray<FVector4f> RenderColors;
+    RenderColors.Reserve(static_cast<int32>(SourceMesh.Vertices.size()));
     for (const SkiDomain::TerrainVertex& Vertex : SourceMesh.Vertices)
     {
         const int32 VertexId = Mesh.AppendVertex(FVector3d(
@@ -95,15 +111,37 @@ bool ASkiTerrainActor::CreateTileComponent(const SkiDomain::TerrainTileMesh& Sou
             (static_cast<double>(Vertex.UpM) - OriginHeightM) * 100.0));
         Mesh.SetVertexNormal(VertexId, FVector3f(Vertex.NormalNorth, Vertex.NormalEast, Vertex.NormalUp));
         Mesh.SetVertexUV(VertexId, FVector2f(Vertex.U, Vertex.V));
-        if (PresentedCover && PresentedCoverWidth > 0 && PresentedCoverHeight > 0)
+        FVector3f Color(0.42F, 0.40F, 0.34F);
+        if (CurrentViewMode == ESkiTerrainViewMode::Elevation)
+        {
+            const float Alpha = static_cast<float>(FMath::Clamp((Vertex.UpM - MinimumHeightM)
+                / FMath::Max(1.0, MaximumHeightM - MinimumHeightM), 0.0, 1.0));
+            Color = FMath::Lerp(FVector3f(0.05F, 0.16F, 0.42F), FVector3f(0.96F, 0.88F, 0.44F), Alpha);
+        }
+        else if (CurrentViewMode == ESkiTerrainViewMode::Slope)
+        {
+            const double Degrees = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp<double>(Vertex.NormalUp, 0.0, 1.0)));
+            Color = Degrees < 15.0 ? FVector3f(0.15F, 0.55F, 0.18F)
+                : Degrees < 30.0 ? FVector3f(0.92F, 0.78F, 0.12F)
+                : Degrees < 45.0 ? FVector3f(0.95F, 0.35F, 0.08F)
+                : FVector3f(0.65F, 0.05F, 0.18F);
+        }
+        else if (CurrentViewMode == ESkiTerrainViewMode::TileLod)
+        {
+            const uint32 Hue = (SourceMesh.Key.X * 37U + SourceMesh.Key.Y * 67U + SourceMesh.Key.Lod * 101U) % 255U;
+            const FLinearColor Hsv = FLinearColor::MakeFromHSV8(static_cast<uint8>(Hue), 210, 235);
+            Color = FVector3f(Hsv.R, Hsv.G, Hsv.B);
+        }
+        else if (PresentedCover && PresentedCoverWidth > 0 && PresentedCoverHeight > 0)
         {
             const uint32 Column = FMath::Min(PresentedCoverWidth - 1,
                 static_cast<uint32>(FMath::RoundToInt(Vertex.U * (PresentedCoverWidth - 1))));
             const uint32 Row = FMath::Min(PresentedCoverHeight - 1,
                 static_cast<uint32>(FMath::RoundToInt(Vertex.V * (PresentedCoverHeight - 1))));
-            Mesh.SetVertexColor(VertexId, CoverColor((*PresentedCover)[static_cast<size_t>(Row)
-                * PresentedCoverWidth + Column]));
+            Color = CoverColor((*PresentedCover)[static_cast<size_t>(Row) * PresentedCoverWidth + Column]);
         }
+        Mesh.SetVertexColor(VertexId, Color);
+        RenderColors.Add(FVector4f(Color.X, Color.Y, Color.Z, 1.0F));
     }
     for (int32 Index = 0; Index + 2 < static_cast<int32>(SourceMesh.Indices.size()); Index += 3)
     {
@@ -111,6 +149,25 @@ bool ASkiTerrainActor::CreateTileComponent(const SkiDomain::TerrainTileMesh& Sou
             static_cast<int32>(SourceMesh.Indices[Index + 1]),
             static_cast<int32>(SourceMesh.Indices[Index + 2]));
         if (Triangle < 0) return false;
+    }
+    // Dynamic Mesh rendering consumes the primary color overlay. The legacy
+    // per-vertex color channel above is retained for mesh-level inspection,
+    // while this one-element-per-vertex overlay drives the packaged diagnostic
+    // views without altering canonical geometry.
+    Mesh.EnableAttributes();
+    Mesh.Attributes()->EnablePrimaryColors();
+    UE::Geometry::FDynamicMeshColorOverlay* Colors = Mesh.Attributes()->PrimaryColors();
+    TArray<int32> ColorElements;
+    ColorElements.SetNum(Mesh.MaxVertexID());
+    for (int32 VertexId : Mesh.VertexIndicesItr())
+    {
+        ColorElements[VertexId] = Colors->AppendElement(RenderColors[VertexId]);
+    }
+    for (int32 TriangleId : Mesh.TriangleIndicesItr())
+    {
+        const UE::Geometry::FIndex3i Triangle = Mesh.GetTriangle(TriangleId);
+        Colors->SetTriangle(TriangleId, UE::Geometry::FIndex3i(
+            ColorElements[Triangle.A], ColorElements[Triangle.B], ColorElements[Triangle.C]));
     }
     UDynamicMeshComponent* Component = NewObject<UDynamicMeshComponent>(this);
     Component->SetupAttachment(SceneRoot);
@@ -135,6 +192,55 @@ bool ASkiTerrainActor::Present(const SkiApplication::TerrainSnapshot& Snapshot, 
     PresentedCover = Snapshot.Cover;
     PresentedCoverWidth = Snapshot.CoverWidth;
     PresentedCoverHeight = Snapshot.CoverHeight;
+    ValidLocalBounds = FBox(ForceInit);
+    MinimumHeightM = TNumericLimits<double>::Max();
+    MaximumHeightM = TNumericLimits<double>::Lowest();
+    for (uint32 Row = 0; Row < Snapshot.Heightfield->Height; ++Row)
+    {
+        for (uint32 Column = 0; Column < Snapshot.Heightfield->Width; ++Column)
+        {
+            const float Height = Snapshot.Heightfield->Samples[static_cast<size_t>(Row) * Snapshot.Heightfield->Width + Column];
+            if (!FMath::IsFinite(Height) || static_cast<double>(Height) == Snapshot.Heightfield->NoDataValue) continue;
+            MinimumHeightM = FMath::Min(MinimumHeightM, static_cast<double>(Height));
+            MaximumHeightM = FMath::Max(MaximumHeightM, static_cast<double>(Height));
+            ValidLocalBounds += FVector(Snapshot.Heightfield->SampleNorthM(Row) * 100.0,
+                Snapshot.Heightfield->EastM(Column) * 100.0,
+                (static_cast<double>(Height) - PresentedOriginHeightM) * 100.0);
+        }
+    }
+    if (!ValidLocalBounds.IsValid) return false;
+    TArray<double> QuadrantSlopes[4];
+    for (uint32 Row = 0; Row + 1 < Snapshot.Heightfield->Height; ++Row)
+        for (uint32 Column = 0; Column + 1 < Snapshot.Heightfield->Width; ++Column)
+        {
+            const float H = Snapshot.Heightfield->Samples[static_cast<size_t>(Row) * Snapshot.Heightfield->Width + Column];
+            const float East = Snapshot.Heightfield->Samples[static_cast<size_t>(Row) * Snapshot.Heightfield->Width + Column + 1];
+            const float South = Snapshot.Heightfield->Samples[static_cast<size_t>(Row + 1) * Snapshot.Heightfield->Width + Column];
+            if (!FMath::IsFinite(H) || !FMath::IsFinite(East) || !FMath::IsFinite(South)) continue;
+            const double Gradient = FMath::Sqrt(FMath::Square((East - H) / Snapshot.Heightfield->EastSpacingM)
+                + FMath::Square((South - H) / Snapshot.Heightfield->NorthSpacingM));
+            const int32 Quadrant = (Column >= Snapshot.Heightfield->Width / 2 ? 1 : 0)
+                + (Row >= Snapshot.Heightfield->Height / 2 ? 2 : 0);
+            QuadrantSlopes[Quadrant].Add(FMath::RadiansToDegrees(FMath::Atan(Gradient)));
+        }
+    int32 Steepest = 0;
+    double SteepestP95 = -1.0;
+    for (int32 Index = 0; Index < 4; ++Index)
+    {
+        QuadrantSlopes[Index].Sort();
+        if (QuadrantSlopes[Index].IsEmpty()) continue;
+        const double P95 = QuadrantSlopes[Index][FMath::Min(QuadrantSlopes[Index].Num() - 1,
+            FMath::FloorToInt(QuadrantSlopes[Index].Num() * 0.95))];
+        if (P95 > SteepestP95) { SteepestP95 = P95; Steepest = Index; }
+    }
+    const FVector Center = ValidLocalBounds.GetCenter();
+    const FVector Extent = ValidLocalBounds.GetExtent();
+    const bool SouthHalf = (Steepest & 2) != 0;
+    const bool EastHalf = (Steepest & 1) != 0;
+    const FVector QuadrantCenter(Center.X + (SouthHalf ? -0.5 : 0.5) * Extent.X,
+        Center.Y + (EastHalf ? 0.5 : -0.5) * Extent.Y, Center.Z);
+    SteepestLocalBounds = FBox(QuadrantCenter - FVector(Extent.X * 0.55, Extent.Y * 0.55, Extent.Z),
+        QuadrantCenter + FVector(Extent.X * 0.55, Extent.Y * 0.55, Extent.Z));
     const uint32 TilesX = (Snapshot.Heightfield->Width - 2) / SkiDomain::TerrainTileCells + 1;
     const uint32 TilesY = (Snapshot.Heightfield->Height - 2) / SkiDomain::TerrainTileCells + 1;
     for (uint32 Y = 0; Y < TilesY; ++Y)
@@ -152,13 +258,67 @@ bool ASkiTerrainActor::Present(const SkiApplication::TerrainSnapshot& Snapshot, 
     PresentedLod = Lod;
     RebuildDots(*Snapshot.Heightfield, PresentedOriginHeightM);
     RebuildContourOverlay(*Snapshot.Heightfield, PresentedOriginHeightM);
-    const double EastExtentCm = (Snapshot.Heightfield->Width - 1) * Snapshot.Heightfield->EastSpacingM * 50.0;
-    const double NorthExtentCm = (Snapshot.Heightfield->Height - 1) * Snapshot.Heightfield->NorthSpacingM * 50.0;
-    const double Extent = FMath::Max(EastExtentCm, NorthExtentCm);
-    const FVector CameraLocation(-NorthExtentCm * 0.75, -EastExtentCm * 1.05, Extent * 1.15);
-    TerrainCamera->SetRelativeLocation(CameraLocation);
-    TerrainCamera->SetRelativeRotation((-CameraLocation).Rotation());
+    SetLightingPreset(CurrentLightingPreset);
     return !Session || Session->AcknowledgeRender(PresentedRevision);
+}
+
+bool ASkiTerrainActor::SetLod(const uint8 Lod)
+{
+    return Session && Lod <= 2 && Present(Session->Snapshot(), Lod);
+}
+
+void ASkiTerrainActor::SetViewMode(const ESkiTerrainViewMode Mode)
+{
+    if (CurrentViewMode == Mode) return;
+    CurrentViewMode = Mode;
+    if (Session) Present(Session->Snapshot(), PresentedLod);
+}
+
+void ASkiTerrainActor::SetVerticalExaggeration(const float Scale)
+{
+    SetActorScale3D(FVector(1.0F, 1.0F, FMath::Clamp(Scale, 1.0F, 4.0F)));
+}
+
+bool ASkiTerrainActor::GetValidWorldBounds(FBox& OutBounds) const
+{
+    if (!ValidLocalBounds.IsValid) return false;
+    OutBounds = ValidLocalBounds.TransformBy(GetActorTransform());
+    return true;
+}
+
+bool ASkiTerrainActor::GetSteepestQuadrantWorldBounds(FBox& OutBounds) const
+{
+    if (!SteepestLocalBounds.IsValid) return false;
+    OutBounds = SteepestLocalBounds.TransformBy(GetActorTransform());
+    return true;
+}
+
+void ASkiTerrainActor::ShowTopologyPatch(const SkiDomain::RayHit& Hit)
+{
+    if (!Session) return;
+    const SkiApplication::TerrainSnapshot Snapshot = Session->Snapshot();
+    if (!Snapshot.Heightfield) return;
+    RebuildContourOverlay(*Snapshot.Heightfield, PresentedOriginHeightM);
+    const SkiDomain::Heightfield& Field = *Snapshot.Heightfield;
+    const uint32 MinRow = Hit.Row > 4 ? Hit.Row - 4 : 0;
+    const uint32 MinColumn = Hit.Column > 4 ? Hit.Column - 4 : 0;
+    const uint32 MaxRow = FMath::Min(Field.Height - 1, Hit.Row + 5);
+    const uint32 MaxColumn = FMath::Min(Field.Width - 1, Hit.Column + 5);
+    TArray<FBatchedLine> Lines;
+    auto Point = [&](uint32 Row, uint32 Column)
+    {
+        const float H = Field.Samples[static_cast<size_t>(Row) * Field.Width + Column];
+        return FVector(Field.SampleNorthM(Row) * 100.0, Field.EastM(Column) * 100.0,
+            (static_cast<double>(H) - PresentedOriginHeightM) * 100.0 + 30.0);
+    };
+    for (uint32 Row = MinRow; Row < MaxRow; ++Row)
+        for (uint32 Column = MinColumn; Column < MaxColumn; ++Column)
+        {
+            Lines.Emplace(Point(Row, Column), Point(Row, Column + 1), FLinearColor(0, 1, 1, 1), 0, 2.0F, 1);
+            Lines.Emplace(Point(Row, Column), Point(Row + 1, Column), FLinearColor(0, 1, 1, 1), 0, 2.0F, 1);
+            Lines.Emplace(Point(Row, Column), Point(Row + 1, Column + 1), FLinearColor::Yellow, 0, 2.5F, 1);
+        }
+    OverlayLines->DrawLines(Lines);
 }
 
 void ASkiTerrainActor::RebuildContourOverlay(const SkiDomain::Heightfield& Field,
@@ -363,7 +523,9 @@ void ASkiTerrainActor::SetLightingPreset(const FName Preset)
     CurrentLightingPreset = Preset;
     Tags.RemoveAll([](const FName Tag) { return Tag.ToString().StartsWith(TEXT("Lighting:")); });
     Tags.Add(FName(*FString::Printf(TEXT("Lighting:%s"), *Preset.ToString())));
-    const TCHAR* AssetPath = Preset == TEXT("LowAngle")
+    const TCHAR* AssetPath = CurrentViewMode != ESkiTerrainViewMode::Presentation
+        ? TEXT("/Game/P1Generated/M_Overlay.M_Overlay")
+        : Preset == TEXT("LowAngle")
         ? TEXT("/Game/P1Generated/M_Terrain_LowAngle.M_Terrain_LowAngle")
         : Preset == TEXT("Overcast")
             ? TEXT("/Game/P1Generated/M_Terrain_Overcast.M_Terrain_Overcast")

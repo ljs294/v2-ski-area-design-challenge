@@ -1,6 +1,9 @@
 #include "SkiPreparation/NativeTerrainProvider.h"
 
+#include "SkiPreparation/GeoTiffDecoder.h"
 #include "SkiPreparation/TerrainPackageStore.h"
+#include "Dom/JsonObject.h"
+#include "HAL/CriticalSection.h"
 #include "HAL/Event.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
@@ -13,8 +16,11 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeLock.h"
+#include "Misc/ScopeExit.h"
 #include "Modules/ModuleManager.h"
-#include "tiffio.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 
 #include <cmath>
 
@@ -23,6 +29,9 @@ namespace
 constexpr int32 MaxNetworkConcurrency = 4;
 constexpr int32 MaxDecodeConcurrency = 2;
 constexpr int32 WorldCoverZoom = 14;
+constexpr int64 MaxPreparationLogBytes = 1024 * 1024;
+
+FCriticalSection DiagnosticsMutex;
 
 struct DownloadState
 {
@@ -32,11 +41,136 @@ struct DownloadState
     TArray<uint8> Bytes;
     FString Error;
     int32 Status = 0;
+    FString ContentType;
     std::atomic_bool Done = false;
 };
 
+struct DownloadResult
+{
+    TArray<uint8> Bytes;
+    int32 Status = 0;
+    FString ContentType;
+    FString Error;
+};
+
+FString DiagnosticsDirectory(const FString& DataRoot)
+{
+    return FPaths::Combine(DataRoot, TEXT("TerrainDiagnostics"));
+}
+
+FString SerializeJson(const TSharedRef<FJsonObject>& Object)
+{
+    FString Json;
+    FJsonSerializer::Serialize(Object, TJsonWriterFactory<>::Create(&Json));
+    return Json;
+}
+
+void RotatePreparationLog(const FString& Directory)
+{
+    IFileManager& Files = IFileManager::Get();
+    const FString Current = FPaths::Combine(Directory, TEXT("preparation.jsonl"));
+    if (Files.FileSize(*Current) < MaxPreparationLogBytes) return;
+    Files.Delete(*FPaths::Combine(Directory, TEXT("preparation.3.jsonl")));
+    Files.Move(*FPaths::Combine(Directory, TEXT("preparation.3.jsonl")),
+        *FPaths::Combine(Directory, TEXT("preparation.2.jsonl")), true, true);
+    Files.Move(*FPaths::Combine(Directory, TEXT("preparation.2.jsonl")),
+        *FPaths::Combine(Directory, TEXT("preparation.1.jsonl")), true, true);
+    Files.Move(*FPaths::Combine(Directory, TEXT("preparation.1.jsonl")), *Current, true, true);
+}
+
+void AppendPreparationEvent(const FString& DataRoot, const SkiPreparation::Request* Request,
+    const TCHAR* Event, const SkiPreparation::State State, const SkiPreparation::ProviderProduct Product,
+    const SkiPreparation::ProviderFailure* Failure = nullptr)
+{
+    FScopeLock Lock(&DiagnosticsMutex);
+    const FString Directory = DiagnosticsDirectory(DataRoot);
+    IFileManager& Files = IFileManager::Get();
+    if (!Files.MakeDirectory(*Directory, true)) return;
+    RotatePreparationLog(Directory);
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("recordedAtUtc"), FDateTime::UtcNow().ToIso8601());
+    Root->SetStringField(TEXT("event"), Event);
+    Root->SetStringField(TEXT("state"), SkiPreparation::StateName(State));
+    Root->SetStringField(TEXT("product"), SkiPreparation::ProviderProductName(Product));
+    if (Request)
+    {
+        Root->SetStringField(TEXT("sessionGeneration"), LexToString(Request->SessionGeneration));
+        Root->SetStringField(TEXT("operationGeneration"), LexToString(Request->OperationGeneration));
+    }
+    if (Failure)
+    {
+        Root->SetStringField(TEXT("code"), Failure->Code.Left(96));
+        Root->SetNumberField(TEXT("httpStatus"), Failure->HttpStatus);
+        Root->SetStringField(TEXT("contentType"), Failure->ContentType.Left(128));
+        Root->SetNumberField(TEXT("responseBytes"), static_cast<double>(Failure->ResponseBytes));
+        Root->SetStringField(TEXT("responseSha256"), Failure->ResponseSha256.Left(64));
+        Root->SetNumberField(TEXT("width"), Failure->Width);
+        Root->SetNumberField(TEXT("height"), Failure->Height);
+        Root->SetStringField(TEXT("organization"), Failure->Organization.Left(32));
+    }
+    FFileHelper::SaveStringToFile(SerializeJson(Root) + TEXT("\n"),
+        *FPaths::Combine(Directory, TEXT("preparation.jsonl")),
+        FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM, &Files, FILEWRITE_Append);
+}
+
+void WriteOperationJournal(const FString& DataRoot, const SkiPreparation::Request& Request,
+    const SkiPreparation::State State, const SkiPreparation::ProviderProduct Product)
+{
+    FScopeLock Lock(&DiagnosticsMutex);
+    const FString Directory = DiagnosticsDirectory(DataRoot);
+    IFileManager& Files = IFileManager::Get();
+    if (!Files.MakeDirectory(*Directory, true)) return;
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("recordedAtUtc"), FDateTime::UtcNow().ToIso8601());
+    Root->SetStringField(TEXT("state"), SkiPreparation::StateName(State));
+    Root->SetStringField(TEXT("product"), SkiPreparation::ProviderProductName(Product));
+    Root->SetStringField(TEXT("sessionGeneration"), LexToString(Request.SessionGeneration));
+    Root->SetStringField(TEXT("operationGeneration"), LexToString(Request.OperationGeneration));
+    const FString Journal = FPaths::Combine(Directory, TEXT("current-operation.json"));
+    const FString Temporary = Journal + TEXT(".tmp");
+    if (FFileHelper::SaveStringToFile(SerializeJson(Root), *Temporary,
+        FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+    {
+        Files.Move(*Journal, *Temporary, true, true);
+    }
+}
+
+void ClearOperationJournal(const FString& DataRoot)
+{
+    FScopeLock Lock(&DiagnosticsMutex);
+    IFileManager::Get().Delete(*FPaths::Combine(DiagnosticsDirectory(DataRoot), TEXT("current-operation.json")));
+}
+
+void InitializeDiagnosticsInternal(const FString& DataRoot)
+{
+    const FString Journal = FPaths::Combine(DiagnosticsDirectory(DataRoot), TEXT("current-operation.json"));
+    if (FPaths::FileExists(Journal))
+    {
+        AppendPreparationEvent(DataRoot, nullptr, TEXT("PREPARATION_INTERRUPTED"),
+            SkiPreparation::State::Failed, SkiPreparation::ProviderProduct::None);
+        ClearOperationJournal(DataRoot);
+    }
+    const FString WorkRoot = FPaths::ConvertRelativePathToFull(FPaths::Combine(DataRoot, TEXT(".work")));
+    TArray<FString> Directories;
+    IFileManager& Files = IFileManager::Get();
+    Files.FindFiles(Directories, *FPaths::Combine(WorkRoot, TEXT("*")), false, true);
+    const FDateTime Cutoff = FDateTime::UtcNow() - FTimespan::FromHours(1.0);
+    for (const FString& Name : Directories)
+    {
+        FGuid Parsed;
+        if (!FGuid::ParseExact(Name, EGuidFormats::Digits, Parsed)) continue;
+        const FString Candidate = FPaths::ConvertRelativePathToFull(FPaths::Combine(WorkRoot, Name));
+        FString Prefix = WorkRoot;
+        if (!Prefix.EndsWith(TEXT("/")) && !Prefix.EndsWith(TEXT("\\"))) Prefix += TEXT("/");
+        FString NormalCandidate = Candidate.Replace(TEXT("\\"), TEXT("/"));
+        Prefix.ReplaceInline(TEXT("\\"), TEXT("/"));
+        if (NormalCandidate.StartsWith(Prefix) && Files.GetTimeStamp(*Candidate) < Cutoff)
+            Files.DeleteDirectory(*Candidate, false, true);
+    }
+}
+
 bool Download(const FString& Url, const TSharedRef<SkiPreparation::Cancellation>& Cancellation,
-    TArray<uint8>& OutBytes, int32& OutStatus, FString& OutError)
+    DownloadResult& Out)
 {
     const TSharedRef<DownloadState> State = MakeShared<DownloadState>();
     const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Http = FHttpModule::Get().CreateRequest();
@@ -47,14 +181,16 @@ bool Download(const FString& Url, const TSharedRef<SkiPreparation::Cancellation>
     Http->OnProcessRequestComplete().BindLambda([State](FHttpRequestPtr, FHttpResponsePtr Response, const bool Connected)
     {
         State->Status = Response ? Response->GetResponseCode() : 0;
-        if (Connected && Response && EHttpResponseCodes::IsOk(State->Status)) State->Bytes = Response->GetContent();
-        else State->Error = FString::Printf(TEXT("HTTP request failed (%d)."), State->Status);
+        State->ContentType = Response ? Response->GetContentType() : FString();
+        if (Response) State->Bytes = Response->GetContent();
+        if (!Connected || !Response || !EHttpResponseCodes::IsOk(State->Status))
+            State->Error = FString::Printf(TEXT("HTTP request failed (%d)."), State->Status);
         State->Done.store(true, std::memory_order_release);
         State->Event->Trigger();
     });
     if (!Http->ProcessRequest())
     {
-        OutError = TEXT("HTTP request could not be queued.");
+        Out.Error = TEXT("HTTP request could not be queued.");
         return false;
     }
     while (!State->Done.load(std::memory_order_acquire))
@@ -62,15 +198,88 @@ bool Download(const FString& Url, const TSharedRef<SkiPreparation::Cancellation>
         if (Cancellation->IsCancelled())
         {
             Http->CancelRequest();
-            OutError = TEXT("Terrain acquisition cancelled.");
+            Out.Error = TEXT("Terrain acquisition cancelled.");
             return false;
         }
         State->Event->Wait(25);
     }
-    OutStatus = State->Status;
-    OutError = State->Error;
-    OutBytes = std::move(State->Bytes);
-    return !OutBytes.IsEmpty();
+    Out.Status = State->Status;
+    Out.ContentType = State->ContentType.Left(128);
+    Out.Error = State->Error;
+    Out.Bytes = std::move(State->Bytes);
+    return Out.Error.IsEmpty() && !Out.Bytes.IsEmpty();
+}
+
+void PopulateDownloadFailure(const DownloadResult& Downloaded,
+    const SkiPreparation::ProviderProduct Product, SkiPreparation::ProviderFailure& Failure)
+{
+    Failure = {};
+    Failure.Code = TEXT("HTTP_ACQUISITION_FAILED");
+    Failure.Stage = SkiPreparation::FailureStage::Acquisition;
+    Failure.Product = Product;
+    Failure.Retry = Downloaded.Status >= 500 || Downloaded.Status == 0
+        ? SkiPreparation::RetryClassification::Retryable
+        : SkiPreparation::RetryClassification::ChangeSelection;
+    Failure.Summary = Downloaded.Error.IsEmpty() ? TEXT("Provider returned no usable data.") : Downloaded.Error;
+    Failure.HttpStatus = Downloaded.Status;
+    Failure.ContentType = Downloaded.ContentType.Left(128);
+    Failure.ResponseBytes = Downloaded.Bytes.Num();
+    Failure.ResponseSha256 = SkiPreparation::Sha256(Downloaded.Bytes);
+}
+
+FString WriteFailureDiagnostic(const FString& DataRoot, const SkiPreparation::Request& Request,
+    SkiPreparation::ProviderFailure& Failure)
+{
+    FScopeLock Lock(&DiagnosticsMutex);
+    const FString Directory = DiagnosticsDirectory(DataRoot);
+    IFileManager& Files = IFileManager::Get();
+    if (!Files.MakeDirectory(*Directory, true)) return {};
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("code"), Failure.Code);
+    Root->SetStringField(TEXT("stage"), SkiPreparation::FailureStageName(Failure.Stage));
+    Root->SetStringField(TEXT("product"), SkiPreparation::ProviderProductName(Failure.Product));
+    Root->SetStringField(TEXT("summary"), Failure.Summary.Left(512));
+    Root->SetNumberField(TEXT("sessionGeneration"), static_cast<double>(Request.SessionGeneration));
+    Root->SetNumberField(TEXT("operationGeneration"), static_cast<double>(Request.OperationGeneration));
+    Root->SetNumberField(TEXT("httpStatus"), Failure.HttpStatus);
+    Root->SetStringField(TEXT("contentType"), Failure.ContentType.Left(128));
+    Root->SetNumberField(TEXT("responseBytes"), static_cast<double>(Failure.ResponseBytes));
+    Root->SetStringField(TEXT("responseSha256"), Failure.ResponseSha256);
+    Root->SetNumberField(TEXT("width"), Failure.Width);
+    Root->SetNumberField(TEXT("height"), Failure.Height);
+    Root->SetStringField(TEXT("organization"), Failure.Organization);
+    Root->SetNumberField(TEXT("compression"), Failure.Compression);
+    Root->SetNumberField(TEXT("orientation"), Failure.Orientation);
+    Root->SetNumberField(TEXT("sampleFormat"), Failure.SampleFormat);
+    Root->SetStringField(TEXT("nodata"), Failure.NoData.Left(64));
+    Root->SetNumberField(TEXT("metadataTag"), Failure.MetadataTag);
+    Root->SetNumberField(TEXT("metadataType"), Failure.MetadataType);
+    Root->SetNumberField(TEXT("metadataReadCount"), Failure.MetadataReadCount);
+    Root->SetBoolField(TEXT("metadataPassCount"), Failure.MetadataPassCount);
+    Root->SetStringField(TEXT("georeferenceStatus"), Failure.GeoreferenceStatus.Left(128));
+    Root->SetStringField(TEXT("recordedAtUtc"), FDateTime::UtcNow().ToIso8601());
+    FString Json;
+    FJsonSerializer::Serialize(Root, TJsonWriterFactory<>::Create(&Json));
+    const FString Filename = FString::Printf(TEXT("%lld-%s.json"),
+        FDateTime::UtcNow().ToUnixTimestamp(), *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+    const FString Path = FPaths::Combine(Directory, Filename);
+    if (!FFileHelper::SaveStringToFile(Json, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)) return {};
+
+    TArray<FString> Names;
+    Files.FindFiles(Names, *FPaths::Combine(Directory, TEXT("*.json")), true, false);
+    Names.Sort();
+    uint64 Total = 0;
+    for (const FString& Name : Names) Total += FMath::Max<int64>(0, Files.FileSize(*FPaths::Combine(Directory, Name)));
+    while (Names.Num() > 5 || Total > 10ULL * 1024ULL * 1024ULL)
+    {
+        const FString Oldest = FPaths::Combine(Directory, Names[0]);
+        const int64 Size = FMath::Max<int64>(0, Files.FileSize(*Oldest));
+        if (!Files.Delete(*Oldest)) break;
+        Total -= FMath::Min<uint64>(Total, static_cast<uint64>(Size));
+        Names.RemoveAt(0);
+    }
+    Failure.DiagnosticReceipt = FPaths::Combine(TEXT("TerrainDiagnostics"), Filename);
+    return Path;
 }
 
 FString ElevationUrl(const SkiDomain::GeographicBounds& Bounds, const int32 Dimension)
@@ -85,82 +294,6 @@ SkiDomain::GeographicBounds Expand(const SkiDomain::GeographicBounds& Bounds, co
     const double Lat = Meters / 111320.0;
     const double Lon = Meters / (111320.0 * FMath::Max(std::cos(FMath::DegreesToRadians(CenterLat)), 1.0e-6));
     return {Bounds.WestDeg - Lon, Bounds.SouthDeg - Lat, Bounds.EastDeg + Lon, Bounds.NorthDeg + Lat};
-}
-
-bool DecodeTiff(const TArray<uint8>& Bytes, const FString& WorkPath,
-    const SkiDomain::GeographicBounds& RequestedBounds, SkiDomain::Heightfield& Out,
-    SkiDomain::GeographicBounds& OutBounds, FString& OutError)
-{
-    if (!FFileHelper::SaveArrayToFile(Bytes, *WorkPath))
-    {
-        OutError = TEXT("Could not stage downloaded GeoTIFF for decoding.");
-        return false;
-    }
-    TIFF* Image = TIFFOpen(TCHAR_TO_UTF8(*WorkPath), "r");
-    if (!Image)
-    {
-        OutError = TEXT("USGS response is not a readable TIFF.");
-        return false;
-    }
-    static const TIFFFieldInfo GeoFields[] = {
-        {33550, -1, -1, TIFF_DOUBLE, FIELD_CUSTOM, true, true, const_cast<char*>("ModelPixelScaleTag")},
-        {33922, -1, -1, TIFF_DOUBLE, FIELD_CUSTOM, true, true, const_cast<char*>("ModelTiepointTag")},
-    };
-    TIFFMergeFieldInfo(Image, GeoFields, UE_ARRAY_COUNT(GeoFields));
-    uint32 Width = 0, Height = 0;
-    uint16 Bits = 0, Samples = 0, Format = 0;
-    TIFFGetField(Image, TIFFTAG_IMAGEWIDTH, &Width);
-    TIFFGetField(Image, TIFFTAG_IMAGELENGTH, &Height);
-    TIFFGetFieldDefaulted(Image, TIFFTAG_BITSPERSAMPLE, &Bits);
-    TIFFGetFieldDefaulted(Image, TIFFTAG_SAMPLESPERPIXEL, &Samples);
-    TIFFGetFieldDefaulted(Image, TIFFTAG_SAMPLEFORMAT, &Format);
-    const uint64 Count = static_cast<uint64>(Width) * Height;
-    if (Width < 2 || Height < 2 || Count > SkiDomain::MaxHeightSamples || Bits != 32
-        || Samples != 1 || Format != SAMPLEFORMAT_IEEEFP)
-    {
-        TIFFClose(Image);
-        OutError = TEXT("GeoTIFF dimensions or sample encoding are unsupported.");
-        return false;
-    }
-    Out = {};
-    Out.Width = Width;
-    Out.Height = Height;
-    Out.NoDataValue = -9999.0;
-    Out.CurrentRevision = 1;
-    Out.Samples.resize(static_cast<size_t>(Count));
-    for (uint32 Row = 0; Row < Height; ++Row)
-    {
-        if (TIFFReadScanline(Image, Out.Samples.data() + static_cast<size_t>(Row) * Width, Row, 0) < 0)
-        {
-            TIFFClose(Image);
-            OutError = TEXT("GeoTIFF scanline decode failed.");
-            return false;
-        }
-    }
-    OutBounds = RequestedBounds;
-    uint32 ScaleCount = 0, TieCount = 0;
-    double* Scale = nullptr;
-    double* Tie = nullptr;
-    if (TIFFGetField(Image, 33550, &ScaleCount, &Scale) && ScaleCount >= 2 && Scale
-        && TIFFGetField(Image, 33922, &TieCount, &Tie) && TieCount >= 6 && Tie
-        && FMath::IsFinite(Scale[0]) && FMath::IsFinite(Scale[1])
-        && Scale[0] > 0.0 && Scale[1] > 0.0)
-    {
-        OutBounds.WestDeg = Tie[3] - Tie[0] * Scale[0];
-        OutBounds.NorthDeg = Tie[4] + Tie[1] * Scale[1];
-        OutBounds.EastDeg = OutBounds.WestDeg + static_cast<double>(Width) * Scale[0];
-        OutBounds.SouthDeg = OutBounds.NorthDeg - static_cast<double>(Height) * Scale[1];
-    }
-    TIFFClose(Image);
-    const double CenterLat = (OutBounds.SouthDeg + OutBounds.NorthDeg) * 0.5;
-    const double WidthM = (OutBounds.EastDeg - OutBounds.WestDeg) * 111320.0
-        * std::cos(FMath::DegreesToRadians(CenterLat));
-    const double HeightM = (OutBounds.NorthDeg - OutBounds.SouthDeg) * 111320.0;
-    Out.WestM = -WidthM * 0.5;
-    Out.NorthM = HeightM * 0.5;
-    Out.EastSpacingM = WidthM / static_cast<double>(Width - 1);
-    Out.NorthSpacingM = HeightM / static_cast<double>(Height - 1);
-    return SkiDomain::IsValidHeightfield(Out);
 }
 
 double TileX(const double Longitude)
@@ -198,7 +331,8 @@ struct TileImage { int32 X = 0; int32 Y = 0; int32 Width = 0; int32 Height = 0; 
 
 bool AcquireWorldCover(const SkiDomain::GeographicBounds& Bounds,
     const TSharedRef<SkiPreparation::Cancellation>& Cancellation, TArray<uint8>& OutCover,
-    uint32& OutWidth, uint32& OutHeight, FString& OutError)
+    uint32& OutWidth, uint32& OutHeight, FString& OutError,
+    SkiPreparation::ProviderFailure& OutFailure)
 {
     const int32 MinX = FMath::FloorToInt(TileX(Bounds.WestDeg));
     const int32 MaxX = FMath::FloorToInt(TileX(Bounds.EastDeg));
@@ -211,9 +345,14 @@ bool AcquireWorldCover(const SkiDomain::GeographicBounds& Bounds,
         for (int32 Y = MinY; Y <= MaxY; ++Y)
         {
             const FString Url = FString::Printf(TEXT("https://wmts.terrascope.be/?service=WMTS&request=GetTile&version=1.0.0&layer=esa-worldcover-map-10m-2021-v2_map&style=default&format=image/png&tilematrixset=EPSG:3857&TileMatrix=14&TileCol=%d&TileRow=%d&TIME=2021-01-01"), X, Y);
-            TArray<uint8> Bytes;
-            int32 Status = 0;
-            if (!Download(Url, Cancellation, Bytes, Status, OutError)) return false;
+            DownloadResult Downloaded;
+            if (!Download(Url, Cancellation, Downloaded))
+            {
+                PopulateDownloadFailure(Downloaded, SkiPreparation::ProviderProduct::WorldCover, OutFailure);
+                OutError = OutFailure.Summary;
+                return false;
+            }
+            TArray<uint8>& Bytes = Downloaded.Bytes;
             const TSharedPtr<IImageWrapper> Wrapper = Images.CreateImageWrapper(EImageFormat::PNG);
             TileImage Tile;
             Tile.X = X; Tile.Y = Y;
@@ -221,6 +360,16 @@ bool AcquireWorldCover(const SkiDomain::GeographicBounds& Bounds,
                 || !Wrapper->GetRaw(ERGBFormat::RGBA, 8, Tile.Rgba))
             {
                 OutError = TEXT("WorldCover PNG decode failed.");
+                OutFailure = {};
+                OutFailure.Code = TEXT("WORLDCOVER_PNG_DECODE_FAILED");
+                OutFailure.Stage = SkiPreparation::FailureStage::Decoding;
+                OutFailure.Product = SkiPreparation::ProviderProduct::WorldCover;
+                OutFailure.Retry = SkiPreparation::RetryClassification::Retryable;
+                OutFailure.Summary = OutError;
+                OutFailure.HttpStatus = Downloaded.Status;
+                OutFailure.ContentType = Downloaded.ContentType;
+                OutFailure.ResponseBytes = Bytes.Num();
+                OutFailure.ResponseSha256 = SkiPreparation::Sha256(Bytes);
                 return false;
             }
             Tile.Width = Wrapper->GetWidth();
@@ -236,7 +385,17 @@ bool AcquireWorldCover(const SkiDomain::GeographicBounds& Bounds,
     OutCover.Init(255, static_cast<int32>(static_cast<uint64>(OutWidth) * OutHeight));
     for (uint32 Row = 0; Row < OutHeight; ++Row)
     {
-        if (Cancellation->IsCancelled()) { OutError = TEXT("WorldCover derivation cancelled."); return false; }
+        if (Cancellation->IsCancelled())
+        {
+            OutError = TEXT("WorldCover derivation cancelled.");
+            OutFailure = {};
+            OutFailure.Code = TEXT("PREPARATION_CANCELLED");
+            OutFailure.Stage = SkiPreparation::FailureStage::Derivation;
+            OutFailure.Product = SkiPreparation::ProviderProduct::WorldCover;
+            OutFailure.Retry = SkiPreparation::RetryClassification::Retryable;
+            OutFailure.Summary = OutError;
+            return false;
+        }
         const double Latitude = Bounds.NorthDeg - (static_cast<double>(Row) + 0.5) / OutHeight
             * (Bounds.NorthDeg - Bounds.SouthDeg);
         const double Yf = TileY(Latitude);
@@ -255,7 +414,18 @@ bool AcquireWorldCover(const SkiDomain::GeographicBounds& Bounds,
                 WorldCoverCode(Tile->Rgba[Index], Tile->Rgba[Index + 1], Tile->Rgba[Index + 2]);
         }
     }
-    return !OutCover.Contains(255);
+    if (OutCover.Contains(255))
+    {
+        OutError = TEXT("WorldCover contains missing cells.");
+        OutFailure = {};
+        OutFailure.Code = TEXT("WORLDCOVER_INCOMPLETE");
+        OutFailure.Stage = SkiPreparation::FailureStage::Derivation;
+        OutFailure.Product = SkiPreparation::ProviderProduct::WorldCover;
+        OutFailure.Retry = SkiPreparation::RetryClassification::Retryable;
+        OutFailure.Summary = OutError;
+        return false;
+    }
+    return true;
 }
 
 TArray<uint8> FloatBytes(const SkiDomain::Heightfield& Field)
@@ -267,11 +437,17 @@ TArray<uint8> FloatBytes(const SkiDomain::Heightfield& Field)
 }
 }
 
+void SkiPreparation::InitializePreparationDiagnostics(const FString& DataRoot)
+{
+    InitializeDiagnosticsInternal(DataRoot);
+}
+
 SkiPreparation::NativeTerrainProvider::NativeTerrainProvider(FString InDataRoot)
     : DataRoot(std::move(InDataRoot))
 {
     static_assert(MaxNetworkConcurrency == 4 && MaxDecodeConcurrency == 2,
         "P1 resource envelopes are contractual");
+    InitializePreparationDiagnostics(DataRoot);
 }
 
 SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Request& RequestValue,
@@ -279,49 +455,108 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
 {
     Result Output;
     const double Began = FPlatformTime::Seconds();
+    ProviderProduct ActiveProduct = ProviderProduct::None;
     auto Report = [&](const State Phase, const uint64 Completed, const TCHAR* Detail)
     {
+        WriteOperationJournal(DataRoot, RequestValue, Phase, ActiveProduct);
+        AppendPreparationEvent(DataRoot, &RequestValue, TEXT("STATE"), Phase, ActiveProduct);
         if (OnProgress) OnProgress({Phase, Completed, 8, FPlatformTime::Seconds() - Began, Detail});
     };
+    auto FinishFailure = [&](ProviderFailure Failure)
+    {
+        if (CancellationValue->IsCancelled()) Output.FinalState = State::Cancelled;
+        Output.Error = Failure.Summary;
+        WriteFailureDiagnostic(DataRoot, RequestValue, Failure);
+        AppendPreparationEvent(DataRoot, &RequestValue, TEXT("FAILURE"), Output.FinalState,
+            Failure.Product, &Failure);
+        Output.Failure = std::move(Failure);
+    };
     Report(State::Validating, 0, TEXT("Validating native provider request"));
-    if (!ValidateRequest(RequestValue, Output.Error)) return Output;
+    ON_SCOPE_EXIT { ClearOperationJournal(DataRoot); };
+    if (!ValidateRequest(RequestValue, Output.Error))
+    {
+        ProviderFailure Failure;
+        Failure.Code = TEXT("REQUEST_INVALID");
+        Failure.Stage = FailureStage::Validation;
+        Failure.Summary = Output.Error;
+        Failure.Retry = RetryClassification::ChangeSelection;
+        FinishFailure(std::move(Failure));
+        return Output;
+    }
     const int32 RequestedDimension = RequestValue.Profile == SourceProfile::High ? 2000 : 1000;
-    const FString Work = FPaths::Combine(DataRoot, TEXT(".work"), FGuid::NewGuid().ToString(EGuidFormats::Digits));
-    IFileManager::Get().MakeDirectory(*Work, true);
-    const auto Cleanup = [&] { IFileManager::Get().DeleteDirectory(*Work, false, true); };
-    TArray<uint8> CoreBytes;
-    TArray<uint8> SurroundBytes;
-    int32 Status = 0;
+    DownloadResult CoreDownload;
+    DownloadResult SurroundDownload;
+    ActiveProduct = ProviderProduct::CoreElevation;
     Report(State::Acquiring, 1, TEXT("Downloading USGS 3DEP core elevation"));
     int32 ActualRequestDimension = RequestedDimension;
     while (ActualRequestDimension >= 500)
     {
+        CoreDownload = {};
         if (Download(ElevationUrl(RequestValue.Bounds, ActualRequestDimension), CancellationValue,
-            CoreBytes, Status, Output.Error)) break;
-        if (Status < 500 || ActualRequestDimension == 500) { Cleanup(); return Output; }
+            CoreDownload)) break;
+        if (CoreDownload.Status < 500 || ActualRequestDimension == 500)
+        {
+            ProviderFailure Failure;
+            PopulateDownloadFailure(CoreDownload, ProviderProduct::CoreElevation, Failure);
+            FinishFailure(std::move(Failure));
+            return Output;
+        }
         ActualRequestDimension = FMath::Max(500, ActualRequestDimension / 2);
     }
     const SkiDomain::GeographicBounds SurroundRequested = Expand(RequestValue.Bounds, 3000.0);
+    ActiveProduct = ProviderProduct::SurroundingElevation;
     Report(State::Acquiring, 2, TEXT("Downloading required USGS surrounding elevation"));
-    if (!Download(ElevationUrl(SurroundRequested, 1024), CancellationValue,
-        SurroundBytes, Status, Output.Error)) { Cleanup(); return Output; }
+    if (!Download(ElevationUrl(SurroundRequested, 1024), CancellationValue, SurroundDownload))
+    {
+        ProviderFailure Failure;
+        PopulateDownloadFailure(SurroundDownload, ProviderProduct::SurroundingElevation, Failure);
+        FinishFailure(std::move(Failure));
+        return Output;
+    }
+    ActiveProduct = ProviderProduct::CoreElevation;
     Report(State::Decoding, 3, TEXT("Decoding GeoTIFF elevation grids"));
-    SkiDomain::Heightfield Core;
-    SkiDomain::Heightfield Surround;
-    SkiDomain::GeographicBounds ActualBounds;
-    SkiDomain::GeographicBounds SurroundBounds;
-    if (!DecodeTiff(CoreBytes, FPaths::Combine(Work, TEXT("core.tif")), RequestValue.Bounds,
-            Core, ActualBounds, Output.Error)
-        || !DecodeTiff(SurroundBytes, FPaths::Combine(Work, TEXT("surround.tif")), SurroundRequested,
-            Surround, SurroundBounds, Output.Error)) { Cleanup(); return Output; }
+    DecodedElevationRaster CoreRaster;
+    DecodedElevationRaster SurroundRaster;
+    ProviderFailure DecodeFailure;
+    if (!DecodeElevationGeoTiff(CoreDownload.Bytes, RequestValue.Bounds,
+            ProviderProduct::CoreElevation, CoreRaster, DecodeFailure))
+    {
+        DecodeFailure.HttpStatus = CoreDownload.Status;
+        DecodeFailure.ContentType = CoreDownload.ContentType;
+        DecodeFailure.ResponseBytes = CoreDownload.Bytes.Num();
+        DecodeFailure.ResponseSha256 = Sha256(CoreDownload.Bytes);
+        FinishFailure(std::move(DecodeFailure));
+        return Output;
+    }
+    ActiveProduct = ProviderProduct::SurroundingElevation;
+    WriteOperationJournal(DataRoot, RequestValue, State::Decoding, ActiveProduct);
+    if (!DecodeElevationGeoTiff(SurroundDownload.Bytes, SurroundRequested,
+            ProviderProduct::SurroundingElevation, SurroundRaster, DecodeFailure))
+    {
+        DecodeFailure.HttpStatus = SurroundDownload.Status;
+        DecodeFailure.ContentType = SurroundDownload.ContentType;
+        DecodeFailure.ResponseBytes = SurroundDownload.Bytes.Num();
+        DecodeFailure.ResponseSha256 = Sha256(SurroundDownload.Bytes);
+        FinishFailure(std::move(DecodeFailure));
+        return Output;
+    }
+    SkiDomain::Heightfield Core = std::move(CoreRaster.Heightfield);
+    SkiDomain::Heightfield Surround = std::move(SurroundRaster.Heightfield);
+    const SkiDomain::GeographicBounds ActualBounds = CoreRaster.ActualOuterBounds;
+    ActiveProduct = ProviderProduct::WorldCover;
     Report(State::Acquiring, 4, TEXT("Downloading required ESA WorldCover tiles"));
     TArray<uint8> Cover;
     uint32 CoverWidth = 0, CoverHeight = 0;
-    if (!AcquireWorldCover(ActualBounds, CancellationValue, Cover, CoverWidth, CoverHeight, Output.Error))
+    ProviderFailure CoverFailure;
+    if (!AcquireWorldCover(ActualBounds, CancellationValue, Cover, CoverWidth, CoverHeight,
+            Output.Error, CoverFailure))
     {
         if (Output.Error.IsEmpty()) Output.Error = TEXT("WorldCover contains missing cells.");
-        Cleanup(); return Output;
+        if (CoverFailure.Summary.IsEmpty()) CoverFailure.Summary = Output.Error;
+        FinishFailure(std::move(CoverFailure));
+        return Output;
     }
+    ActiveProduct = ProviderProduct::None;
     Report(State::Deriving, 5, TEXT("Deriving compact cover and contour products"));
     TArray<PackageAssetBytes> Assets;
     Assets.Add({TEXT("cover.u8"), TEXT("worldcover-byte-grid"), std::move(Cover), true, {},
@@ -364,11 +599,26 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
     Report(State::WritingStaging, 6, TEXT("Writing content-addressed package staging"));
     PackageStore Store(DataRoot);
     if (!Store.WriteAndActivate(std::move(Manifest), Core, Output.PackageDirectory,
-        Output.Manifest, Output.Error, Assets)) { Cleanup(); return Output; }
+        Output.Manifest, Output.Error, Assets))
+    {
+        ProviderFailure Failure;
+        Failure.Code = TEXT("PACKAGE_WRITE_FAILED");
+        Failure.Stage = FailureStage::Writing;
+        Failure.Summary = Output.Error;
+        FinishFailure(std::move(Failure));
+        return Output;
+    }
     Report(State::Verifying, 7, TEXT("Verifying activated package"));
     if (!Store.Load(UTF8_TO_TCHAR(Output.Manifest.ContentId.c_str()), Output.Manifest,
-        Output.Heightfield, Output.Error, &Output.Cover)) { Cleanup(); return Output; }
-    Cleanup();
+        Output.Heightfield, Output.Error, &Output.Cover))
+    {
+        ProviderFailure Failure;
+        Failure.Code = TEXT("PACKAGE_VERIFY_FAILED");
+        Failure.Stage = FailureStage::Verification;
+        Failure.Summary = Output.Error;
+        FinishFailure(std::move(Failure));
+        return Output;
+    }
     Output.Ok = true;
     Output.FinalState = State::Installed;
     Report(State::Installed, 8, TEXT("Native terrain package installed"));

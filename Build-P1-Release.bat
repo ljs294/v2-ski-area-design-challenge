@@ -22,19 +22,55 @@ if errorlevel 1 (
   set "PYTHON_COMMAND=py -3"
 )
 
-echo [1/2] Building the self-contained Shipping package...
+echo [1/5] Running the focused GeoTIFF crash regression...
 echo.
-call %PYTHON_COMMAND% Tools\Build\p1.py package --configuration Shipping
+call %PYTHON_COMMAND% Tools\Build\p1.py tiff
 if errorlevel 1 (
   echo.
-  echo ERROR: Shipping packaging failed. Review the messages above.
+  echo ERROR: Focused GeoTIFF regression failed. The release was not built.
   echo.
   pause
   exit /b 1
 )
 
 echo.
-echo [2/2] Creating the tester folder and ZIP...
+echo [2/5] Running the complete P1 preparation automation group...
+echo.
+call %PYTHON_COMMAND% Tools\Build\p1.py automation
+if errorlevel 1 (
+  echo.
+  echo ERROR: P1 automation failed. The release was not built.
+  echo.
+  pause
+  exit /b 1
+)
+
+echo.
+echo [3/5] Building the self-contained Shipping package...
+echo.
+call %PYTHON_COMMAND% Tools\Build\p1.py package --configuration Shipping
+if errorlevel 1 (
+  echo.
+  echo ERROR: Shipping packaging failed. Review the run-output path above.
+  echo.
+  pause
+  exit /b 1
+)
+
+echo.
+echo [4/5] Running the GeoTIFF regression through the Shipping executable...
+echo.
+call %PYTHON_COMMAND% Tools\Build\p1.py smoke --configuration Shipping --scenario geotiff-regression
+if errorlevel 1 (
+  echo.
+  echo ERROR: The packaged GeoTIFF regression failed. The release was not assembled.
+  echo.
+  pause
+  exit /b 1
+)
+
+echo.
+echo [5/5] Creating the tester folder and ZIP...
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "Tools\Build\assemble_p1_release.ps1"
 if errorlevel 1 (
@@ -53,6 +89,6 @@ echo.
 echo Give testers the ZIP. After extracting it, they can double-click
 echo START MOUNTAIN PLANNER.bat or START SAMPLE TERRAIN.bat.
 echo.
-pause
+if /i not "%~1"=="nopause" pause
 endlocal
 exit /b 0

@@ -72,3 +72,32 @@ const TCHAR* SkiPreparation::StateName(const State Value) noexcept
     }
     return TEXT("Unknown");
 }
+
+const TCHAR* SkiPreparation::FailureStageName(const FailureStage Value) noexcept
+{
+    switch (Value)
+    {
+    case FailureStage::Validation: return TEXT("validation");
+    case FailureStage::Acquisition: return TEXT("acquisition");
+    case FailureStage::Decoding: return TEXT("decoding");
+    case FailureStage::Derivation: return TEXT("derivation");
+    case FailureStage::Writing: return TEXT("writing");
+    case FailureStage::Verification: return TEXT("verification");
+    case FailureStage::Activation: return TEXT("activation");
+    }
+    return TEXT("unknown");
+}
+
+const TCHAR* SkiPreparation::ProviderProductName(const ProviderProduct Value) noexcept
+{
+    switch (Value)
+    {
+    case ProviderProduct::None: return TEXT("provider data");
+    case ProviderProduct::CoreElevation: return TEXT("USGS core elevation");
+    case ProviderProduct::SurroundingElevation: return TEXT("USGS surrounding elevation");
+    case ProviderProduct::WorldCover: return TEXT("ESA WorldCover");
+    case ProviderProduct::Imagery: return TEXT("USGS NAIP imagery");
+    case ProviderProduct::VectorContext: return TEXT("Overpass vector context");
+    }
+    return TEXT("provider data");
+}
