@@ -1,6 +1,6 @@
 # Unreal P1 runbook
 
-P1 starts from committed P0 baseline `31af9880e12bd8230508a42ca6789d405e5b4bbe`. The v0.9 planning archive is retained reference material; its P0 prompts and historical archives are not active instructions. Sol High is the main coordination and implementation agent. The user alone stages and commits accepted section boundaries.
+P1 starts from committed P0 baseline `31af9880e12bd8230508a42ca6789d405e5b4bbe`. The v0.9 planning archive is retained reference material; its P0 prompts and historical archives are not active instructions. Sol High is the main coordination and implementation agent. The Section 0 implementation checkpoint is frozen at `de7413dee3e011529c6289ce631c782a58873b1e`; that records a baseline, not owner acceptance of the still-open Section 0 rows. For the remaining-plan execution begun 2026-09-22, the owner explicitly authorized the main agent to continue beyond that open acceptance boundary and to stage and commit tested section checkpoints while the owner is away. That exception does not grant unrelated repository or global-system changes.
 
 The live accounting record is [the P1 requirement and acceptance matrix](P1-requirement-matrix.md). Code presence does not close a row without its named deterministic and packaged evidence; owner-review rows also require explicit owner acceptance.
 
@@ -10,7 +10,12 @@ P1 proves that one packaged Windows runtime can select, prepare, install, render
 
 Dependency direction is `SkiDomain -> SkiApplication -> SkiPreparation/SkiTerrainRuntime -> SkiPresentation`. `SkiDomain` remains ordinary C++ and owns coordinates, heightfields, manifests, tiling, queries and revisions. `SkiPreparation` owns runtime provider/decoder/storage adapters. `SkiTerrainRuntime` owns Unreal geometry and presentation readiness. Only the integrator changes targets, module rules, project/config files, generated assets and packaging.
 
-## Section gates
+## Original P1 product gates
+
+The numbered P1.1-P1.8 gates below are the original product-scope sections. They
+are distinct from the later remaining-plan delivery checkpoints, whose Section 1
+is the shared TerrainCore foundation and whose Section 2 completes the original
+P1 product on Medium terrain.
 
 1. **P1.1:** schema-1 fixture package, pure coordinate/heightfield/manifest tests, packaged Dynamic Mesh tile import, query and bounded scratch mutation.
 2. **P1.2:** the same terrain gains pre-cooked slope/altitude/cover materials, three art-light presets, overlays and 3,000 batched dots.
@@ -21,7 +26,25 @@ Dependency direction is `SkiDomain -> SkiApplication -> SkiPreparation/SkiTerrai
 7. **P1.7:** combined editability, picking, lighting, LOD and resource/performance proof on the same implementation.
 8. **P1.8:** prepare after build, activate, exit and reopen offline from an isolated data root without editor, Node, Python, dev server or uncooked content.
 
+Here, "offline" is an application contract: the production acquisition transport is
+denied before request construction and the harness samples the owned process tree for TCP
+listeners and remote endpoints. It is not a claim of OS-level network isolation; the harness
+does not change Windows Firewall or other machine-wide security settings.
+
 No section automatically authorizes the next. Failure of packaged Geometry Framework editability/appearance, CEF selector support, security validation or the declared resource envelope stops the owning section; no alternate product or picker is substituted without owner direction.
+
+## Remaining-plan checkpoint map
+
+0. **Current-remediation baseline:** GeoTIFF, acquisition, diagnostics, responsive UI and release harness. Commit `de7413dee3e011529c6289ce631c782a58873b1e` freezes the implementation baseline; open owner/evidence rows remain open.
+1. **Shared TerrainCore foundation:** TerrainCore v2 contracts, deterministic LOD shards, bounded disk-backed residency, canonical queries, sparse edit sidecars and schema-1 read compatibility. These are the `TC1-*` matrix rows.
+2. **Complete original P1 on Medium:** analytical cover, remaining viewer/selector/product behavior, integrated visual/performance/offline qualification and owner acceptance.
+3. **P1A:** verified 1 m lidar availability, bounded COG acquisition/reprojection and packaged High qualification.
+4. **P2A:** independent CoverEcology channels, source/epoch policy, held-out quality gates and packaged ecology evidence.
+
+Implementation completion never substitutes for an evidence or owner-acceptance
+row. The explicit 2026-09-22 continuation authorization permits work on later
+checkpoints while earlier owner-review rows remain open; it does not mark those
+rows accepted.
 
 ## Commands and evidence
 
@@ -30,6 +53,7 @@ Run focused pure and adapter tests first, then expand only for the owning gate:
 ```powershell
 python Tools/Build/p1.py check
 python Tools/Build/p1.py domain
+python Tools/Build/p1.py terraincore
 python Tools/Build/p1.py build
 python Tools/Build/p1.py automation
 python Tools/Build/p1.py assets
@@ -41,6 +65,7 @@ python Tools/Build/p1.py package --configuration Shipping
 python Tools/Build/p1.py smoke --configuration Shipping --scenario selector
 python Tools/Build/p1.py smoke --configuration Shipping --scenario import
 python Tools/Build/p1.py smoke --configuration Shipping --scenario offline-reopen --content-id <content-id-from-import-receipt>
+python Tools/Build/p1.py smoke --configuration Shipping --scenario terraincore-regression
 ```
 
 Receipts belong under ignored `test-results/p1/` and identify frozen source, engine/toolchain, configuration, package manifest, fixture/content hashes, actual hardware/RHI/resolution, test counts, failures/skips and unavailable metrics. Live-provider evidence is separately labeled and never inferred from saved fixtures. Source/editor writes stop during final qualification and any separately authorized non-author review.

@@ -73,11 +73,12 @@ void USkiP1Widget::NativeOnInitialized()
     ReadyControls->AddChildToVerticalBox(Grid);
     AddGridCommandButton(Grid, TEXT("Presentation"), TEXT("Presentation"), 0, 0); AddGridCommandButton(Grid, TEXT("Elevation"), TEXT("Elevation"), 0, 1);
     AddGridCommandButton(Grid, TEXT("Slope classes"), TEXT("Slope"), 1, 0); AddGridCommandButton(Grid, TEXT("Cover classes"), TEXT("Cover"), 1, 1);
-    AddGridCommandButton(Grid, TEXT("Tile / LOD"), TEXT("Lod"), 2, 0); AddGridCommandButton(Grid, TEXT("LOD 0 (full)"), TEXT("Lod0"), 2, 1);
-    AddGridCommandButton(Grid, TEXT("LOD 1 (half)"), TEXT("Lod1"), 3, 0); AddGridCommandButton(Grid, TEXT("LOD 2 (quarter)"), TEXT("Lod2"), 3, 1);
-    AddGridCommandButton(Grid, TEXT("Vertical 1×"), TEXT("Vertical1"), 4, 0); AddGridCommandButton(Grid, TEXT("Vertical 2×"), TEXT("Vertical2"), 4, 1);
-    AddGridCommandButton(Grid, TEXT("Vertical 4×"), TEXT("Vertical4"), 5, 0); AddGridCommandButton(Grid, TEXT("Clear midday"), TEXT("Midday"), 5, 1);
-    AddGridCommandButton(Grid, TEXT("Low angle"), TEXT("LowAngle"), 6, 0); AddGridCommandButton(Grid, TEXT("Overcast"), TEXT("Overcast"), 6, 1);
+    AddGridCommandButton(Grid, TEXT("Tile / LOD"), TEXT("Lod"), 2, 0); AddGridCommandButton(Grid, TEXT("LOD Auto"), TEXT("LodAuto"), 2, 1);
+    AddGridCommandButton(Grid, TEXT("LOD 0 (full)"), TEXT("Lod0"), 3, 0); AddGridCommandButton(Grid, TEXT("LOD 1 (half)"), TEXT("Lod1"), 3, 1);
+    AddGridCommandButton(Grid, TEXT("LOD 2 (quarter)"), TEXT("Lod2"), 4, 0); AddGridCommandButton(Grid, TEXT("Vertical 1×"), TEXT("Vertical1"), 4, 1);
+    AddGridCommandButton(Grid, TEXT("Vertical 2×"), TEXT("Vertical2"), 5, 0); AddGridCommandButton(Grid, TEXT("Vertical 4×"), TEXT("Vertical4"), 5, 1);
+    AddGridCommandButton(Grid, TEXT("Clear midday"), TEXT("Midday"), 6, 0); AddGridCommandButton(Grid, TEXT("Low angle"), TEXT("LowAngle"), 6, 1);
+    AddGridCommandButton(Grid, TEXT("Overcast"), TEXT("Overcast"), 7, 0);
     UTextBlock* Controls = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Controls")); Controls->SetAutoWrapText(true);
     Controls->SetText(FText::FromString(TEXT("RMB orbit • MMB pan • wheel zoom • F/Home frame all • 1 full • 2 close • 3 last probe • Esc release"))); ReadyControls->AddChildToVerticalBox(Controls);
     SetShellState(EP1ShellState::Selecting);
@@ -122,7 +123,7 @@ void USkiP1Widget::BindCommandButton(UButton* Button, const FName Name)
     if (Name==TEXT("Retry")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::RetryClicked); else if (Name==TEXT("ChangeSelection")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::ChangeSelectionClicked);
     else if (Name==TEXT("Presentation")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::PresentationClicked); else if (Name==TEXT("Elevation")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::ElevationClicked);
     else if (Name==TEXT("Slope")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::SlopeClicked); else if (Name==TEXT("Cover")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::CoverClicked);
-    else if (Name==TEXT("Lod")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::LodClicked); else if(Name==TEXT("Lod0"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Lod0Clicked); else if(Name==TEXT("Lod1"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Lod1Clicked); else if(Name==TEXT("Lod2"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Lod2Clicked);
+    else if (Name==TEXT("Lod")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::LodClicked); else if(Name==TEXT("LodAuto"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::LodAutoClicked); else if(Name==TEXT("Lod0"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Lod0Clicked); else if(Name==TEXT("Lod1"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Lod1Clicked); else if(Name==TEXT("Lod2"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Lod2Clicked);
     else if(Name==TEXT("Vertical1"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Vertical1Clicked); else if(Name==TEXT("Vertical2"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Vertical2Clicked); else if(Name==TEXT("Vertical4"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Vertical4Clicked);
     else if(Name==TEXT("Midday"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::MiddayClicked); else if(Name==TEXT("LowAngle"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::LowAngleClicked); else Button->OnClicked.AddDynamic(this,&USkiP1Widget::OvercastClicked);
 }
@@ -159,6 +160,7 @@ void USkiP1Widget::SetShellState(const EP1ShellState State){ShellState=State;con
 void USkiP1Widget::RetryClicked(){if(RetryButton)RetryButton->SetIsEnabled(false);SetShellState(EP1ShellState::Preparing);if(RetryHandler)RetryHandler();} void USkiP1Widget::ChangeSelectionClicked(){if(ChangeSelectionHandler)ChangeSelectionHandler();}
 void USkiP1Widget::PresentationClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Presentation"));} void USkiP1Widget::ElevationClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Elevation"));}
 void USkiP1Widget::SlopeClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Slope"));} void USkiP1Widget::CoverClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Cover"));} void USkiP1Widget::LodClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Lod"));}
+void USkiP1Widget::LodAutoClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("LodAuto"));}
 void USkiP1Widget::Lod0Clicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Lod0"));} void USkiP1Widget::Lod1Clicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Lod1"));} void USkiP1Widget::Lod2Clicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Lod2"));}
 void USkiP1Widget::Vertical1Clicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Vertical1"));} void USkiP1Widget::Vertical2Clicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Vertical2"));} void USkiP1Widget::Vertical4Clicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Vertical4"));}
 void USkiP1Widget::MiddayClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Midday"));} void USkiP1Widget::LowAngleClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("LowAngle"));} void USkiP1Widget::OvercastClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Overcast"));}

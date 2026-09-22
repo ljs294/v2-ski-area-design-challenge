@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GameFramework/GameModeBase.h"
+#include "SkiApplication/TerrainCoreSession.h"
 #include "SkiApplication/TerrainSession.h"
 #include "SkiPreparation/TerrainPreparation.h"
 #include "SkiBootstrapGameMode.generated.h"
@@ -39,6 +40,7 @@ private:
     TObjectPtr<ASkiTerrainActor> TerrainActor;
 
     TSharedPtr<SkiApplication::TerrainSession> TerrainSession;
+    TSharedPtr<SkiApplication::TerrainCoreSession> TerrainCoreSession;
     TSharedPtr<SkiPreparation::Cancellation> PreparationCancellation;
     TSharedPtr<SkiPreparation::PreparationOperationLease, ESPMode::ThreadSafe> PreparationLease;
     TOptional<SkiPreparation::Request> LastRequest;
@@ -56,5 +58,6 @@ private:
     FString UiLayoutReceiptPath;
     FString UiLayoutToken;
     bool bUiInputIsolationValid = false;
+    bool bTerrainCoreInitialFramePending = false;
     FString UiInputIsolationError;
 };

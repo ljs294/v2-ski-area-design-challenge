@@ -44,6 +44,7 @@ private:
     UFUNCTION() void RetryClicked(); UFUNCTION() void ChangeSelectionClicked();
     UFUNCTION() void PresentationClicked(); UFUNCTION() void ElevationClicked();
     UFUNCTION() void SlopeClicked(); UFUNCTION() void CoverClicked(); UFUNCTION() void LodClicked();
+    UFUNCTION() void LodAutoClicked();
     UFUNCTION() void Lod0Clicked(); UFUNCTION() void Lod1Clicked(); UFUNCTION() void Lod2Clicked();
     UFUNCTION() void Vertical1Clicked(); UFUNCTION() void Vertical2Clicked(); UFUNCTION() void Vertical4Clicked();
     UFUNCTION() void MiddayClicked(); UFUNCTION() void LowAngleClicked(); UFUNCTION() void OvercastClicked();

@@ -6,9 +6,10 @@ test and packaged receipt from one frozen source digest; `OWNER` additionally
 requires owner visual or workflow acceptance. A blank or `OPEN` row is not made
 complete by another row passing.
 
-The current Section 0 remediation must be accepted and committed by the owner
-before TerrainCore v2, P1A, or P2A implementation starts. The user alone stages
-and commits section boundaries.
+The Section 0 remediation is frozen in commit `de7413dee3e011529c6289ce631c782a58873b1e`.
+For the remaining-plan execution begun 2026-09-22, the owner explicitly authorized
+the main Sol agent to stage and commit each tested section boundary while the owner
+is away. That authorization is limited to this implementation sequence.
 
 | ID | Requirement | Implementation | Deterministic test | Packaged evidence | Status |
 | --- | --- | --- | --- | --- | --- |
@@ -18,6 +19,12 @@ and commits section boundaries.
 | S0-04 | Actionable redacted diagnostics, interruption journal and tester access | native diagnostics plus application JSONL log | `ProviderDiagnostics` in full P1 automation | abnormal packaged runs copy bounded isolated crash context; tester has `OPEN DIAGNOSTICS.bat` | Section 0 gate pending final frozen run |
 | S0-05 | Responsive recovery UI and terrain-input isolation | existing P1 right-side shell and terrain view controller | `p1.py ui` supported viewport set | Shipping `ui-layout` | Section 0 gate pending final frozen run and owner review |
 | S0-06 | One immutable source identity across focused gates, cook, Shipping regressions and release | `p1.py` freeze and release assembler | exact automation-name parser tooling tests | receipt/package file hashes and source digest checked at assembly | Section 0 gate pending final release run |
+| TC1-01 | Separate TerrainCore v2 contract while schema-1 remains readable and its existing source contract stays unchanged | `SkiDomain/TerrainCore`; schema-1 manifest/store unchanged from the Section 0 checkpoint | `p1.py terraincore`; schema-1 round-trip compatibility automation plus checkpoint source diff | Shipping `terraincore-regression` | PASS at the Section 1 checkpoint evidence set |
+| TC1-02 | 256-sample overlapping tiles, partial edges, one-sample halo and deterministic 1/2/4/8/16 LOD factors | TerrainCore planner and derivation | pure TerrainCore plus store attacks | Shipping TerrainCore receipt | PASS at the Section 1 checkpoint evidence set |
+| TC1-03 | Incremental content-addressed shard store and bounded tile reads | `TerrainCorePackageStore`; handle-relative Windows metadata/shard I/O | store round-trip, malformed UTF-8, reparse substitution and hostile-path automation | Shipping activation/reopen receipt | PASS at the Section 1 checkpoint evidence set |
+| TC1-04 | 512 MiB default disk-backed residency, bounded publication, LRU/pins/single-flight and stale rejection | application repository/session and runtime tile cache | residency/publication automation, including small-budget eviction | Shipping records the 512 MiB production default and separately exercises bounded small-budget eviction | PASS at the Section 1 checkpoint evidence set |
+| TC1-05 | Finest-data canonical queries, per-tile LOD hysteresis and adjacent emitted-tile delta no greater than one | runtime cache/query and LOD controller | triangle-specific nodata queries, adversarial post-coalescing adjacency and runtime LOD automation | Shipping finest-query and production renderer proof | PASS at the Section 1 checkpoint evidence set |
+| TC1-06 | One cumulative bounded sparse edit sidecar keyed to immutable TerrainCore ID; offline reopen without base mutation | flattened TerrainCore edit repository, edit store and change receipts | 256-repeat bounded-overlay and edit-persistence automation | Shipping separate-process acquisition-port-denied reopen | PASS at the Section 1 checkpoint evidence set |
 | P1.1-01 | Portable immutable schema-1 package with hostile-input validation | schema-1 domain manifest/package store | `PackageAndProtocol`; domain tests | packaged import/reopen | Implemented; integrated frozen evidence OPEN |
 | P1.1-02 | Editable Dynamic Mesh terrain tiles with shared samples, skirts and normal halo | `SkiTerrainRuntime` | runtime automation coverage is partial | packaged import/edit receipt | Implemented; owner editability acceptance OPEN |
 | P1.1-03 | Full/half/quarter LOD with adjacent difference no greater than one | runtime terrain actor | LOD unit/automation coverage is partial | visual/performance receipt | Implemented; seam and performance acceptance OPEN |
@@ -40,7 +47,7 @@ and commits section boundaries.
 | P1.7-02 | Synthetic, Crystal 2 km and reference 10 km datasets remain separately identified | fixtures/live qualification | fixture hashes and provider checks | separate receipts/captures | Synthetic present; live reference evidence OPEN |
 | P1.7-03 | Full and steepest-quadrant views under three lights plus elevation/slope/cover/LOD/topology diagnostics | viewer and visual harness | camera/mode automation | tokened screenshots and SHA-256 receipts | Implemented in part; final evidence and OWNER review OPEN |
 | P1.7-04 | Declared frame, gap, cancellation and reopen performance bounds | performance harness | deterministic controls | cold/warm packaged performance receipt | OPEN |
-| P1.8-01 | Shipping build prepares after cook, activates, exits, loses network and reopens without development dependencies | provider/package/runtime | full automation | post-cook live prepare and network-denied reopen | OPEN |
+| P1.8-01 | Shipping build prepares after cook, activates, exits and reopens without development dependencies while the production acquisition port is denied | provider/package/runtime | full automation | post-cook live prepare; acquisition-port-denied reopen plus process-attributed TCP sampling with no observed listeners/endpoints | OPEN; current harness does not claim OS-level network isolation |
 | P1.8-02 | Tester bundle is self-contained with direct launch and diagnostics access | release assembler | package-tree/source-freeze validation | assembled folder and ZIP | Section 0 final release gate pending |
 | P1-MCP-01 | Unreal MCP remains editor-only, loopback-only, selected toolsets only and absent from Shipping | project descriptor and local `.codex` config | static project checks | packaged module/listener assertion | Implemented; final Shipping assertion OPEN |
 

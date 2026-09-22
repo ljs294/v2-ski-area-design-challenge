@@ -3,6 +3,7 @@
     "Source/SkiDomain/Private/Core/Coordinates.cpp",
     "Source/SkiDomain/Private/Core/Heightfield.cpp",
     "Source/SkiDomain/Private/Core/Revision.cpp",
+    "Source/SkiDomain/Private/Core/TerrainCore.cpp",
     "Source/SkiDomain/Private/Core/TerrainPackage.cpp",
     "Source/SkiDomain/Private/Core/TerrainTile.cpp"
   ],
@@ -11,6 +12,7 @@
     "Source/SkiDomain/Public/SkiDomain/Export.h",
     "Source/SkiDomain/Public/SkiDomain/Heightfield.h",
     "Source/SkiDomain/Public/SkiDomain/Revision.h",
+    "Source/SkiDomain/Public/SkiDomain/TerrainCore.h",
     "Source/SkiDomain/Public/SkiDomain/TerrainPackage.h",
     "Source/SkiDomain/Public/SkiDomain/TerrainTile.h"
   ]

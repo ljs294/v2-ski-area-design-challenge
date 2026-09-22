@@ -50,6 +50,8 @@ FCriticalSection ResourceGateMutex;
 int32 ActiveNetworkRequests = 0;
 int32 ActiveElevationRequests = 0;
 int32 ActiveDecodeJobs = 0;
+std::atomic<int32> AcquisitionPortDenyDepth = 0;
+std::atomic<uint64> AcquisitionTransportCalls = 0;
 
 bool IsElevationProduct(const SkiPreparation::ProviderProduct Product)
 {
@@ -130,9 +132,45 @@ private:
 };
 }
 
+SkiPreparation::ScopedAcquisitionPortDeny::ScopedAcquisitionPortDeny()
+    : StartingTransportCalls(AcquisitionTransportCalls.load(std::memory_order_acquire))
+    , bInstalled(true)
+{
+    AcquisitionPortDenyDepth.fetch_add(1, std::memory_order_acq_rel);
+}
+
+SkiPreparation::ScopedAcquisitionPortDeny::~ScopedAcquisitionPortDeny()
+{
+    if (bInstalled)
+    {
+        AcquisitionPortDenyDepth.fetch_sub(1, std::memory_order_acq_rel);
+        bInstalled = false;
+    }
+}
+
+bool SkiPreparation::ScopedAcquisitionPortDeny::IsActive() const noexcept
+{
+    return bInstalled && AcquisitionPortDenyDepth.load(std::memory_order_acquire) > 0;
+}
+
+uint64 SkiPreparation::ScopedAcquisitionPortDeny::ObservedTransportCalls() const noexcept
+{
+    const uint64 Current = AcquisitionTransportCalls.load(std::memory_order_acquire);
+    return Current >= StartingTransportCalls ? Current - StartingTransportCalls : MAX_uint64;
+}
+
 SkiPreparation::HttpAcquisitionResult SkiPreparation::UnrealHttpAcquisitionTransport::Get(
     const HttpAcquisitionRequest& Request, const TSharedRef<Cancellation>& Cancellation)
 {
+    AcquisitionTransportCalls.fetch_add(1, std::memory_order_acq_rel);
+    if (AcquisitionPortDenyDepth.load(std::memory_order_acquire) > 0)
+    {
+        HttpAcquisitionResult Denied;
+        Denied.FailureReason = TransportFailureReason::Cancelled;
+        Denied.RequestStatus = TEXT("BlockedByOfflineGuard");
+        Denied.Attempt = Request.Attempt;
+        return Denied;
+    }
     const TSharedRef<FRequestState> State = MakeShared<FRequestState>();
     State->BackendLifetime = Request.BackendLifetime;
     State->BeganSeconds = FPlatformTime::Seconds();

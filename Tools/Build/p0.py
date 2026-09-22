@@ -137,12 +137,10 @@ def verify_asset_changes(before: dict, after: dict) -> None:
 
 
 def package_manifest(directory: Path) -> dict:
-    """Fingerprint shipped files; Unreal's runtime Saved directories are outputs."""
+    """Fingerprint every shipped file, including any Saved content, without exclusions."""
     files = {}
     for path in sorted(directory.rglob("*")):
         relative = path.relative_to(directory)
-        if "Saved" in relative.parts:
-            continue
         resolve_inside(directory, relative.as_posix())
         if path.is_file():
             files[relative.as_posix()] = sha(path)

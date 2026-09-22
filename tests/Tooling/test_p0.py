@@ -160,11 +160,14 @@ class PackageEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(p0.Failed, "files changed"):
             p0.verify_package_receipt(self.receipt, "source", "Shipping")
 
-    def test_added_binary_invalidates_package_but_runtime_logs_do_not(self):
+    def test_added_binary_and_saved_runtime_output_invalidate_package(self):
         saved = self.launcher.parent / "Saved/Logs"
         saved.mkdir(parents=True)
         (saved / "runtime.log").write_text("runtime output")
-        p0.verify_package_receipt(self.receipt, "source", "Shipping")
+        self.assertIn("Windows/Saved/Logs/runtime.log", p0.package_manifest(self.root)["files"])
+        with self.assertRaisesRegex(p0.Failed, "files changed"):
+            p0.verify_package_receipt(self.receipt, "source", "Shipping")
+        (saved / "runtime.log").unlink()
         (self.launcher.parent / "unexpected.dll").write_bytes(b"extra library")
         with self.assertRaisesRegex(p0.Failed, "files changed"):
             p0.verify_package_receipt(self.receipt, "source", "Shipping")

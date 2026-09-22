@@ -512,6 +512,22 @@ bool FP1AcquisitionRetryPolicyTest::RunTest(const FString&)
         FPlatformTime::Seconds() - CancelBegan <= 0.250);
     TestEqual(TEXT("Cancellation prevents another transport attempt"), CancelledTransport.Observed.Num(), 1);
 
+    {
+        SkiPreparation::ScopedAcquisitionPortDeny OfflineGuard;
+        SkiPreparation::UnrealHttpAcquisitionTransport ProductionTransport;
+        SkiPreparation::HttpAcquisitionRequest DeniedRequest;
+        DeniedRequest.Url = TEXT("https://invalid.example.test/must-not-open");
+        const TSharedRef<SkiPreparation::Cancellation> DeniedCancellation =
+            MakeShared<SkiPreparation::Cancellation>();
+        const SkiPreparation::HttpAcquisitionResult Denied =
+            ProductionTransport.Get(DeniedRequest, DeniedCancellation);
+        TestTrue(TEXT("Offline guard is installed"), OfflineGuard.IsActive());
+        TestEqual(TEXT("Offline guard rejects before an HTTP request is constructed"),
+            Denied.RequestStatus, FString(TEXT("BlockedByOfflineGuard")));
+        TestEqual(TEXT("Offline guard counts the blocked application transport call"),
+            OfflineGuard.ObservedTransportCalls(), uint64(1));
+    }
+
     auto RunConcurrentAcquisitions = [&](const SkiPreparation::ProviderProduct Product,
         const int32 Count, int32& OutMaximum)
     {

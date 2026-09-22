@@ -23,7 +23,7 @@ if errorlevel 1 (
 )
 
 set "SKI_P1_RELEASE_FREEZE=test-results\p1\release-freeze.json"
-echo [1/10] Freezing the release-wide source identity...
+echo [1/12] Freezing the release-wide source identity...
 echo.
 call %PYTHON_COMMAND% Tools\Build\p1.py freeze
 if errorlevel 1 (
@@ -35,7 +35,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/10] Running the focused GeoTIFF crash regression...
+echo [2/12] Running the focused GeoTIFF crash regression...
 echo.
 call %PYTHON_COMMAND% Tools\Build\p1.py tiff
 if errorlevel 1 (
@@ -47,7 +47,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [3/10] Running the focused acquisition and retry regression...
+echo [3/12] Running the focused acquisition and retry regression...
 echo.
 call %PYTHON_COMMAND% Tools\Build\p1.py acquisition
 if errorlevel 1 (
@@ -59,7 +59,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [4/10] Running the focused responsive UI regression...
+echo [4/12] Running the focused responsive UI regression...
 echo.
 call %PYTHON_COMMAND% Tools\Build\p1.py ui
 if errorlevel 1 (
@@ -71,7 +71,19 @@ if errorlevel 1 (
 )
 
 echo.
-echo [5/10] Running the complete P1 automation group...
+echo [5/12] Running the focused TerrainCore streaming and persistence regression...
+echo.
+call %PYTHON_COMMAND% Tools\Build\p1.py terraincore
+if errorlevel 1 (
+  echo.
+  echo ERROR: Focused TerrainCore regression failed. The release was not built.
+  echo.
+  if /i not "%~1"=="nopause" pause
+  exit /b 1
+)
+
+echo.
+echo [6/12] Running the complete P1 automation group...
 echo.
 call %PYTHON_COMMAND% Tools\Build\p1.py automation
 if errorlevel 1 (
@@ -83,7 +95,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [6/10] Building the self-contained Shipping package...
+echo [7/12] Building the self-contained Shipping package...
 echo.
 call %PYTHON_COMMAND% Tools\Build\p1.py package --configuration Shipping
 if errorlevel 1 (
@@ -95,7 +107,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [7/10] Running the GeoTIFF regression through the Shipping executable...
+echo [8/12] Running the GeoTIFF regression through the Shipping executable...
 echo.
 call %PYTHON_COMMAND% Tools\Build\p1.py smoke --configuration Shipping --scenario geotiff-regression
 if errorlevel 1 (
@@ -107,7 +119,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [8/10] Running the acquisition-policy regression through Shipping...
+echo [9/12] Running the acquisition-policy regression through Shipping...
 echo.
 call %PYTHON_COMMAND% Tools\Build\p1.py smoke --configuration Shipping --scenario acquisition-regression
 if errorlevel 1 (
@@ -119,7 +131,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [9/10] Running the responsive UI regression through Shipping...
+echo [10/12] Running the responsive UI regression through Shipping...
 echo.
 call %PYTHON_COMMAND% Tools\Build\p1.py smoke --configuration Shipping --scenario ui-layout
 if errorlevel 1 (
@@ -131,7 +143,19 @@ if errorlevel 1 (
 )
 
 echo.
-echo [10/10] Rechecking the source freeze and creating the tester folder and ZIP...
+echo [11/12] Running the TerrainCore persistence regression through Shipping...
+echo.
+call %PYTHON_COMMAND% Tools\Build\p1.py smoke --configuration Shipping --scenario terraincore-regression
+if errorlevel 1 (
+  echo.
+  echo ERROR: The packaged TerrainCore regression failed. The release was not assembled.
+  echo.
+  if /i not "%~1"=="nopause" pause
+  exit /b 1
+)
+
+echo.
+echo [12/12] Rechecking the source freeze and creating the tester folder and ZIP...
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "Tools\Build\assemble_p1_release.ps1"
 if errorlevel 1 (

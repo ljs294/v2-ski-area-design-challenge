@@ -98,6 +98,26 @@ public:
         const TSharedRef<Cancellation>& Cancellation) override;
 };
 
+/**
+ * Process-wide, nestable fail-closed guard for packaged workflows that must not use the
+ * application HTTP acquisition port. UnrealHttpAcquisitionTransport records and rejects an
+ * attempt before constructing an IHttpRequest while any guard is active.
+ */
+class SKIPREPARATION_API ScopedAcquisitionPortDeny final
+{
+public:
+    ScopedAcquisitionPortDeny();
+    ~ScopedAcquisitionPortDeny();
+    ScopedAcquisitionPortDeny(const ScopedAcquisitionPortDeny&) = delete;
+    ScopedAcquisitionPortDeny& operator=(const ScopedAcquisitionPortDeny&) = delete;
+    bool IsActive() const noexcept;
+    uint64 ObservedTransportCalls() const noexcept;
+
+private:
+    uint64 StartingTransportCalls = 0;
+    bool bInstalled = false;
+};
+
 SKIPREPARATION_API AcquisitionPlan BuildElevationAcquisitionPlan(
     const SkiDomain::GeographicBounds& Bounds, SourceProfile Profile, uint32 MaximumTileAxis = 1000);
 SKIPREPARATION_API bool IsRetryableTransportFailure(const HttpAcquisitionResult& Result) noexcept;

@@ -1,6 +1,9 @@
 #include "SkiTerrainRuntime/SkiTerrainActor.h"
 
 #include "Async/Async.h"
+#include "SkiApplication/TerrainCoreEditedRepository.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "Components/DynamicMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LineBatchComponent.h"
@@ -12,9 +15,15 @@
 #include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "DynamicMesh/DynamicMeshOverlay.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/World.h"
+#include "GameFramework/PlayerController.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Materials/MaterialInterface.h"
 #include "SkiDomain/TerrainTile.h"
+#include "SkiTerrainRuntime/TerrainCoreMesh.h"
 #include "UObject/ConstructorHelpers.h"
+#include "Algo/AllOf.h"
+#include "Algo/AnyOf.h"
 
 namespace
 {
@@ -34,11 +43,74 @@ FVector3f CoverColor(const uint8 Code)
     default: return {0.42F, 0.40F, 0.34F};
     }
 }
+
+uint64 TerrainCoreRenderKey(const SkiApplication::TerrainCoreTileKey& Key)
+{
+    return (static_cast<uint64>(Key.Lod) << 56U)
+        | (static_cast<uint64>(Key.Y) << 28U) | Key.X;
+}
+
+bool BuildCircularTerrainCoreEdit(const SkiDomain::TerrainCoreManifest& Metadata,
+    const SkiDomain::Revision BaseRevision, const FVector2D& CenterEastNorthM,
+    const double RadiusM, const double DeltaM, SkiDomain::TerrainEditSet& OutEdits)
+{
+    OutEdits = {};
+    constexpr uint64 MaximumScratchSamples = 262144;
+    constexpr double MaximumScratchRadiusM = 2000.0;
+    if (BaseRevision == 0 || BaseRevision == TNumericLimits<SkiDomain::Revision>::Max()
+        || !FMath::IsFinite(RadiusM) || !FMath::IsFinite(DeltaM) || RadiusM <= 0.0
+        || RadiusM > MaximumScratchRadiusM || DeltaM == 0.0)
+    {
+        return false;
+    }
+    const int64 MinimumColumn = FMath::Max<int64>(0, FMath::FloorToInt64(
+        (CenterEastNorthM.X - RadiusM - Metadata.SampleCenterBounds.WestM)
+            / Metadata.DeliveredEastSpacingM));
+    const int64 MaximumColumn = FMath::Min<int64>(Metadata.Width - 1U, FMath::CeilToInt64(
+        (CenterEastNorthM.X + RadiusM - Metadata.SampleCenterBounds.WestM)
+            / Metadata.DeliveredEastSpacingM));
+    const int64 MinimumRow = FMath::Max<int64>(0, FMath::FloorToInt64(
+        (Metadata.SampleCenterBounds.NorthM - CenterEastNorthM.Y - RadiusM)
+            / Metadata.DeliveredNorthSpacingM));
+    const int64 MaximumRow = FMath::Min<int64>(Metadata.Height - 1U, FMath::CeilToInt64(
+        (Metadata.SampleCenterBounds.NorthM - CenterEastNorthM.Y + RadiusM)
+            / Metadata.DeliveredNorthSpacingM));
+    if (MinimumColumn > MaximumColumn || MinimumRow > MaximumRow) return false;
+    const uint64 Columns = static_cast<uint64>(MaximumColumn - MinimumColumn + 1);
+    const uint64 Rows = static_cast<uint64>(MaximumRow - MinimumRow + 1);
+    if (Rows == 0 || Columns > MaximumScratchSamples
+        || Rows > MaximumScratchSamples / Columns) return false;
+
+    OutEdits.TerrainCoreId = Metadata.ContentId;
+    OutEdits.BaseRevision = BaseRevision;
+    OutEdits.EditRevision = BaseRevision + 1U;
+    OutEdits.Deltas.reserve(static_cast<std::size_t>(Columns * Rows));
+    const double RadiusSquared = RadiusM * RadiusM;
+    for (int64 Row = MinimumRow; Row <= MaximumRow; ++Row)
+    {
+        const double North = Metadata.SampleCenterBounds.NorthM
+            - static_cast<double>(Row) * Metadata.DeliveredNorthSpacingM;
+        for (int64 Column = MinimumColumn; Column <= MaximumColumn; ++Column)
+        {
+            const double East = Metadata.SampleCenterBounds.WestM
+                + static_cast<double>(Column) * Metadata.DeliveredEastSpacingM;
+            const double EastDelta = East - CenterEastNorthM.X;
+            const double NorthDelta = North - CenterEastNorthM.Y;
+            if (EastDelta * EastDelta + NorthDelta * NorthDelta <= RadiusSquared)
+            {
+                OutEdits.Deltas.push_back({static_cast<uint32>(Column),
+                    static_cast<uint32>(Row), static_cast<float>(DeltaM)});
+            }
+        }
+    }
+    return !OutEdits.Deltas.empty()
+        && SkiDomain::ValidateTerrainEditSet(OutEdits, Metadata.Width, Metadata.Height).Ok();
+}
 }
 
 ASkiTerrainActor::ASkiTerrainActor()
 {
-    PrimaryActorTick.bCanEverTick = false;
+    PrimaryActorTick.bCanEverTick = true;
     SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("TerrainRoot"));
     RootComponent = SceneRoot;
     GuestDots = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("GuestDots"));
@@ -71,8 +143,101 @@ ASkiTerrainActor::ASkiTerrainActor()
     if (Sphere.Succeeded()) GuestDots->SetStaticMesh(Sphere.Object);
 }
 
+void ASkiTerrainActor::Tick(const float DeltaSeconds)
+{
+    Super::Tick(DeltaSeconds);
+    UpdateTerrainCoreAutoLod(DeltaSeconds);
+    PumpTerrainCoreStreaming();
+}
+
+void ASkiTerrainActor::ReleaseTerrainCorePins()
+{
+    if (!CoreCache)
+    {
+        CoreRequestedKeys.Reset();
+        return;
+    }
+    for (const SkiApplication::TerrainCoreTileKey& Key : CoreDesiredKeys)
+    {
+        const uint64 EncodedKey = TerrainCoreRenderKey(Key);
+        if (CoreRequestedKeys.Contains(EncodedKey)) CoreCache->ReleasePin(Key);
+    }
+    CoreRequestedKeys.Reset();
+}
+
+void ASkiTerrainActor::CompleteScratchMutation(const bool bSucceeded)
+{
+    bScratchMutationInFlight = false;
+    TFunction<void(bool)> Completion = MoveTemp(ScratchMutationCompletion);
+    if (Completion) Completion(bSucceeded);
+}
+
+void ASkiTerrainActor::CancelScratchMutation()
+{
+    if (!bScratchMutationInFlight && !ScratchMutationCompletion) return;
+    ++ScratchMutationSerial;
+    CompleteScratchMutation(false);
+}
+
+void ASkiTerrainActor::FailTerrainCorePresentation()
+{
+    // A failed selection is never left partially visible. Keep the desired keys so an
+    // explicit same-selection retry can restart them, but invalidate every outstanding
+    // mesh publication and make the component/key state empty and coherent.
+    ++CorePresentationSerial;
+    ReleaseTerrainCorePins();
+    CoreMeshBuildsInFlight.Reset();
+    CoreRequestedKeys.Reset();
+    ClearTiles();
+    bCoreBoundsHaveSamples = false;
+    ValidLocalBounds = FBox(ForceInit);
+    SteepestLocalBounds = FBox(ForceInit);
+    if (!bCoreReadyNotified)
+    {
+        bCoreReadyNotified = true;
+        if (CoreReadyHandler) CoreReadyHandler(false);
+    }
+    if (bScratchMutationInFlight) CompleteScratchMutation(false);
+}
+
+void ASkiTerrainActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    ++CorePresentationSerial;
+    bTerrainCoreAutoLod = false;
+    ReleaseTerrainCorePins();
+    CancelScratchMutation();
+    CoreMeshBuildsInFlight.Reset();
+    CoreFailedMeshKeys.Reset();
+    CoreDesiredKeys.Reset();
+    CoreCache.Reset();
+    CoreSession.Reset();
+    CoreBaseRepository.reset();
+    CoreLodController.Reset();
+    bCoreBoundsHaveSamples = false;
+    ValidLocalBounds = FBox(ForceInit);
+    SteepestLocalBounds = FBox(ForceInit);
+    ClearTiles();
+    Super::EndPlay(EndPlayReason);
+}
+
 void ASkiTerrainActor::SetTerrainSession(TSharedPtr<SkiApplication::TerrainSession> InSession)
 {
+    ++CorePresentationSerial;
+    ReleaseTerrainCorePins();
+    CancelScratchMutation();
+    CoreCache.Reset();
+    CoreSession.Reset();
+    CoreCacheGeneration = 0;
+    CoreBaseRepository.reset();
+    CoreEdits = {};
+    CoreLodController.Reset();
+    CoreDesiredKeys.Reset();
+    CoreMeshBuildsInFlight.Reset();
+    CoreFailedMeshKeys.Reset();
+    bTerrainCoreAutoLod = false;
+    bCoreBoundsHaveSamples = false;
+    ValidLocalBounds = FBox(ForceInit);
+    SteepestLocalBounds = FBox(ForceInit);
     Session = std::move(InSession);
 }
 
@@ -84,6 +249,537 @@ void ASkiTerrainActor::ClearTiles()
     }
     Tiles.Reset();
     TileKeys.Reset();
+    CoreRenderedKeys.Reset();
+}
+
+bool ASkiTerrainActor::PresentTerrainCore(
+    TSharedPtr<SkiApplication::TerrainCoreSession> InSession,
+    const uint8 Lod, const double TimeoutSeconds)
+{
+    if (!FMath::IsFinite(TimeoutSeconds) || TimeoutSeconds <= 0.0
+        || !BeginTerrainCoreStreaming(MoveTemp(InSession), Lod))
+    {
+        return false;
+    }
+    return PresentTerrainCoreLod(Lod, TimeoutSeconds);
+}
+
+bool ASkiTerrainActor::BeginTerrainCoreStreaming(
+    TSharedPtr<SkiApplication::TerrainCoreSession> InSession, const uint8 Lod)
+{
+    if (!InSession || Lod >= SkiDomain::TerrainCoreLodFactors.size()) return false;
+    const SkiApplication::TerrainCoreSnapshot Snapshot = InSession->Snapshot();
+    if (!Snapshot.CanonicalReady()) return false;
+    TArray<SkiApplication::TerrainCoreTileKey> Desired;
+    for (const SkiDomain::TerrainCoreTileDescriptor& Tile : Snapshot.Metadata->Tiles)
+        if (Tile.LodIndex == Lod) Desired.Add({Tile.LodIndex, Tile.TileX, Tile.TileY});
+    constexpr int32 MaximumFullViewTiles = 256;
+    if (Desired.IsEmpty() || Desired.Num() > MaximumFullViewTiles) return false;
+
+    ++CorePresentationSerial;
+    ReleaseTerrainCorePins();
+    CancelScratchMutation();
+    Session.Reset();
+    CoreSession = MoveTemp(InSession);
+    CoreBaseRepository = Snapshot.Repository;
+    CoreEdits = {};
+    CoreCache = MakeUnique<SkiTerrainRuntime::TerrainCoreTileCache>(
+        Snapshot.Repository, Snapshot.Generation);
+    CoreLodController = MakeUnique<SkiTerrainRuntime::TerrainCoreLodController>();
+    CoreLodController->Reset(Lod);
+    bTerrainCoreAutoLod = true;
+    CoreAutoLodElapsedSeconds = 0.0F;
+    CoreCacheGeneration = Snapshot.Generation;
+    CoreDesiredKeys = MoveTemp(Desired);
+    CoreMeshBuildsInFlight.Reset();
+    CoreFailedMeshKeys.Reset();
+    CoreRequestedKeys.Reset();
+    ClearTiles();
+    PresentedRevision = Snapshot.Revisions.Canonical;
+    PresentedLod = Lod;
+    PresentedOriginHeightM = Snapshot.Metadata->LocalOrigin.HeightM;
+    MinimumHeightM = TNumericLimits<double>::Max();
+    MaximumHeightM = TNumericLimits<double>::Lowest();
+    ValidLocalBounds = FBox(ForceInit);
+    SteepestLocalBounds = FBox(ForceInit);
+    bCoreBoundsHaveSamples = false;
+    bCoreReadyNotified = false;
+    return true;
+}
+
+void ASkiTerrainActor::SetTerrainCoreCover(
+    std::shared_ptr<const std::vector<std::uint8_t>> Cover,
+    const std::uint32_t Width, const std::uint32_t Height)
+{
+    const std::uint64_t Count = static_cast<std::uint64_t>(Width) * Height;
+    if (!Cover || Width == 0 || Height == 0 || Count != Cover->size())
+    {
+        PresentedCover.reset();
+        PresentedCoverWidth = PresentedCoverHeight = 0;
+        return;
+    }
+    PresentedCover = MoveTemp(Cover);
+    PresentedCoverWidth = Width;
+    PresentedCoverHeight = Height;
+}
+
+bool ASkiTerrainActor::PresentTerrainCoreLod(const uint8 Lod,
+    const double TimeoutSeconds)
+{
+    if (!CoreSession || !CoreCache || Lod >= SkiDomain::TerrainCoreLodFactors.size())
+    {
+        return false;
+    }
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    if (!Snapshot.CanonicalReady()) return false;
+    if (CoreCacheGeneration != Snapshot.Generation)
+    {
+        CoreCache->ResetGeneration(Snapshot.Generation, Snapshot.Repository);
+        CoreCacheGeneration = Snapshot.Generation;
+    }
+
+    TArray<SkiApplication::TerrainCoreTileKey> Requested;
+    for (const SkiDomain::TerrainCoreTileDescriptor& Tile : Snapshot.Metadata->Tiles)
+    {
+        if (Tile.LodIndex == Lod)
+        {
+            Requested.Add({Tile.LodIndex, Tile.TileX, Tile.TileY});
+        }
+    }
+    // A full-view publication is deliberately bounded. The 2-10 km product envelope fits
+    // comfortably at the overview LOD; a finer fixed diagnostic must be view-streamed rather
+    // than constructing an unbounded whole-mountain mesh.
+    constexpr int32 MaximumFullViewTiles = 256;
+    if (Requested.IsEmpty() || Requested.Num() > MaximumFullViewTiles) return false;
+    // This blocking path is reserved for deterministic regression/support calls. Build
+    // the complete replacement transactionally; product UI selections stream via Tick.
+    ++CorePresentationSerial;
+    ReleaseTerrainCorePins();
+    CoreMeshBuildsInFlight.Reset();
+    CoreFailedMeshKeys.Reset();
+    CoreRequestedKeys.Reset();
+    bCoreReadyNotified = false;
+    bCoreBoundsHaveSamples = false;
+    ValidLocalBounds = FBox(ForceInit);
+    SteepestLocalBounds = FBox(ForceInit);
+
+    TArray<SkiDomain::TerrainTileMesh> Meshes;
+    Meshes.Reserve(Requested.Num());
+    double Minimum = TNumericLimits<double>::Max();
+    double Maximum = TNumericLimits<double>::Lowest();
+    FBox Bounds(ForceInit);
+    const double Deadline = FPlatformTime::Seconds() + TimeoutSeconds;
+    for (const SkiApplication::TerrainCoreTileKey& Key : Requested)
+    {
+        std::shared_ptr<const SkiApplication::TerrainCoreTilePayload> Payload =
+            CoreCache->FindResident(Key);
+        while (!Payload && FPlatformTime::Seconds() < Deadline)
+        {
+            if (CoreCache->TileStatus(Key) ==
+                SkiTerrainRuntime::TerrainCoreRequestStatus::Failed)
+            {
+                if (!CoreCache->RetryTile(Key))
+                {
+                    CoreFailedMeshKeys.Add(TerrainCoreRenderKey(Key));
+                    FailTerrainCorePresentation();
+                    return false;
+                }
+            }
+            else if (!CoreCache->RequestTile(Key))
+            {
+                CoreCache->PumpPublications();
+            }
+            if (!CoreCache->WaitForWorkers(FMath::Min(1.0,
+                    FMath::Max(0.001, Deadline - FPlatformTime::Seconds()))))
+            {
+                continue;
+            }
+            CoreCache->PumpPublications();
+            Payload = CoreCache->FindResident(Key);
+        }
+        if (!Payload)
+        {
+            CoreFailedMeshKeys.Add(TerrainCoreRenderKey(Key));
+            FailTerrainCorePresentation();
+            return false;
+        }
+        SkiDomain::TerrainTileMesh Mesh;
+        if (!SkiTerrainRuntime::BuildTerrainCoreTileMesh(*Payload, *Snapshot.Metadata,
+                Snapshot.Revisions.Canonical, true, 25.0, Mesh))
+        {
+            CoreFailedMeshKeys.Add(TerrainCoreRenderKey(Key));
+            FailTerrainCorePresentation();
+            return false;
+        }
+        for (uint32 Row = 0; Row < Payload->Descriptor.CoreHeight; ++Row)
+        {
+            for (uint32 Column = 0; Column < Payload->Descriptor.CoreWidth; ++Column)
+            {
+                const uint32 StoredWidth = Payload->Descriptor.CoreWidth
+                    + Payload->Descriptor.HaloWest + Payload->Descriptor.HaloEast;
+                const uint64 Index = static_cast<uint64>(Row + Payload->Descriptor.HaloNorth)
+                        * StoredWidth
+                    + Column + Payload->Descriptor.HaloWest;
+                if (Index >= Payload->Heights.size() || Index >= Payload->Validity.size()
+                    || Payload->Validity[Index] == 0
+                    || !FMath::IsFinite(Payload->Heights[Index])) continue;
+                const double Height = Payload->Heights[Index];
+                Minimum = FMath::Min(Minimum, Height);
+                Maximum = FMath::Max(Maximum, Height);
+                const uint64 FineColumn = static_cast<uint64>(
+                    Payload->Descriptor.StartColumn + Column) * Payload->Descriptor.LodFactor;
+                const uint64 FineRow = static_cast<uint64>(
+                    Payload->Descriptor.StartRow + Row) * Payload->Descriptor.LodFactor;
+                const double East = Snapshot.Metadata->SampleCenterBounds.WestM
+                    + FineColumn * Snapshot.Metadata->DeliveredEastSpacingM;
+                const double North = Snapshot.Metadata->SampleCenterBounds.NorthM
+                    - FineRow * Snapshot.Metadata->DeliveredNorthSpacingM;
+                Bounds += FVector(North * 100.0, East * 100.0,
+                    (Height - Snapshot.Metadata->LocalOrigin.HeightM) * 100.0);
+            }
+        }
+        Meshes.Add(MoveTemp(Mesh));
+    }
+    if (!Bounds.IsValid || !FMath::IsFinite(Minimum) || !FMath::IsFinite(Maximum))
+    {
+        if (!Requested.IsEmpty())
+            CoreFailedMeshKeys.Add(TerrainCoreRenderKey(Requested[0]));
+        FailTerrainCorePresentation();
+        return false;
+    }
+
+    CoreDesiredKeys = Requested;
+    ClearTiles();
+    PresentedOriginHeightM = Snapshot.Metadata->LocalOrigin.HeightM;
+    MinimumHeightM = Minimum;
+    MaximumHeightM = Maximum;
+    ValidLocalBounds = Bounds;
+    bCoreBoundsHaveSamples = true;
+    SteepestLocalBounds = Bounds;
+    for (const SkiDomain::TerrainTileMesh& Mesh : Meshes)
+    {
+        if (!Mesh.Indices.empty() && !CreateTileComponent(Mesh, PresentedOriginHeightM))
+        {
+            ClearTiles();
+            CoreFailedMeshKeys.Add(TerrainCoreRenderKey(
+                {Mesh.Key.Lod, Mesh.Key.X, Mesh.Key.Y}));
+            FailTerrainCorePresentation();
+            return false;
+        }
+        CoreRenderedKeys.Add(TerrainCoreRenderKey(
+            {Mesh.Key.Lod, Mesh.Key.X, Mesh.Key.Y}));
+    }
+    PresentedRevision = Snapshot.Revisions.Canonical;
+    PresentedLod = Lod;
+    const SkiTerrainRuntime::TerrainCoreCacheStats Stats = CoreCache->Stats();
+    CoreSession->ReportResidency(Snapshot.Generation,
+        {Stats.ResidentBytes, Stats.ResidentTiles, Stats.PendingTiles});
+    if (!CoreSession->AcknowledgeRender(Snapshot.Generation, Snapshot.Revisions.Canonical)
+        || !CoreSession->AcknowledgeQuery(Snapshot.Generation, Snapshot.Revisions.Canonical))
+    {
+        if (!Requested.IsEmpty())
+            CoreFailedMeshKeys.Add(TerrainCoreRenderKey(Requested[0]));
+        FailTerrainCorePresentation();
+        return false;
+    }
+    SetLightingPreset(CurrentLightingPreset);
+    const bool bReady = IsTerrainCoreRevisionAligned();
+    bCoreReadyNotified = bReady;
+    if (CoreReadyHandler) CoreReadyHandler(bReady);
+    return bReady;
+}
+
+bool ASkiTerrainActor::IsTerrainCoreRevisionAligned() const
+{
+    if (!CoreSession) return false;
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    return Snapshot.RenderReady() && Snapshot.QueryReady()
+        && Snapshot.Revisions.Canonical == PresentedRevision
+        && bCoreBoundsHaveSamples && CoreFailedMeshKeys.IsEmpty()
+        && CoreMeshBuildsInFlight.IsEmpty()
+        && CoreRenderedKeys.Num() == CoreDesiredKeys.Num()
+        && Algo::AllOf(CoreDesiredKeys, [this](const SkiApplication::TerrainCoreTileKey& Key)
+        { return CoreRenderedKeys.Contains(TerrainCoreRenderKey(Key)); });
+}
+
+bool ASkiTerrainActor::ApplyTerrainCoreSelection(
+    TArray<SkiApplication::TerrainCoreTileKey> Desired, const bool bClearVisibleTiles,
+    const bool bForceRebuild)
+{
+    if (!CoreSession || !CoreCache || Desired.IsEmpty() || Desired.Num() > 256) return false;
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    if (!Snapshot.CanonicalReady()) return false;
+    TSet<uint64> DesiredSet;
+    for (const SkiApplication::TerrainCoreTileKey& Key : Desired)
+    {
+        const bool bExists = Algo::AnyOf(Snapshot.Metadata->Tiles,
+            [&Key](const SkiDomain::TerrainCoreTileDescriptor& Tile)
+            {
+                return Tile.LodIndex == Key.Lod && Tile.TileX == Key.X && Tile.TileY == Key.Y;
+            });
+        if (!bExists || DesiredSet.Contains(TerrainCoreRenderKey(Key))) return false;
+        DesiredSet.Add(TerrainCoreRenderKey(Key));
+    }
+    const bool bUnchanged = Desired.Num() == CoreDesiredKeys.Num()
+        && Algo::AllOf(Desired, [this](const SkiApplication::TerrainCoreTileKey& Key)
+        {
+            return Algo::AnyOf(CoreDesiredKeys,
+                [&Key](const SkiApplication::TerrainCoreTileKey& Existing)
+                { return Existing.Lod == Key.Lod && Existing.X == Key.X && Existing.Y == Key.Y; });
+        });
+    if (bUnchanged && !bForceRebuild && CoreFailedMeshKeys.IsEmpty()) return true;
+
+    ++CorePresentationSerial;
+    ReleaseTerrainCorePins();
+    CoreDesiredKeys = MoveTemp(Desired);
+    CoreMeshBuildsInFlight.Reset();
+    CoreFailedMeshKeys.Reset();
+    CoreRequestedKeys.Reset();
+    bCoreReadyNotified = false;
+    bCoreBoundsHaveSamples = false;
+    ValidLocalBounds = FBox(ForceInit);
+    SteepestLocalBounds = FBox(ForceInit);
+    if (bClearVisibleTiles) ClearTiles();
+    for (const SkiApplication::TerrainCoreTileKey& Key : CoreDesiredKeys)
+    {
+        if (CoreCache->TileStatus(Key) !=
+            SkiTerrainRuntime::TerrainCoreRequestStatus::Failed) continue;
+        const uint64 EncodedKey = TerrainCoreRenderKey(Key);
+        if (!CoreCache->RetryTile(Key, true))
+        {
+            CoreFailedMeshKeys.Add(EncodedKey);
+            FailTerrainCorePresentation();
+            return false;
+        }
+        CoreRequestedKeys.Add(EncodedKey);
+    }
+    return true;
+}
+
+void ASkiTerrainActor::UpdateTerrainCoreAutoLod(const float DeltaSeconds)
+{
+    if (!bTerrainCoreAutoLod || !CoreSession || !CoreLodController || !GetWorld()) return;
+    CoreAutoLodElapsedSeconds += FMath::Max(0.0F, DeltaSeconds);
+    if (CoreAutoLodElapsedSeconds < 0.25F) return;
+    CoreAutoLodElapsedSeconds = 0.0F;
+
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    APlayerController* Controller = GetWorld()->GetFirstPlayerController();
+    APlayerCameraManager* Camera = Controller ? Controller->PlayerCameraManager : nullptr;
+    if (!Snapshot.CanonicalReady() || !Camera || !Controller) return;
+    int32 ViewWidth = 0;
+    int32 ViewHeight = 0;
+    Controller->GetViewportSize(ViewWidth, ViewHeight);
+    if (ViewWidth <= 0 || ViewHeight <= 0) return;
+
+    const uint32 FinestTilesX = FMath::DivideAndRoundUp(
+        Snapshot.Metadata->Width - 1U, SkiDomain::TerrainCoreTileCells);
+    const uint32 FinestTilesY = FMath::DivideAndRoundUp(
+        Snapshot.Metadata->Height - 1U, SkiDomain::TerrainCoreTileCells);
+    const uint64 Count = static_cast<uint64>(FinestTilesX) * FinestTilesY;
+    if (Count == 0 || Count > 256) return;
+    std::vector<double> SamplePixels(static_cast<size_t>(Count), 0.0);
+    const double TanHalfFov = FMath::Tan(FMath::DegreesToRadians(
+        FMath::Clamp(static_cast<double>(Camera->GetFOVAngle()), 20.0, 150.0) * 0.5));
+    const double SampleWorldCm = FMath::Max(Snapshot.Metadata->DeliveredEastSpacingM,
+        Snapshot.Metadata->DeliveredNorthSpacingM) * 100.0;
+    for (uint32 Y = 0; Y < FinestTilesY; ++Y)
+    {
+        for (uint32 X = 0; X < FinestTilesX; ++X)
+        {
+            const uint32 CenterColumn = FMath::Min(Snapshot.Metadata->Width - 1U,
+                X * SkiDomain::TerrainCoreTileCells + SkiDomain::TerrainCoreTileCells / 2U);
+            const uint32 CenterRow = FMath::Min(Snapshot.Metadata->Height - 1U,
+                Y * SkiDomain::TerrainCoreTileCells + SkiDomain::TerrainCoreTileCells / 2U);
+            const double East = Snapshot.Metadata->SampleCenterBounds.WestM
+                + CenterColumn * Snapshot.Metadata->DeliveredEastSpacingM;
+            const double North = Snapshot.Metadata->SampleCenterBounds.NorthM
+                - CenterRow * Snapshot.Metadata->DeliveredNorthSpacingM;
+            const FVector Center(North * 100.0, East * 100.0, 0.0);
+            const double DistanceCm = FMath::Max(100.0,
+                FVector::Distance(Camera->GetCameraLocation(), Center));
+            SamplePixels[static_cast<size_t>(Y) * FinestTilesX + X] =
+                SampleWorldCm * ViewHeight / (2.0 * TanHalfFov * DistanceCm);
+        }
+    }
+    std::vector<SkiApplication::TerrainCoreTileKey> Selected;
+    if (!CoreLodController->SelectTileKeys(FinestTilesX, FinestTilesY,
+            SamplePixels, Selected)) return;
+    TArray<SkiApplication::TerrainCoreTileKey> Desired;
+    Desired.Reserve(static_cast<int32>(Selected.size()));
+    for (const SkiApplication::TerrainCoreTileKey& Key : Selected) Desired.Add(Key);
+    ApplyTerrainCoreSelection(MoveTemp(Desired), true);
+}
+
+bool ASkiTerrainActor::PublishTerrainCoreMesh(const uint64 ExpectedSerial,
+    const uint64 ExpectedGeneration, const SkiDomain::Revision ExpectedRevision,
+    const uint64 EncodedKey, const SkiApplication::TerrainCoreTilePayload& Payload,
+    const SkiDomain::TerrainTileMesh& Mesh, const bool bBuilt)
+{
+    const uint64* InFlightSerial = CoreMeshBuildsInFlight.Find(EncodedKey);
+    if (InFlightSerial && *InFlightSerial == ExpectedSerial)
+    {
+        CoreMeshBuildsInFlight.Remove(EncodedKey);
+    }
+    if (ExpectedSerial != CorePresentationSerial)
+    {
+        ++RejectedCoreMeshBuilds;
+        return false;
+    }
+    const SkiApplication::TerrainCoreSnapshot Current = CoreSession
+        ? CoreSession->Snapshot() : SkiApplication::TerrainCoreSnapshot{};
+    if (!bBuilt || Current.Generation != ExpectedGeneration
+        || Current.Revisions.Canonical != ExpectedRevision
+        || (!Mesh.Indices.empty() && !CreateTileComponent(Mesh, PresentedOriginHeightM)))
+    {
+        ++RejectedCoreMeshBuilds;
+        CoreFailedMeshKeys.Add(EncodedKey);
+        FailTerrainCorePresentation();
+        return false;
+    }
+    if (!bCoreBoundsHaveSamples)
+    {
+        ValidLocalBounds = FBox(ForceInit);
+        MinimumHeightM = TNumericLimits<double>::Max();
+        MaximumHeightM = TNumericLimits<double>::Lowest();
+    }
+    bool bPublishedFiniteSample = false;
+    const uint32 StoredWidth = Payload.Descriptor.CoreWidth
+        + Payload.Descriptor.HaloWest + Payload.Descriptor.HaloEast;
+    for (uint32 Row = 0; Row < Payload.Descriptor.CoreHeight; ++Row)
+    {
+        for (uint32 Column = 0; Column < Payload.Descriptor.CoreWidth; ++Column)
+        {
+            const uint64 Index = static_cast<uint64>(Row + Payload.Descriptor.HaloNorth)
+                    * StoredWidth + Column + Payload.Descriptor.HaloWest;
+            if (Index >= Payload.Heights.size() || Index >= Payload.Validity.size()
+                || Payload.Validity[Index] == 0 || !FMath::IsFinite(Payload.Heights[Index])) continue;
+            const double HeightM = Payload.Heights[Index];
+            const uint64 FineColumn = static_cast<uint64>(Payload.Descriptor.StartColumn + Column)
+                * Payload.Descriptor.LodFactor;
+            const uint64 FineRow = static_cast<uint64>(Payload.Descriptor.StartRow + Row)
+                * Payload.Descriptor.LodFactor;
+            const double East = Current.Metadata->SampleCenterBounds.WestM
+                + FineColumn * Current.Metadata->DeliveredEastSpacingM;
+            const double North = Current.Metadata->SampleCenterBounds.NorthM
+                - FineRow * Current.Metadata->DeliveredNorthSpacingM;
+            MinimumHeightM = FMath::Min(MinimumHeightM, HeightM);
+            MaximumHeightM = FMath::Max(MaximumHeightM, HeightM);
+            ValidLocalBounds += FVector(North * 100.0, East * 100.0,
+                (HeightM - PresentedOriginHeightM) * 100.0);
+            bPublishedFiniteSample = true;
+        }
+    }
+    if (bPublishedFiniteSample) bCoreBoundsHaveSamples = true;
+    CoreRenderedKeys.Add(EncodedKey);
+    if (CoreRenderedKeys.Num() != CoreDesiredKeys.Num()) return true;
+    if (!bCoreBoundsHaveSamples)
+    {
+        FailTerrainCorePresentation();
+        return false;
+    }
+
+    const SkiTerrainRuntime::TerrainCoreCacheStats Stats = CoreCache->Stats();
+    CoreSession->ReportResidency(ExpectedGeneration,
+        {Stats.ResidentBytes, Stats.ResidentTiles, Stats.PendingTiles});
+    CoreSession->AcknowledgeRender(ExpectedGeneration, ExpectedRevision);
+    CoreSession->AcknowledgeQuery(ExpectedGeneration, ExpectedRevision);
+    SteepestLocalBounds = ValidLocalBounds;
+    SetLightingPreset(CurrentLightingPreset);
+    const bool bReady = IsTerrainCoreRevisionAligned();
+    if (!bCoreReadyNotified)
+    {
+        bCoreReadyNotified = true;
+        if (CoreReadyHandler) CoreReadyHandler(bReady);
+    }
+    if (bScratchMutationInFlight) CompleteScratchMutation(bReady);
+    return bReady;
+}
+
+bool ASkiTerrainActor::RunStaleTerrainCoreMeshPublicationProbe()
+{
+    if (!CoreSession || !CoreCache || CoreDesiredKeys.IsEmpty()) return false;
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    if (!Snapshot.Metadata) return false;
+    for (const SkiApplication::TerrainCoreTileKey& Key : CoreDesiredKeys)
+    {
+        const std::shared_ptr<const SkiApplication::TerrainCoreTilePayload> Payload =
+            CoreCache->FindResident(Key);
+        if (!Payload) continue;
+        SkiDomain::TerrainTileMesh Mesh;
+        if (!SkiTerrainRuntime::BuildTerrainCoreTileMesh(*Payload, *Snapshot.Metadata,
+                Snapshot.Revisions.Canonical, true, 25.0, Mesh)
+            || Mesh.Indices.empty())
+        {
+            continue;
+        }
+        const uint64 Before = RejectedCoreMeshBuilds;
+        return !PublishTerrainCoreMesh(CorePresentationSerial - 1U, Snapshot.Generation,
+            Snapshot.Revisions.Canonical, TerrainCoreRenderKey(Key),
+            *Payload, Mesh, true) && RejectedCoreMeshBuilds == Before + 1U;
+    }
+    return false;
+}
+
+void ASkiTerrainActor::PumpTerrainCoreStreaming()
+{
+    if (!CoreSession || !CoreCache || CoreDesiredKeys.IsEmpty()) return;
+    if (!CoreFailedMeshKeys.IsEmpty()) return;
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    if (!Snapshot.CanonicalReady() || Snapshot.Generation != CoreCacheGeneration
+        || Snapshot.Revisions.Canonical != PresentedRevision)
+    {
+        return;
+    }
+    CoreCache->PumpPublications();
+    for (const SkiApplication::TerrainCoreTileKey& Key : CoreDesiredKeys)
+    {
+        const uint64 EncodedKey = TerrainCoreRenderKey(Key);
+        if (CoreCache->TileStatus(Key) == SkiTerrainRuntime::TerrainCoreRequestStatus::Failed)
+        {
+            CoreRequestedKeys.Remove(EncodedKey);
+            CoreFailedMeshKeys.Add(EncodedKey);
+            FailTerrainCorePresentation();
+            return;
+        }
+        if (CoreRenderedKeys.Contains(EncodedKey)
+            || CoreRequestedKeys.Contains(EncodedKey)) continue;
+        if (CoreCache->RequestTile(Key, true)) CoreRequestedKeys.Add(EncodedKey);
+    }
+
+    constexpr int32 MaximumMeshBuildJobs = 2;
+    for (const SkiApplication::TerrainCoreTileKey& Key : CoreDesiredKeys)
+    {
+        if (CoreMeshBuildsInFlight.Num() >= MaximumMeshBuildJobs) break;
+        const uint64 EncodedKey = TerrainCoreRenderKey(Key);
+        if (CoreRenderedKeys.Contains(EncodedKey)
+            || CoreMeshBuildsInFlight.Contains(EncodedKey)) continue;
+        std::shared_ptr<const SkiApplication::TerrainCoreTilePayload> Payload =
+            CoreCache->FindResident(Key);
+        if (!Payload) continue;
+        const uint64 ExpectedSerial = CorePresentationSerial;
+        CoreMeshBuildsInFlight.Add(EncodedKey, ExpectedSerial);
+        const uint64 ExpectedGeneration = Snapshot.Generation;
+        const SkiDomain::Revision ExpectedRevision = Snapshot.Revisions.Canonical;
+        const std::shared_ptr<const SkiDomain::TerrainCoreManifest> Metadata = Snapshot.Metadata;
+        const TWeakObjectPtr<ASkiTerrainActor> WeakThis(this);
+        Async(EAsyncExecution::ThreadPool,
+            [WeakThis, Payload = MoveTemp(Payload), Metadata, ExpectedSerial,
+                ExpectedGeneration, ExpectedRevision, EncodedKey]() mutable
+            {
+                SkiDomain::TerrainTileMesh Mesh;
+                const bool Built = Metadata && SkiTerrainRuntime::BuildTerrainCoreTileMesh(
+                    *Payload, *Metadata, ExpectedRevision, true, 25.0, Mesh);
+                AsyncTask(ENamedThreads::GameThread,
+                    [WeakThis, Payload = MoveTemp(Payload), Mesh = MoveTemp(Mesh), Built,
+                        ExpectedSerial, ExpectedGeneration, ExpectedRevision, EncodedKey]() mutable
+                    {
+                        if (!WeakThis.IsValid()) return;
+                        WeakThis->PublishTerrainCoreMesh(ExpectedSerial, ExpectedGeneration,
+                            ExpectedRevision, EncodedKey, *Payload, Mesh, Built);
+                    });
+            });
+    }
 }
 
 bool ASkiTerrainActor::BuildTileComponent(const SkiDomain::Heightfield& Field,
@@ -187,6 +883,19 @@ bool ASkiTerrainActor::Present(const SkiApplication::TerrainSnapshot& Snapshot, 
     {
         return false;
     }
+    if (CoreSession)
+    {
+        ++CorePresentationSerial;
+        ReleaseTerrainCorePins();
+        CancelScratchMutation();
+    }
+    CoreCache.Reset();
+    CoreSession.Reset();
+    CoreCacheGeneration = 0;
+    CoreDesiredKeys.Reset();
+    CoreMeshBuildsInFlight.Reset();
+    CoreFailedMeshKeys.Reset();
+    bCoreBoundsHaveSamples = false;
     ClearTiles();
     PresentedOriginHeightM = Snapshot.Manifest ? Snapshot.Manifest->LocalOrigin.HeightM : 0.0;
     PresentedCover = Snapshot.Cover;
@@ -264,14 +973,47 @@ bool ASkiTerrainActor::Present(const SkiApplication::TerrainSnapshot& Snapshot, 
 
 bool ASkiTerrainActor::SetLod(const uint8 Lod)
 {
+    if (CoreSession)
+    {
+        if (!CoreCache || !CoreLodController
+            || Lod >= SkiDomain::TerrainCoreLodFactors.size()) return false;
+        const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+        if (!Snapshot.CanonicalReady()) return false;
+        TArray<SkiApplication::TerrainCoreTileKey> Desired;
+        for (const SkiDomain::TerrainCoreTileDescriptor& Tile : Snapshot.Metadata->Tiles)
+        {
+            if (Tile.LodIndex == Lod)
+                Desired.Add({Tile.LodIndex, Tile.TileX, Tile.TileY});
+        }
+        constexpr int32 MaximumFullViewTiles = 256;
+        if (Desired.IsEmpty() || Desired.Num() > MaximumFullViewTiles) return false;
+        bTerrainCoreAutoLod = false;
+        CoreLodController->Reset(Lod);
+        PresentedLod = Lod;
+        return ApplyTerrainCoreSelection(MoveTemp(Desired), true);
+    }
     return Session && Lod <= 2 && Present(Session->Snapshot(), Lod);
+}
+
+bool ASkiTerrainActor::SetLodAuto()
+{
+    if (!CoreSession || !CoreLodController) return false;
+    CoreLodController->Reset(PresentedLod);
+    bTerrainCoreAutoLod = true;
+    CoreAutoLodElapsedSeconds = 0.25F;
+    return true;
 }
 
 void ASkiTerrainActor::SetViewMode(const ESkiTerrainViewMode Mode)
 {
     if (CurrentViewMode == Mode) return;
     CurrentViewMode = Mode;
-    if (Session) Present(Session->Snapshot(), PresentedLod);
+    if (CoreSession && !CoreDesiredKeys.IsEmpty())
+    {
+        TArray<SkiApplication::TerrainCoreTileKey> Desired = CoreDesiredKeys;
+        ApplyTerrainCoreSelection(MoveTemp(Desired), true, true);
+    }
+    else if (Session) Present(Session->Snapshot(), PresentedLod);
 }
 
 void ASkiTerrainActor::SetVerticalExaggeration(const float Scale)
@@ -281,14 +1023,14 @@ void ASkiTerrainActor::SetVerticalExaggeration(const float Scale)
 
 bool ASkiTerrainActor::GetValidWorldBounds(FBox& OutBounds) const
 {
-    if (!ValidLocalBounds.IsValid) return false;
+    if ((CoreSession && !bCoreBoundsHaveSamples) || !ValidLocalBounds.IsValid) return false;
     OutBounds = ValidLocalBounds.TransformBy(GetActorTransform());
     return true;
 }
 
 bool ASkiTerrainActor::GetSteepestQuadrantWorldBounds(FBox& OutBounds) const
 {
-    if (!SteepestLocalBounds.IsValid) return false;
+    if ((CoreSession && !bCoreBoundsHaveSamples) || !SteepestLocalBounds.IsValid) return false;
     OutBounds = SteepestLocalBounds.TransformBy(GetActorTransform());
     return true;
 }
@@ -393,6 +1135,32 @@ void ASkiTerrainActor::RebuildDots(const SkiDomain::Heightfield& Field, const do
 bool ASkiTerrainActor::ApplyScratchMutation(const FVector2D& CenterEastNorthM,
     const double RadiusM, const double DeltaM)
 {
+    if (bScratchMutationInFlight) return false;
+    if (CoreSession)
+    {
+        const SkiApplication::TerrainCoreSnapshot Before = CoreSession->Snapshot();
+        if (!Before.CanonicalReady() || !CoreCache) return false;
+        SkiDomain::TerrainEditSet Candidate;
+        if (!BuildCircularTerrainCoreEdit(*Before.Metadata, Before.Revisions.Canonical,
+                CenterEastNorthM, RadiusM, DeltaM, Candidate)) return false;
+        std::string EditError;
+        auto EditedRepository = SkiApplication::TerrainCoreEditedRepository::Create(
+            Before.Repository, Candidate, Before.Revisions.Canonical, EditError);
+        if (!EditedRepository) return false;
+        SkiApplication::TerrainCoreSnapshot Published;
+        if (!CoreSession->PublishEdit(Before.Generation, Before.Revisions.Canonical,
+                EditedRepository, Candidate.EditRevision, Published))
+        {
+            return false;
+        }
+        std::shared_ptr<const SkiDomain::TerrainEditSet> CumulativeEdits;
+        EditedRepository->FlattenEditOverlay(CoreBaseRepository, CumulativeEdits);
+        CoreEdits = *CumulativeEdits;
+        CoreCache->ResetGeneration(Published.Generation, Published.Repository);
+        CoreCacheGeneration = Published.Generation;
+        PresentedRevision = Published.Revisions.Canonical;
+        return PresentTerrainCoreLod(PresentedLod, 30.0);
+    }
     if (!Session) return false;
     const SkiApplication::TerrainSnapshot Before = Session->Snapshot();
     if (!Before.Heightfield) return false;
@@ -408,6 +1176,85 @@ bool ASkiTerrainActor::ApplyScratchMutation(const FVector2D& CenterEastNorthM,
 void ASkiTerrainActor::ApplyScratchMutationAsync(const FVector2D& CenterEastNorthM,
     const double RadiusM, const double DeltaM, TFunction<void(bool)> Completion)
 {
+    if (bScratchMutationInFlight)
+    {
+        if (Completion) Completion(false);
+        return;
+    }
+    if (CoreSession)
+    {
+        const SkiApplication::TerrainCoreSnapshot Before = CoreSession->Snapshot();
+        if (!Before.CanonicalReady() || !CoreCache)
+        {
+            if (Completion) Completion(false);
+            return;
+        }
+        bScratchMutationInFlight = true;
+        ScratchMutationCompletion = MoveTemp(Completion);
+        const uint64 MutationSerial = ++ScratchMutationSerial;
+        const TSharedPtr<SkiApplication::TerrainCoreSession> CapturedSession = CoreSession;
+        const TWeakObjectPtr<ASkiTerrainActor> WeakThis(this);
+        Async(EAsyncExecution::ThreadPool,
+            [WeakThis, CapturedSession, Before, CenterEastNorthM, RadiusM, DeltaM,
+                MutationSerial]() mutable
+            {
+                SkiDomain::TerrainEditSet Candidate;
+                std::string EditError;
+                const bool bBuilt = BuildCircularTerrainCoreEdit(*Before.Metadata,
+                    Before.Revisions.Canonical, CenterEastNorthM, RadiusM, DeltaM, Candidate);
+                std::shared_ptr<SkiApplication::TerrainCoreEditedRepository> EditedRepository;
+                if (bBuilt)
+                {
+                    EditedRepository = SkiApplication::TerrainCoreEditedRepository::Create(
+                        Before.Repository, Candidate, Before.Revisions.Canonical, EditError);
+                }
+                AsyncTask(ENamedThreads::GameThread,
+                    [WeakThis, CapturedSession, ExpectedGeneration = Before.Generation,
+                        ExpectedRevision = Before.Revisions.Canonical,
+                        Candidate = MoveTemp(Candidate), EditedRepository = MoveTemp(EditedRepository),
+                        MutationSerial]() mutable
+                    {
+                        if (!WeakThis.IsValid()) return;
+                        if (!WeakThis->bScratchMutationInFlight
+                            || WeakThis->ScratchMutationSerial != MutationSerial)
+                        {
+                            return;
+                        }
+                        if (WeakThis->CoreSession != CapturedSession || !WeakThis->CoreCache
+                            || !EditedRepository)
+                        {
+                            WeakThis->CompleteScratchMutation(false);
+                            return;
+                        }
+                        SkiApplication::TerrainCoreSnapshot Published;
+                        if (!CapturedSession->PublishEdit(ExpectedGeneration, ExpectedRevision,
+                                EditedRepository, Candidate.EditRevision, Published))
+                        {
+                            WeakThis->CompleteScratchMutation(false);
+                            return;
+                        }
+                        std::shared_ptr<const SkiDomain::TerrainEditSet> CumulativeEdits;
+                        EditedRepository->FlattenEditOverlay(
+                            WeakThis->CoreBaseRepository, CumulativeEdits);
+                        WeakThis->CoreEdits = *CumulativeEdits;
+                        WeakThis->ReleaseTerrainCorePins();
+                        WeakThis->CoreCache->ResetGeneration(Published.Generation,
+                            Published.Repository);
+                        WeakThis->CoreCacheGeneration = Published.Generation;
+                        WeakThis->PresentedRevision = Published.Revisions.Canonical;
+                        ++WeakThis->CorePresentationSerial;
+                        WeakThis->CoreMeshBuildsInFlight.Reset();
+                        WeakThis->CoreFailedMeshKeys.Reset();
+                        WeakThis->CoreRequestedKeys.Reset();
+                        WeakThis->ClearTiles();
+                        WeakThis->bCoreBoundsHaveSamples = false;
+                        WeakThis->bCoreReadyNotified = false;
+                        WeakThis->ValidLocalBounds = FBox(ForceInit);
+                        WeakThis->SteepestLocalBounds = FBox(ForceInit);
+                    });
+            });
+        return;
+    }
     if (!Session)
     {
         if (Completion) Completion(false);
@@ -419,19 +1266,28 @@ void ASkiTerrainActor::ApplyScratchMutationAsync(const FVector2D& CenterEastNort
         if (Completion) Completion(false);
         return;
     }
+    bScratchMutationInFlight = true;
+    ScratchMutationCompletion = MoveTemp(Completion);
+    const uint64 MutationSerial = ++ScratchMutationSerial;
     const TSharedPtr<SkiApplication::TerrainSession> CapturedSession = Session;
     const uint8 Lod = PresentedLod;
     const double OriginHeightM = PresentedOriginHeightM;
     const TWeakObjectPtr<ASkiTerrainActor> WeakThis(this);
     Async(EAsyncExecution::ThreadPool, [WeakThis, CapturedSession, Expected = Before.Readiness.Canonical,
-        CenterEastNorthM, RadiusM, DeltaM, Lod, OriginHeightM, Completion = std::move(Completion)]() mutable
+        CenterEastNorthM, RadiusM, DeltaM, Lod, OriginHeightM, MutationSerial]() mutable
     {
         SkiDomain::MutationBounds Bounds;
         if (!CapturedSession->ApplyScratchMutation(Expected, CenterEastNorthM.X, CenterEastNorthM.Y,
                 RadiusM, DeltaM, Bounds))
         {
-            AsyncTask(ENamedThreads::GameThread, [Completion = std::move(Completion)]() mutable
-            { if (Completion) Completion(false); });
+            AsyncTask(ENamedThreads::GameThread, [WeakThis, MutationSerial]()
+            {
+                if (WeakThis.IsValid() && WeakThis->bScratchMutationInFlight
+                    && WeakThis->ScratchMutationSerial == MutationSerial)
+                {
+                    WeakThis->CompleteScratchMutation(false);
+                }
+            });
             return;
         }
         const SkiApplication::TerrainSnapshot Edited = CapturedSession->Snapshot();
@@ -454,19 +1310,32 @@ void ASkiTerrainActor::ApplyScratchMutationAsync(const FVector2D& CenterEastNort
                 SkiDomain::TerrainTileMesh Mesh;
                 if (!SkiDomain::BuildTerrainTile(*Edited.Heightfield, {X, Y, Lod}, true, 25.0, Mesh))
                 {
-                    AsyncTask(ENamedThreads::GameThread, [Completion = std::move(Completion)]() mutable
-                    { if (Completion) Completion(false); });
+                    AsyncTask(ENamedThreads::GameThread, [WeakThis, MutationSerial]()
+                    {
+                        if (WeakThis.IsValid() && WeakThis->bScratchMutationInFlight
+                            && WeakThis->ScratchMutationSerial == MutationSerial)
+                        {
+                            WeakThis->CompleteScratchMutation(false);
+                        }
+                    });
                     return;
                 }
                 Meshes.Add(std::move(Mesh));
             }
         }
         AsyncTask(ENamedThreads::GameThread, [WeakThis, CapturedSession, Revision = Edited.Readiness.Canonical,
-            Meshes = std::move(Meshes), OriginHeightM, Completion = std::move(Completion)]() mutable
+            Meshes = std::move(Meshes), OriginHeightM, MutationSerial]() mutable
         {
-            if (!WeakThis.IsValid() || CapturedSession->Snapshot().Readiness.Canonical != Revision)
+            if (!WeakThis.IsValid()) return;
+            if (!WeakThis->bScratchMutationInFlight
+                || WeakThis->ScratchMutationSerial != MutationSerial)
             {
-                if (Completion) Completion(false);
+                return;
+            }
+            if (WeakThis->Session != CapturedSession
+                || CapturedSession->Snapshot().Readiness.Canonical != Revision)
+            {
+                WeakThis->CompleteScratchMutation(false);
                 return;
             }
             for (const SkiDomain::TerrainTileMesh& Mesh : Meshes)
@@ -483,7 +1352,7 @@ void ASkiTerrainActor::ApplyScratchMutationAsync(const FVector2D& CenterEastNort
                 }
                 if (!WeakThis->CreateTileComponent(Mesh, OriginHeightM))
                 {
-                    if (Completion) Completion(false);
+                    WeakThis->CompleteScratchMutation(false);
                     return;
                 }
             }
@@ -493,7 +1362,7 @@ void ASkiTerrainActor::ApplyScratchMutationAsync(const FVector2D& CenterEastNort
             WeakThis->SetLightingPreset(WeakThis->CurrentLightingPreset);
             const bool Ready = CapturedSession->AcknowledgeRender(Revision)
                 && CapturedSession->Snapshot().Readiness.IsReady();
-            if (Completion) Completion(Ready);
+            WeakThis->CompleteScratchMutation(Ready);
         });
     });
 }
@@ -501,15 +1370,169 @@ void ASkiTerrainActor::ApplyScratchMutationAsync(const FVector2D& CenterEastNort
 SkiDomain::RayHit ASkiTerrainActor::QueryCanonical(const FVector& WorldOriginCm,
     const FVector& WorldDirection) const
 {
+    if (CoreSession) return QueryTerrainCore(WorldOriginCm, WorldDirection);
     if (!Session) return {};
     const SkiApplication::TerrainSnapshot Snapshot = Session->Snapshot();
     if (!Snapshot.Heightfield) return {};
     const FVector LocalOrigin = GetActorTransform().InverseTransformPosition(WorldOriginCm);
-    const FVector LocalDirection = GetActorTransform().InverseTransformVectorNoScale(WorldDirection);
+    const FVector LocalDirection = GetActorTransform().InverseTransformVector(WorldDirection);
     const SkiDomain::Ray Query{{LocalOrigin.Y / 100.0, LocalOrigin.X / 100.0,
         LocalOrigin.Z / 100.0 + PresentedOriginHeightM},
         {LocalDirection.Y, LocalDirection.X, LocalDirection.Z}};
     return SkiDomain::QueryHeightfield(*Snapshot.Heightfield, Query);
+}
+
+SkiDomain::RayHit ASkiTerrainActor::QueryTerrainCore(const FVector& WorldOriginCm,
+    const FVector& WorldDirection) const
+{
+    SkiDomain::RayHit Miss;
+    if (!CoreSession || !CoreCache) return Miss;
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    if (!Snapshot.CanonicalReady() || Snapshot.Generation != CoreCacheGeneration) return Miss;
+    const FVector LocalOriginCm = GetActorTransform().InverseTransformPosition(WorldOriginCm);
+    const FVector LocalDirection = GetActorTransform().InverseTransformVector(WorldDirection);
+    const SkiDomain::EnuVector Origin{LocalOriginCm.Y / 100.0,
+        LocalOriginCm.X / 100.0, LocalOriginCm.Z / 100.0 + PresentedOriginHeightM};
+    const double Length = LocalDirection.Length();
+    if (!FMath::IsFinite(Length) || Length <= UE_SMALL_NUMBER) return Miss;
+    const SkiDomain::EnuVector Direction{LocalDirection.Y / Length,
+        LocalDirection.X / Length, LocalDirection.Z / Length};
+    const SkiDomain::TerrainCoreManifest& Metadata = *Snapshot.Metadata;
+
+    double Enter = 0.0;
+    double Exit = TNumericLimits<double>::Max();
+    const auto Clip = [&Enter, &Exit](const double Coordinate, const double Delta,
+        const double Minimum, const double Maximum)
+    {
+        if (FMath::Abs(Delta) <= UE_SMALL_NUMBER)
+            return Coordinate >= Minimum && Coordinate <= Maximum;
+        double First = (Minimum - Coordinate) / Delta;
+        double Second = (Maximum - Coordinate) / Delta;
+        if (First > Second) Swap(First, Second);
+        Enter = FMath::Max(Enter, First);
+        Exit = FMath::Min(Exit, Second);
+        return Exit >= Enter;
+    };
+    if (!Clip(Origin.East, Direction.East, Metadata.SampleCenterBounds.WestM,
+            Metadata.SampleCenterBounds.EastM)
+        || !Clip(Origin.North, Direction.North, Metadata.SampleCenterBounds.SouthM,
+            Metadata.SampleCenterBounds.NorthM)
+        || Exit < 0.0)
+    {
+        return Miss;
+    }
+    Enter = FMath::Max(0.0, Enter);
+    constexpr double MaximumRayDistanceM = 100000.0;
+    Exit = FMath::Min(Exit, MaximumRayDistanceM);
+
+    const auto HeightAt = [this, &Metadata](const double East, const double North,
+        double& OutHeight, uint32& OutColumn, uint32& OutRow)
+    {
+        const double ColumnValue = (East - Metadata.SampleCenterBounds.WestM)
+            / Metadata.DeliveredEastSpacingM;
+        const double RowValue = (Metadata.SampleCenterBounds.NorthM - North)
+            / Metadata.DeliveredNorthSpacingM;
+        if (!FMath::IsFinite(ColumnValue) || !FMath::IsFinite(RowValue)
+            || ColumnValue < 0.0 || RowValue < 0.0
+            || ColumnValue > Metadata.Width - 1.0 || RowValue > Metadata.Height - 1.0)
+        {
+            return false;
+        }
+        OutColumn = FMath::Min(Metadata.Width - 2U,
+            static_cast<uint32>(std::floor(ColumnValue)));
+        OutRow = FMath::Min(Metadata.Height - 2U,
+            static_cast<uint32>(std::floor(RowValue)));
+        const double EastFraction = FMath::Clamp(ColumnValue - OutColumn, 0.0, 1.0);
+        const double SouthFraction = FMath::Clamp(RowValue - OutRow, 0.0, 1.0);
+        bool Valid = false;
+        SkiTerrainRuntime::TerrainCoreQueryStatus Status = CoreCache->QueryCanonicalCell(
+            OutColumn, OutRow, EastFraction, SouthFraction, OutHeight, Valid);
+        if (Status == SkiTerrainRuntime::TerrainCoreQueryStatus::Pending)
+        {
+            if (!CoreCache->WaitForWorkers(2.0)) return false;
+            CoreCache->PumpPublications();
+            Status = CoreCache->QueryCanonicalCell(OutColumn, OutRow,
+                EastFraction, SouthFraction, OutHeight, Valid);
+        }
+        return Status == SkiTerrainRuntime::TerrainCoreQueryStatus::Ready && Valid;
+    };
+    const double HorizontalSpeed = FMath::Sqrt(Direction.East * Direction.East
+        + Direction.North * Direction.North);
+    if (HorizontalSpeed <= UE_SMALL_NUMBER)
+    {
+        double Height = 0.0;
+        uint32 Column = 0;
+        uint32 Row = 0;
+        if (!HeightAt(Origin.East, Origin.North, Height, Column, Row)
+            || FMath::Abs(Direction.Up) <= UE_SMALL_NUMBER) return Miss;
+        const double Distance = (Height - Origin.Up) / Direction.Up;
+        if (Distance < 0.0 || Distance > MaximumRayDistanceM) return Miss;
+        return {true, Distance, {Origin.East, Origin.North, Height}, Row, Column,
+            Snapshot.Revisions.Canonical};
+    }
+
+    const double HorizontalStep = FMath::Max(0.25,
+        FMath::Min(Metadata.DeliveredEastSpacingM, Metadata.DeliveredNorthSpacingM) * 0.5);
+    const double Step = HorizontalStep / HorizontalSpeed;
+    const uint64 MaximumSteps = 200000;
+    double PreviousDistance = Enter;
+    double PreviousDifference = 0.0;
+    bool HavePrevious = false;
+    for (uint64 Index = 0; Index < MaximumSteps && PreviousDistance <= Exit; ++Index)
+    {
+        const double Distance = FMath::Min(Exit, Enter + static_cast<double>(Index) * Step);
+        const double East = Origin.East + Direction.East * Distance;
+        const double North = Origin.North + Direction.North * Distance;
+        const double Up = Origin.Up + Direction.Up * Distance;
+        double Height = 0.0;
+        uint32 Column = 0;
+        uint32 Row = 0;
+        if (HeightAt(East, North, Height, Column, Row))
+        {
+            const double Difference = Up - Height;
+            if (HavePrevious && PreviousDifference >= 0.0 && Difference <= 0.0)
+            {
+                double Low = PreviousDistance;
+                double High = Distance;
+                uint32 HitColumn = Column;
+                uint32 HitRow = Row;
+                for (int32 Iteration = 0; Iteration < 16; ++Iteration)
+                {
+                    const double Middle = (Low + High) * 0.5;
+                    const double MidEast = Origin.East + Direction.East * Middle;
+                    const double MidNorth = Origin.North + Direction.North * Middle;
+                    const double MidUp = Origin.Up + Direction.Up * Middle;
+                    double MidHeight = 0.0;
+                    uint32 MidColumn = 0;
+                    uint32 MidRow = 0;
+                    if (!HeightAt(MidEast, MidNorth, MidHeight, MidColumn, MidRow)) break;
+                    if (MidUp - MidHeight > 0.0) Low = Middle;
+                    else
+                    {
+                        High = Middle;
+                        HitColumn = MidColumn;
+                        HitRow = MidRow;
+                    }
+                }
+                const double HitDistance = High;
+                const double HitEast = Origin.East + Direction.East * HitDistance;
+                const double HitNorth = Origin.North + Direction.North * HitDistance;
+                double HitHeight = 0.0;
+                if (!HeightAt(HitEast, HitNorth, HitHeight, HitColumn, HitRow)) return Miss;
+                return {true, HitDistance, {HitEast, HitNorth, HitHeight}, HitRow,
+                    HitColumn, Snapshot.Revisions.Canonical};
+            }
+            HavePrevious = true;
+            PreviousDifference = Difference;
+        }
+        else
+        {
+            HavePrevious = false;
+        }
+        PreviousDistance = Distance;
+        if (Distance >= Exit) break;
+    }
+    return Miss;
 }
 
 void ASkiTerrainActor::SetLightingPreset(const FName Preset)

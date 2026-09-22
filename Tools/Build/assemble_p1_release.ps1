@@ -11,10 +11,12 @@ $receiptPath = Join-Path $repoRoot 'test-results\p1\package-Shipping.json'
 $tiffEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\tiff.json'
 $acquisitionEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\acquisition.json'
 $uiEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\ui.json'
+$terrainCoreEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\terraincore.json'
 $automationReceiptPath = Join-Path $repoRoot 'test-results\p1\automation.json'
 $tiffReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-geotiff-regression.json'
 $acquisitionReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-acquisition-regression.json'
 $uiReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-ui-layout.json'
+$terrainCoreReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-terraincore-regression.json'
 
 if (-not (Test-Path -LiteralPath $freezePath -PathType Leaf)) {
     throw "Release source freeze is missing: $freezePath"
@@ -84,7 +86,16 @@ function Assert-EditorGateReceipt {
 $tiffEditorReceipt = Assert-EditorGateReceipt -Path $tiffEditorReceiptPath -Command 'tiff'
 $acquisitionEditorReceipt = Assert-EditorGateReceipt -Path $acquisitionEditorReceiptPath -Command 'acquisition'
 $uiEditorReceipt = Assert-EditorGateReceipt -Path $uiEditorReceiptPath -Command 'ui'
+$terrainCoreEditorReceipt = Assert-EditorGateReceipt -Path $terrainCoreEditorReceiptPath -Command 'terraincore'
 $automationReceipt = Assert-EditorGateReceipt -Path $automationReceiptPath -Command 'automation'
+$expectedNativeTerrainCoreTests = @('SkiDomain.Revision', 'SkiDomain.Terrain', 'SkiDomain.TerrainCore')
+$recordedNativeTests = @($terrainCoreEditorReceipt.result.native_receipts | ForEach-Object { [string]$_.name } | Sort-Object)
+if (($recordedNativeTests -join '|') -ne (($expectedNativeTerrainCoreTests | Sort-Object) -join '|') -or
+    @($terrainCoreEditorReceipt.result.native_receipts | Where-Object {
+        $_.result -ne 'PASS' -or [string]$_.executable_sha256 -notmatch '^[0-9a-f]{64}$'
+    }).Count -ne 0) {
+    throw 'The exact native TerrainCore CTest identities are not bound to passing executable receipts.'
+}
 if (-not (Test-Path -LiteralPath $tiffReceiptPath -PathType Leaf)) {
     throw "Shipping GeoTIFF regression receipt is missing: $tiffReceiptPath"
 }
@@ -119,6 +130,79 @@ function Assert-ShippingRegressionReceipt {
 
 $acquisitionReceipt = Assert-ShippingRegressionReceipt -Path $acquisitionReceiptPath -Scenario 'acquisition-regression' -Label 'acquisition-policy'
 $uiReceipt = Assert-ShippingRegressionReceipt -Path $uiReceiptPath -Scenario 'ui-layout' -Label 'UI-layout'
+$terrainCoreReceipt = Assert-ShippingRegressionReceipt -Path $terrainCoreReceiptPath -Scenario 'terraincore-regression' -Label 'TerrainCore'
+$uiProcessAudit = $uiReceipt.result.process_network_audit
+if ($uiProcessAudit.method -ne 'GetExtendedTcpTable process-attributed polling' -or
+    $uiProcessAudit.snapshots -lt 1 -or @($uiProcessAudit.listen_ports).Count -ne 0) {
+    throw 'The Shipping UI scenario lacks a process-attributed no-listener audit.'
+}
+$terrainCoreProof = $terrainCoreReceipt.result.receipt
+if ($terrainCoreProof.schemaVersion -ne 2 -or
+    [string]$terrainCoreProof.contentId -notmatch '^[0-9a-f]{64}$' -or
+    [string]$terrainCoreProof.editSetId -notmatch '^[0-9a-f]{64}$' -or
+    -not $terrainCoreProof.baseImmutable -or -not $terrainCoreProof.offlineReopen -or
+    -not $terrainCoreProof.deterministicIds -or -not $terrainCoreProof.deterministicTrees -or
+    -not $terrainCoreProof.rendererPath -or $terrainCoreProof.renderedTileCount -le 0 -or
+    -not $terrainCoreProof.revisionAligned -or -not $terrainCoreProof.actorPicked -or
+    -not $terrainCoreProof.actorMutationObserved -or
+    -not $terrainCoreProof.actorStaleMeshRejected -or
+    -not $terrainCoreProof.acquisitionPortGuardInstalled -or
+    $terrainCoreProof.acquisitionTransportCalls -ne 0 -or
+    [string]$terrainCoreProof.contractTrees.TerrainCore.sha256 -notmatch '^[0-9a-f]{64}$' -or
+    [string]$terrainCoreProof.contractTrees.TerrainEdits.sha256 -notmatch '^[0-9a-f]{64}$' -or
+    $terrainCoreProof.contractTrees.TerrainCore.sha256 -ne $terrainCoreProof.contractTreeRuns.first.TerrainCore.sha256 -or
+    $terrainCoreProof.contractTrees.TerrainEdits.sha256 -ne $terrainCoreProof.contractTreeRuns.first.TerrainEdits.sha256 -or
+    $terrainCoreProof.contractTreeRuns.first.TerrainCore.sha256 -ne $terrainCoreProof.contractTreeRuns.repeat.TerrainCore.sha256 -or
+    $terrainCoreProof.contractTreeRuns.first.TerrainCore.sha256 -ne $terrainCoreProof.contractTreeRuns.reopen.TerrainCore.sha256 -or
+    $terrainCoreProof.contractTreeRuns.first.TerrainEdits.sha256 -ne $terrainCoreProof.contractTreeRuns.repeat.TerrainEdits.sha256 -or
+    $terrainCoreProof.contractTreeRuns.first.TerrainEdits.sha256 -ne $terrainCoreProof.contractTreeRuns.reopen.TerrainEdits.sha256 -or
+    $terrainCoreProof.defaultCacheBudgetBytes -ne 536870912 -or
+    $terrainCoreProof.processNetworkAudit.method -ne 'GetExtendedTcpTable process-attributed polling' -or
+    $terrainCoreProof.processNetworkAudit.snapshots -lt 1 -or
+    @($terrainCoreProof.processNetworkAudit.listen_ports).Count -ne 0 -or
+    @($terrainCoreProof.processNetworkAudit.remote_endpoints).Count -ne 0) {
+    throw 'The Shipping TerrainCore receipt is incomplete or does not prove immutable offline reopen.'
+}
+$terrainCoreChildren = @($terrainCoreProof.children)
+if ($terrainCoreChildren.Count -ne 3 -or @($terrainCoreChildren | Where-Object {
+    -not $_.rendererPath -or $_.renderedTileCount -le 0 -or
+    -not $_.revisionAligned -or -not $_.actorPicked -or -not $_.actorMutationObserved -or
+    -not $_.actorStaleMeshRejected
+}).Count -ne 0) {
+    throw 'Every Shipping TerrainCore child must prove rendering, picking, and revision alignment.'
+}
+$offlineChild = @($terrainCoreChildren | Where-Object { $_.scenario -eq 'terraincore-offline-reopen' })
+if ($offlineChild.Count -ne 1 -or -not $offlineChild[0].acquisitionPortGuardInstalled -or
+    $offlineChild[0].acquisitionTransportCalls -ne 0) {
+    throw 'The offline child lacks production acquisition-port denial.'
+}
+
+$shippingMcpProof = $receipt.result.shipping_mcp_proof
+if ($shippingMcpProof.status -ne 'PASS' -or
+    $shippingMcpProof.target -ne 'SkiAreaDesignChallenge' -or
+    $shippingMcpProof.platform -ne 'Win64' -or
+    $shippingMcpProof.configuration -ne 'Shipping' -or
+    $shippingMcpProof.target_type -ne 'Game' -or
+    $shippingMcpProof.root_module -ne 'SkiPresentation' -or
+    [string]$shippingMcpProof.target_receipt_sha256 -notmatch '^[0-9a-f]{64}$' -or
+    [string]$shippingMcpProof.target_rules_sha256 -notmatch '^[0-9a-f]{64}$' -or
+    @($shippingMcpProof.forbidden_plugins_absent).Count -ne 5) {
+    throw 'The Shipping package lacks exact Game-target/module proof for MCP exclusion.'
+}
+
+$requiredEvidenceReceipts = [ordered]@{
+    'editor-tiff' = @{ Path = $tiffEditorReceiptPath; Receipt = $tiffEditorReceipt }
+    'editor-acquisition' = @{ Path = $acquisitionEditorReceiptPath; Receipt = $acquisitionEditorReceipt }
+    'editor-ui' = @{ Path = $uiEditorReceiptPath; Receipt = $uiEditorReceipt }
+    'editor-terraincore' = @{ Path = $terrainCoreEditorReceiptPath; Receipt = $terrainCoreEditorReceipt }
+    'editor-automation' = @{ Path = $automationReceiptPath; Receipt = $automationReceipt }
+    'shipping-package' = @{ Path = $receiptPath; Receipt = $receipt }
+    'shipping-geotiff' = @{ Path = $tiffReceiptPath; Receipt = $tiffReceipt }
+    'shipping-acquisition' = @{ Path = $acquisitionReceiptPath; Receipt = $acquisitionReceipt }
+    'shipping-ui' = @{ Path = $uiReceiptPath; Receipt = $uiReceipt }
+    'shipping-terraincore' = @{ Path = $terrainCoreReceiptPath; Receipt = $terrainCoreReceipt }
+}
+$runsRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot 'test-results\p1\runs'))
 
 $packageRoot = [IO.Path]::GetFullPath([string]$receipt.result.directory)
 $packageWindows = Join-Path $packageRoot 'Windows'
@@ -147,7 +231,6 @@ function Assert-RecordedPackageFiles {
     $actual = @{}
     foreach ($file in Get-ChildItem -LiteralPath $Root -Recurse -File) {
         $relative = $file.FullName.Substring(([IO.Path]::GetFullPath($Root)).Length).TrimStart('\','/').Replace('\','/')
-        if (($relative -split '/') -contains 'Saved') { continue }
         $actual[$relative] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     if ($actual.Count -ne $expected.Count) {
@@ -231,6 +314,33 @@ are outside this build's scope.
 '@
 Set-Content -LiteralPath (Join-Path $releaseRoot 'README FIRST.txt') -Value $readme -Encoding UTF8
 
+$evidenceLedgerPath = Join-Path $releaseRoot 'P1-EVIDENCE-LEDGER.json'
+$evidenceLedgerArguments = @(
+    (Join-Path $repoRoot 'Tools\Build\evidence_ledger.py'),
+    '--repo-root', $repoRoot,
+    '--runs-root', $runsRoot,
+    '--source-digest', $sourceDigest,
+    '--package-invocation', $packageInvocation,
+    '--output', $evidenceLedgerPath
+)
+foreach ($label in $requiredEvidenceReceipts.Keys) {
+    $evidenceLedgerArguments += @('--receipt', "$label=$($requiredEvidenceReceipts[$label].Path)")
+}
+$evidenceLedgerArguments += @(
+    '--require', 'editor-terraincore=terraincore-ctest-discovery.json',
+    '--require', 'editor-terraincore=terraincore-ctest-results.xml',
+    '--require', 'editor-terraincore=terraincore-ctest-run.log'
+)
+if ($python) {
+    & $python.Source @evidenceLedgerArguments
+} else {
+    & py -3 @evidenceLedgerArguments
+}
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $evidenceLedgerPath -PathType Leaf)) {
+    throw 'The release evidence ledger could not be validated and assembled.'
+}
+$evidenceLedgerHash = (Get-FileHash -LiteralPath $evidenceLedgerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
 $manifestHash = [string]$receipt.result.manifest.sha256
 $buildInfo = @"
 Mountain Planner Unreal P1
@@ -240,13 +350,37 @@ Package manifest SHA-256: $manifestHash
 Editor GeoTIFF gate: $($tiffEditorReceipt.invocation)
 Editor acquisition gate: $($acquisitionEditorReceipt.invocation)
 Editor UI gate: $($uiEditorReceipt.invocation)
+Editor TerrainCore gate: $($terrainCoreEditorReceipt.invocation)
 Full P1 automation gate: $($automationReceipt.invocation)
 Shipping GeoTIFF regression: $($tiffReceipt.invocation)
 Shipping acquisition regression: $($acquisitionReceipt.invocation)
 Shipping UI-layout regression: $($uiReceipt.invocation)
+Shipping TerrainCore regression: $($terrainCoreReceipt.invocation)
+Shipping target receipt SHA-256: $($shippingMcpProof.target_receipt_sha256)
+Shipping process TCP audit snapshots: $($terrainCoreProof.processNetworkAudit.snapshots)
+TerrainCore default cache bytes: $($terrainCoreProof.defaultCacheBudgetBytes)
+Evidence ledger SHA-256: $evidenceLedgerHash
 Assembled UTC: $([DateTime]::UtcNow.ToString('o'))
 "@
 Set-Content -LiteralPath (Join-Path $releaseRoot 'BUILD-INFO.txt') -Value $buildInfo -Encoding Ascii
+
+$releaseManifestPath = Join-Path $releaseRoot 'ReleaseManifest.json'
+$releaseManifestFiles = @(
+    foreach ($file in Get-ChildItem -LiteralPath $releaseRoot -Recurse -File | Sort-Object FullName) {
+        [ordered]@{
+            path = $file.FullName.Substring($releaseRoot.Length).TrimStart('\','/').Replace('\','/')
+            bytes = [long]$file.Length
+            sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+)
+[ordered]@{
+    schemaVersion = 1
+    artifact = $artifactName
+    sourceDigest = $sourceDigest
+    files = $releaseManifestFiles
+} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $releaseManifestPath -Encoding UTF8
+$releaseManifestHash = (Get-FileHash -LiteralPath $releaseManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
 if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
@@ -296,6 +430,8 @@ $launcherHash = (Get-FileHash -LiteralPath (Join-Path $releaseRoot 'SkiAreaDesig
     SourceDigest = $sourceDigest
     PackageInvocation = $packageInvocation
     LauncherSha256 = $launcherHash
+    ReleaseManifestSha256 = $releaseManifestHash
+    EvidenceLedgerSha256 = $evidenceLedgerHash
     ZipSha256 = $zipHash
 } | ConvertTo-Json | Set-Content -LiteralPath $latestTemporaryPath -Encoding UTF8
 Move-Item -LiteralPath $latestTemporaryPath -Destination $latestPath -Force
