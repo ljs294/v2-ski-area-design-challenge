@@ -24,7 +24,9 @@ public:
     bool WriteAndActivate(SkiDomain::TerrainManifest Manifest,
         const SkiDomain::Heightfield& Heightfield, FString& OutPackageDirectory,
         SkiDomain::TerrainManifest& OutManifest, FString& OutError,
-        const TArray<PackageAssetBytes>& AdditionalAssets = {}) const;
+        const TArray<PackageAssetBytes>& AdditionalAssets = {},
+        const TSharedPtr<PreparationOperationLease, ESPMode::ThreadSafe>& Lease = nullptr,
+        uint64 SessionGeneration = 0, uint64 OperationGeneration = 0) const;
     bool Load(const FString& ContentId, SkiDomain::TerrainManifest& OutManifest,
         SkiDomain::Heightfield& OutHeightfield, FString& OutError,
         TArray<uint8>* OutCover = nullptr) const;

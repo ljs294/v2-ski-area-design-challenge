@@ -244,8 +244,19 @@ bool SkiPreparation::ParseManifest(const FString& Json, SkiDomain::TerrainManife
 bool SkiPreparation::PackageStore::WriteAndActivate(SkiDomain::TerrainManifest Manifest,
     const SkiDomain::Heightfield& Heightfield, FString& OutPackageDirectory,
     SkiDomain::TerrainManifest& OutManifest, FString& OutError,
-    const TArray<PackageAssetBytes>& AdditionalAssets) const
+    const TArray<PackageAssetBytes>& AdditionalAssets,
+    const TSharedPtr<PreparationOperationLease, ESPMode::ThreadSafe>& Lease,
+    const uint64 SessionGeneration, const uint64 OperationGeneration) const
 {
+    const auto LeaseCurrent = [&]()
+    {
+        return !Lease || Lease->IsCurrent(SessionGeneration, OperationGeneration);
+    };
+    if (!LeaseCurrent())
+    {
+        OutError = TEXT("Preparation operation is no longer current.");
+        return false;
+    }
     if (!SkiDomain::IsValidHeightfield(Heightfield))
     {
         OutError = TEXT("Heightfield is invalid.");
@@ -312,8 +323,20 @@ bool SkiPreparation::PackageStore::WriteAndActivate(SkiDomain::TerrainManifest M
         Cleanup();
         return false;
     }
+    if (!LeaseCurrent())
+    {
+        OutError = TEXT("Preparation operation became stale while writing staging.");
+        Cleanup();
+        return false;
+    }
     for (const PackageAssetBytes& Asset : AdditionalAssets)
     {
+        if (!LeaseCurrent())
+        {
+            OutError = TEXT("Preparation operation became stale while writing staging assets.");
+            Cleanup();
+            return false;
+        }
         if (Asset.Bytes.IsEmpty()) continue;
         const FString Destination = FPaths::Combine(Stage, Asset.Path);
         if (!Files.MakeDirectory(*FPaths::GetPath(Destination), true)
@@ -323,6 +346,12 @@ bool SkiPreparation::PackageStore::WriteAndActivate(SkiDomain::TerrainManifest M
             Cleanup();
             return false;
         }
+    }
+    if (!LeaseCurrent())
+    {
+        OutError = TEXT("Preparation operation became stale before staging verification.");
+        Cleanup();
+        return false;
     }
     const FString ManifestJson = SerializeManifest(Manifest, true);
     const FTCHARToUTF8 ManifestUtf8(*ManifestJson);
@@ -365,16 +394,37 @@ bool SkiPreparation::PackageStore::WriteAndActivate(SkiDomain::TerrainManifest M
     }
     if (Files.DirectoryExists(*Target))
     {
+        if (!LeaseCurrent())
+        {
+            OutError = TEXT("Preparation operation became stale before activation.");
+            Files.DeleteDirectory(*SyntheticTarget, false, true);
+            return false;
+        }
         Files.DeleteDirectory(*SyntheticTarget, false, true);
         SkiDomain::TerrainManifest ExistingManifest;
         SkiDomain::Heightfield ExistingHeightfield;
         if (!Load(StageContentId, ExistingManifest, ExistingHeightfield, OutError)) return false;
     }
-    else if (!Files.Move(*Target, *SyntheticTarget, false, false, true, true))
+    else
     {
-        OutError = TEXT("Unable to atomically activate terrain package.");
-        Files.DeleteDirectory(*SyntheticTarget, false, true);
-        return false;
+        bool bMoved = false;
+        const auto MovePackage = [&]()
+        {
+            bMoved = Files.Move(*Target, *SyntheticTarget, false, false, true, true);
+        };
+        if (Lease && !Lease->RunIfCurrent(SessionGeneration, OperationGeneration, MovePackage))
+        {
+            OutError = TEXT("Preparation operation became stale before activation.");
+            Files.DeleteDirectory(*SyntheticTarget, false, true);
+            return false;
+        }
+        if (!Lease) MovePackage();
+        if (!bMoved)
+        {
+            OutError = TEXT("Unable to atomically activate terrain package.");
+            Files.DeleteDirectory(*SyntheticTarget, false, true);
+            return false;
+        }
     }
     OutPackageDirectory = Target;
     OutManifest = std::move(Manifest);
@@ -441,8 +491,10 @@ bool SkiPreparation::PackageStore::Load(const FString& ContentId,
     OutHeightfield = {};
     OutHeightfield.Width = OutManifest.HeightWidth;
     OutHeightfield.Height = OutManifest.HeightHeight;
-    OutHeightfield.WestM = 0.0;
-    OutHeightfield.NorthM = static_cast<double>(OutManifest.HeightHeight - 1) * OutManifest.NorthSpacingM;
+    OutHeightfield.WestM = -static_cast<double>(OutManifest.HeightWidth - 1)
+        * OutManifest.EastSpacingM * 0.5;
+    OutHeightfield.NorthM = static_cast<double>(OutManifest.HeightHeight - 1)
+        * OutManifest.NorthSpacingM * 0.5;
     OutHeightfield.EastSpacingM = OutManifest.EastSpacingM;
     OutHeightfield.NorthSpacingM = OutManifest.NorthSpacingM;
     OutHeightfield.NoDataValue = OutManifest.NoDataValue;

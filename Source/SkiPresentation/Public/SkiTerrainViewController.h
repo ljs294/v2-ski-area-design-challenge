@@ -19,6 +19,10 @@ public:
     void FrameSteepest();
     void FrameLastProbe();
     void SetStatusHandler(TFunction<void(const FString&)> Handler);
+    void SetUiGeometryHandlers(TFunction<double()> RightInsetProvider,
+        TFunction<bool()> PointerBlockedProvider, TFunction<bool()> KeyboardBlockedProvider);
+    bool RunInputIsolationRegression(FVector2D PanelPoint, FVector2D TerrainPoint,
+        TFunction<void()> FocusUi, FString& OutError);
     FString DescribeCamera() const;
 
 protected:
@@ -27,7 +31,9 @@ protected:
 
 private:
     void BeginOrbit(); void EndOrbit(); void BeginPan(); void EndPan(); void CancelGesture();
-    void ZoomIn(); void ZoomOut(); void Probe(); void FocusProbe();
+    void ZoomIn(); void ZoomOut(); void Probe(); bool TryProbe(); void FocusProbe();
+    void InputFrameAll(); void InputFrameSteepest(); void InputFrameLastProbe();
+    bool IsKeyboardInputBlocked() const; void ClaimTerrainInput();
     void FrameBounds(const FBox& Bounds); void UpdateCamera();
 
     UPROPERTY() TObjectPtr<ASkiTerrainActor> Terrain;
@@ -42,4 +48,10 @@ private:
     bool bPanning = false;
     TOptional<SkiDomain::RayHit> LastProbe;
     TFunction<void(const FString&)> StatusHandler;
+    TFunction<double()> UiRightInsetProvider;
+    TFunction<bool()> UiPointerBlockedProvider;
+    TFunction<bool()> UiKeyboardBlockedProvider;
+    int32 LastViewportWidth = 0;
+    int32 LastViewportHeight = 0;
+    double LastRightInset = -1.0;
 };

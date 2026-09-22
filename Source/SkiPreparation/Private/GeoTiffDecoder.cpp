@@ -260,13 +260,23 @@ bool ValidateGeoKeys(TIFF* Image, FString& OutStatus, SkiPreparation::ProviderFa
 
 bool SkiPreparation::DecodeElevationGeoTiff(const TArray<uint8>& Bytes,
     const SkiDomain::GeographicBounds& RequestedBounds, const ProviderProduct Product,
-    DecodedElevationRaster& OutRaster, ProviderFailure& OutFailure)
+    DecodedElevationRaster& OutRaster, ProviderFailure& OutFailure,
+    const TFunction<bool()>& IsCancelled)
 {
     static_cast<void>(RequestedBounds);
     OutRaster = {};
     OutFailure = {};
     OutFailure.Product = Product;
     OutFailure.ResponseBytes = Bytes.Num();
+    const auto Cancelled = [&]()
+    {
+        if (!IsCancelled || !IsCancelled()) return false;
+        Fail(OutFailure, TEXT("PREPARATION_CANCELLED"), TEXT("GeoTIFF decode was cancelled."),
+            RetryClassification::Retryable);
+        OutRaster = {};
+        return true;
+    };
+    if (Cancelled()) return false;
     if (!HasTiffSignature(Bytes))
     {
         Fail(OutFailure, TEXT("TIFF_INVALID_SIGNATURE"),
@@ -359,8 +369,10 @@ bool SkiPreparation::DecodeElevationGeoTiff(const TArray<uint8>& Bytes,
         {
             for (uint32 TileX = 0; TileX < Width; TileX += TileWidth)
             {
+                if (Cancelled()) return false;
                 const uint32 Tile = TIFFComputeTile(Image.get(), TileX, TileY, 0, 0);
                 const tmsize_t Read = TIFFReadEncodedTile(Image.get(), Tile, Buffer.GetData(), TileBytes);
+                if (Cancelled()) return false;
                 const uint32 CopyRows = FMath::Min(TileHeight, Height - TileY);
                 const uint32 CopyColumns = FMath::Min(TileWidth, Width - TileX);
                 const uint64 Required = static_cast<uint64>(CopyRows - 1) * static_cast<uint64>(TileRowBytes)
@@ -403,11 +415,13 @@ bool SkiPreparation::DecodeElevationGeoTiff(const TArray<uint8>& Bytes,
         Buffer.SetNumUninitialized(static_cast<int32>(StripBytes));
         for (uint32 Strip = 0; Strip < StripCount; ++Strip)
         {
+            if (Cancelled()) return false;
             const uint64 FirstRow64 = static_cast<uint64>(Strip) * RowsPerStrip;
             if (FirstRow64 >= Height) break;
             const uint32 FirstRow = static_cast<uint32>(FirstRow64);
             const uint32 CopyRows = FMath::Min(RowsPerStrip, Height - FirstRow);
             const tmsize_t Read = TIFFReadEncodedStrip(Image.get(), Strip, Buffer.GetData(), StripBytes);
+            if (Cancelled()) return false;
             const uint64 Required = static_cast<uint64>(CopyRows - 1) * static_cast<uint64>(RowBytes)
                 + static_cast<uint64>(Width) * sizeof(float);
             if (Read < 0 || static_cast<uint64>(Read) < Required)
@@ -427,6 +441,7 @@ bool SkiPreparation::DecodeElevationGeoTiff(const TArray<uint8>& Bytes,
         }
     }
 
+    if (Cancelled()) return false;
     double NoData = -9999.0;
     std::string NoDataText;
     const FieldResult NoDataResult = ReadAsciiField(Image.get(), TIFFTAG_GDAL_NODATA, NoDataText, OutFailure);

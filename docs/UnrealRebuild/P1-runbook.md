@@ -2,6 +2,8 @@
 
 P1 starts from committed P0 baseline `31af9880e12bd8230508a42ca6789d405e5b4bbe`. The v0.9 planning archive is retained reference material; its P0 prompts and historical archives are not active instructions. Sol High is the main coordination and implementation agent. The user alone stages and commits accepted section boundaries.
 
+The live accounting record is [the P1 requirement and acceptance matrix](P1-requirement-matrix.md). Code presence does not close a row without its named deterministic and packaged evidence; owner-review rows also require explicit owner acceptance.
+
 ## Scope and architecture
 
 P1 proves that one packaged Windows runtime can select, prepare, install, render, edit, query and reopen real terrain. Preparation is native C++; the embedded MapLibre page submits only a bounded site request. Existing TypeScript terrain and `GameSave` schemas remain unchanged. P2 construction, full grading/undo, simulation, weather and source retirement are excluded.
@@ -47,7 +49,7 @@ Receipts belong under ignored `test-results/p1/` and identify frozen source, eng
 
 `Build-P1-Release.bat` builds the Shipping target and creates both an extracted tester folder and a shareable ZIP under ignored `release/`. The distribution is self-contained and does not require the repository, Unreal Editor, Python, Node.js or a development server. Its two visible launchers distinguish the live-provider path from the deterministic sample-terrain path.
 
-Repository users can double-click `Run-P1.bat` to launch the sample-terrain path. It creates the release first only when one does not already exist; `Run-P1.bat live` selects the live-provider path.
+Repository users can double-click `Run-P1.bat` to launch the sample-terrain path. It resolves the exact validated versioned build through `release/MountainPlanner-P1-LATEST.json`, creates a release when no valid handoff exists, and never guesses from directory timestamps; `Run-P1.bat live` selects the live-provider path.
 
 ## Acceptance summary
 

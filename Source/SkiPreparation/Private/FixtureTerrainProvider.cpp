@@ -109,7 +109,8 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
     Report(State::WritingStaging, 2, 5, TEXT("Writing fixture package staging"));
     PackageStore Store(DataRoot);
     if (!Store.WriteAndActivate(std::move(Manifest), Field, Output.PackageDirectory,
-            Output.Manifest, Output.Error, Assets))
+            Output.Manifest, Output.Error, Assets, RequestValue.Lease,
+            RequestValue.SessionGeneration, RequestValue.OperationGeneration))
     {
         return Output;
     }

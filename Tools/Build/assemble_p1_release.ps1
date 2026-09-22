@@ -5,14 +5,37 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $releaseBase = [IO.Path]::GetFullPath((Join-Path $repoRoot 'release'))
-$releaseRoot = [IO.Path]::GetFullPath((Join-Path $releaseBase 'MountainPlanner-P1-Windows'))
-$zipPath = [IO.Path]::GetFullPath((Join-Path $releaseBase 'MountainPlanner-P1-Windows.zip'))
-$hashPath = "$zipPath.sha256"
+$freezePath = Join-Path $repoRoot 'test-results\p1\release-freeze.json'
+$freezeCheckPath = Join-Path $repoRoot 'test-results\p1\freeze-check.json'
 $receiptPath = Join-Path $repoRoot 'test-results\p1\package-Shipping.json'
-$tiffReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping.json'
+$tiffEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\tiff.json'
+$acquisitionEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\acquisition.json'
+$uiEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\ui.json'
+$automationReceiptPath = Join-Path $repoRoot 'test-results\p1\automation.json'
+$tiffReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-geotiff-regression.json'
+$acquisitionReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-acquisition-regression.json'
+$uiReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-ui-layout.json'
 
-if (-not $releaseRoot.StartsWith($releaseBase + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Refusing to assemble outside the repository release directory: $releaseRoot"
+if (-not (Test-Path -LiteralPath $freezePath -PathType Leaf)) {
+    throw "Release source freeze is missing: $freezePath"
+}
+$env:SKI_P1_RELEASE_FREEZE = $freezePath
+$python = Get-Command python -ErrorAction SilentlyContinue
+if ($python) {
+    & $python.Source (Join-Path $repoRoot 'Tools\Build\p1.py') freeze-check
+} else {
+    & py -3 (Join-Path $repoRoot 'Tools\Build\p1.py') freeze-check
+}
+if ($LASTEXITCODE -ne 0) {
+    throw 'Current source no longer matches the release-wide freeze receipt.'
+}
+
+$freeze = ConvertFrom-Json (Get-Content -LiteralPath $freezePath -Raw)
+$freezeCheck = ConvertFrom-Json (Get-Content -LiteralPath $freezeCheckPath -Raw)
+if ($freeze.command -ne 'freeze' -or $freeze.result.status -ne 'PASS' -or
+    $freezeCheck.command -ne 'freeze-check' -or $freezeCheck.result.status -ne 'PASS' -or
+    $freezeCheck.source_before -ne $freeze.source_before) {
+    throw 'Release source freeze receipts are missing, failed, or inconsistent.'
 }
 
 if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
@@ -23,6 +46,45 @@ $receipt = ConvertFrom-Json (Get-Content -LiteralPath $receiptPath -Raw)
 if ($receipt.result.status -ne 'PASS' -or $receipt.configuration -ne 'Shipping') {
     throw 'The latest Shipping package receipt is not a PASS.'
 }
+if ($receipt.source_before -ne $freeze.source_before) {
+    throw 'The Shipping package was not built from the release-wide frozen source.'
+}
+
+$sourceDigest = [string]$freeze.source_before
+$packageInvocation = [string]$receipt.invocation
+if ($sourceDigest -notmatch '^[0-9a-f]{64}$' -or
+    $packageInvocation -notmatch '^(?<timestamp>[0-9]{8}T[0-9]{6})\.') {
+    throw 'Release identity is malformed; refusing to derive output paths.'
+}
+$artifactName = "MountainPlanner-P1-Windows-$($sourceDigest.Substring(0, 8))-$($Matches.timestamp)"
+$releaseRoot = [IO.Path]::GetFullPath((Join-Path $releaseBase $artifactName))
+$zipPath = [IO.Path]::GetFullPath((Join-Path $releaseBase "$artifactName.zip"))
+$hashPath = "$zipPath.sha256"
+if (-not $releaseRoot.StartsWith($releaseBase + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+    -not $zipPath.StartsWith($releaseBase + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to assemble outside the repository release directory: $releaseRoot"
+}
+
+function Assert-EditorGateReceipt {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Command
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Editor gate receipt is missing: $Path"
+    }
+    $gate = ConvertFrom-Json (Get-Content -LiteralPath $Path -Raw)
+    if ($gate.command -ne $Command -or $gate.result.status -ne 'PASS' -or
+        $gate.source_before -ne $freeze.source_before) {
+        throw "Editor gate '$Command' is failed, stale, or belongs to another source."
+    }
+    return $gate
+}
+
+$tiffEditorReceipt = Assert-EditorGateReceipt -Path $tiffEditorReceiptPath -Command 'tiff'
+$acquisitionEditorReceipt = Assert-EditorGateReceipt -Path $acquisitionEditorReceiptPath -Command 'acquisition'
+$uiEditorReceipt = Assert-EditorGateReceipt -Path $uiEditorReceiptPath -Command 'ui'
+$automationReceipt = Assert-EditorGateReceipt -Path $automationReceiptPath -Command 'automation'
 if (-not (Test-Path -LiteralPath $tiffReceiptPath -PathType Leaf)) {
     throw "Shipping GeoTIFF regression receipt is missing: $tiffReceiptPath"
 }
@@ -35,11 +97,73 @@ if ($tiffReceipt.result.status -ne 'PASS' -or
     throw 'The Shipping GeoTIFF regression is absent, stale, or belongs to another package.'
 }
 
+function Assert-ShippingRegressionReceipt {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Scenario,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Shipping $Label receipt is missing: $Path"
+    }
+    $scenarioReceipt = ConvertFrom-Json (Get-Content -LiteralPath $Path -Raw)
+    if ($scenarioReceipt.result.status -ne 'PASS' -or
+        $scenarioReceipt.result.scenario -ne $Scenario -or
+        $scenarioReceipt.configuration -ne 'Shipping' -or
+        $scenarioReceipt.source_before -ne $receipt.source_before -or
+        $scenarioReceipt.result.package_invocation -ne $receipt.invocation) {
+        throw "The Shipping $Label regression is absent, stale, or belongs to another package."
+    }
+    return $scenarioReceipt
+}
+
+$acquisitionReceipt = Assert-ShippingRegressionReceipt -Path $acquisitionReceiptPath -Scenario 'acquisition-regression' -Label 'acquisition-policy'
+$uiReceipt = Assert-ShippingRegressionReceipt -Path $uiReceiptPath -Scenario 'ui-layout' -Label 'UI-layout'
+
 $packageRoot = [IO.Path]::GetFullPath([string]$receipt.result.directory)
 $packageWindows = Join-Path $packageRoot 'Windows'
 $packageExe = Join-Path $packageWindows 'SkiAreaDesignChallenge.exe'
 if (-not (Test-Path -LiteralPath $packageExe -PathType Leaf)) {
     throw "The packaged executable is missing: $packageExe"
+}
+
+function Assert-RecordedPackageFiles {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)]$Manifest,
+        [string]$StripPrefix = ''
+    )
+    $expected = @{}
+    foreach ($property in $Manifest.files.PSObject.Properties) {
+        $relative = [string]$property.Name
+        if ($StripPrefix) {
+            if (-not $relative.StartsWith($StripPrefix, [StringComparison]::Ordinal)) {
+                throw "Recorded package path is outside expected prefix '$StripPrefix': $relative"
+            }
+            $relative = $relative.Substring($StripPrefix.Length)
+        }
+        $expected[$relative] = [string]$property.Value
+    }
+    $actual = @{}
+    foreach ($file in Get-ChildItem -LiteralPath $Root -Recurse -File) {
+        $relative = $file.FullName.Substring(([IO.Path]::GetFullPath($Root)).Length).TrimStart('\','/').Replace('\','/')
+        if (($relative -split '/') -contains 'Saved') { continue }
+        $actual[$relative] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    if ($actual.Count -ne $expected.Count) {
+        throw "Packaged file count changed: expected $($expected.Count), found $($actual.Count)."
+    }
+    foreach ($relative in $expected.Keys) {
+        if (-not $actual.ContainsKey($relative) -or $actual[$relative] -ne $expected[$relative]) {
+            throw "Packaged file is missing or changed: $relative"
+        }
+    }
+}
+
+Assert-RecordedPackageFiles -Root $packageRoot -Manifest $receipt.result.manifest
+if ((Get-FileHash -LiteralPath $packageExe -Algorithm SHA256).Hash.ToLowerInvariant() -ne
+    ([string]$receipt.result.launcher_sha256).ToLowerInvariant()) {
+    throw 'The packaged executable hash differs from the package receipt.'
 }
 
 New-Item -ItemType Directory -Path $releaseBase -Force | Out-Null
@@ -48,8 +172,7 @@ if (Test-Path -LiteralPath $releaseRoot) {
 }
 New-Item -ItemType Directory -Path $releaseRoot | Out-Null
 Copy-Item -Path (Join-Path $packageWindows '*') -Destination $releaseRoot -Recurse -Force
-
-Get-ChildItem -LiteralPath $releaseRoot -Filter 'Manifest_*.txt' -File | Remove-Item -Force
+Assert-RecordedPackageFiles -Root $releaseRoot -Manifest $receipt.result.manifest -StripPrefix 'Windows/'
 
 $normalLauncher = @'
 @echo off
@@ -67,9 +190,9 @@ Set-Content -LiteralPath (Join-Path $releaseRoot 'START SAMPLE TERRAIN.bat') -Va
 
 $diagnosticsLauncher = @'
 @echo off
-set "DIAGNOSTICS=%LOCALAPPDATA%\SkiAreaDesignChallenge\Saved\TerrainDiagnostics"
-if not exist "%DIAGNOSTICS%" mkdir "%DIAGNOSTICS%"
-start "Mountain Planner Diagnostics" "%DIAGNOSTICS%"
+set "SAVED=%LOCALAPPDATA%\SkiAreaDesignChallenge\Saved"
+if not exist "%SAVED%\TerrainDiagnostics" mkdir "%SAVED%\TerrainDiagnostics"
+start "Mountain Planner Diagnostics" "%SAVED%"
 '@
 Set-Content -LiteralPath (Join-Path $releaseRoot 'OPEN DIAGNOSTICS.bat') -Value $diagnosticsLauncher -Encoding Ascii
 
@@ -100,8 +223,8 @@ The application is self-contained. Testers do not need Unreal Editor, Python,
 Node.js, a development server or the source repository.
 
 If preparation fails, double-click OPEN DIAGNOSTICS.bat. The folder contains
-bounded, redacted preparation logs and failure receipts; it does not contain
-raw downloaded terrain payloads.
+bounded, redacted preparation logs and failure receipts. Unreal Logs and Crashes
+also appear there when available. Raw downloaded terrain payloads are not kept.
 
 This is a P1 terrain-preparation test build. Construction and simulation gameplay
 are outside this build's scope.
@@ -114,7 +237,13 @@ Mountain Planner Unreal P1
 Package invocation: $($receipt.invocation)
 Source digest: $($receipt.source_before)
 Package manifest SHA-256: $manifestHash
+Editor GeoTIFF gate: $($tiffEditorReceipt.invocation)
+Editor acquisition gate: $($acquisitionEditorReceipt.invocation)
+Editor UI gate: $($uiEditorReceipt.invocation)
+Full P1 automation gate: $($automationReceipt.invocation)
 Shipping GeoTIFF regression: $($tiffReceipt.invocation)
+Shipping acquisition regression: $($acquisitionReceipt.invocation)
+Shipping UI-layout regression: $($uiReceipt.invocation)
 Assembled UTC: $([DateTime]::UtcNow.ToString('o'))
 "@
 Set-Content -LiteralPath (Join-Path $releaseRoot 'BUILD-INFO.txt') -Value $buildInfo -Encoding Ascii
@@ -128,11 +257,48 @@ if (Test-Path -LiteralPath $hashPath) {
 
 Compress-Archive -LiteralPath $releaseRoot -DestinationPath $zipPath -CompressionLevel Optimal
 $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-Set-Content -LiteralPath $hashPath -Value "$zipHash  MountainPlanner-P1-Windows.zip" -Encoding Ascii
+Set-Content -LiteralPath $hashPath -Value "$zipHash  $artifactName.zip" -Encoding Ascii
+
+# Close the copy/compression race: a source change at any point during assembly
+# invalidates the output even when all pre-assembly receipts matched.
+if ($python) {
+    & $python.Source (Join-Path $repoRoot 'Tools\Build\p1.py') freeze-check
+} else {
+    & py -3 (Join-Path $repoRoot 'Tools\Build\p1.py') freeze-check
+}
+if ($LASTEXITCODE -ne 0) {
+    Set-Content -LiteralPath (Join-Path $releaseRoot 'DO NOT USE - SOURCE CHANGED.txt') `
+        -Value 'Source changed during release assembly. Rebuild from a new freeze.' -Encoding Ascii
+    if (Test-Path -LiteralPath $zipPath) {
+        Move-Item -LiteralPath $zipPath -Destination ($zipPath + '.INVALID') -Force
+    }
+    if (Test-Path -LiteralPath $hashPath) {
+        Move-Item -LiteralPath $hashPath -Destination ($hashPath + '.INVALID') -Force
+    }
+    throw 'Source changed during release assembly; output was marked invalid.'
+}
+$finalFreezeCheck = ConvertFrom-Json (Get-Content -LiteralPath $freezeCheckPath -Raw)
+if ($finalFreezeCheck.command -ne 'freeze-check' -or
+    $finalFreezeCheck.result.status -ne 'PASS' -or
+    $finalFreezeCheck.source_before -ne $freeze.source_before) {
+    throw 'Final release source-freeze receipt is missing, failed, or inconsistent.'
+}
 
 $fileCount = (Get-ChildItem -LiteralPath $releaseRoot -Recurse -File).Count
 $folderBytes = (Get-ChildItem -LiteralPath $releaseRoot -Recurse -File | Measure-Object -Property Length -Sum).Sum
 $zipBytes = (Get-Item -LiteralPath $zipPath).Length
+$latestPath = Join-Path $releaseBase 'MountainPlanner-P1-LATEST.json'
+$latestTemporaryPath = "$latestPath.$PID.tmp"
+$launcherHash = (Get-FileHash -LiteralPath (Join-Path $releaseRoot 'SkiAreaDesignChallenge.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+[pscustomobject]@{
+    Status = 'PASS'
+    Artifact = $artifactName
+    SourceDigest = $sourceDigest
+    PackageInvocation = $packageInvocation
+    LauncherSha256 = $launcherHash
+    ZipSha256 = $zipHash
+} | ConvertTo-Json | Set-Content -LiteralPath $latestTemporaryPath -Encoding UTF8
+Move-Item -LiteralPath $latestTemporaryPath -Destination $latestPath -Force
 
 [pscustomobject]@{
     Status = 'PASS'
@@ -142,4 +308,5 @@ $zipBytes = (Get-Item -LiteralPath $zipPath).Length
     Files = $fileCount
     FolderBytes = $folderBytes
     ZipBytes = $zipBytes
+    LatestReceipt = $latestPath
 } | Format-List

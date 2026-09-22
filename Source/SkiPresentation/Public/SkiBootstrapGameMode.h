@@ -21,6 +21,8 @@ protected:
 
 private:
     bool RunP1Smoke();
+    bool BeginP1UiLayoutSmoke();
+    void FinishP1UiLayoutSmoke();
     bool BeginP1VisualCapture();
     void RequestP1VisualScreenshot();
     void FinishP1VisualCapture();
@@ -38,6 +40,7 @@ private:
 
     TSharedPtr<SkiApplication::TerrainSession> TerrainSession;
     TSharedPtr<SkiPreparation::Cancellation> PreparationCancellation;
+    TSharedPtr<SkiPreparation::PreparationOperationLease, ESPMode::ThreadSafe> PreparationLease;
     TOptional<SkiPreparation::Request> LastRequest;
     uint64 ActiveSessionGeneration = 0;
     uint64 ActiveOperationGeneration = 0;
@@ -50,4 +53,8 @@ private:
     int32 VisualLod = 0;
     int32 VisualCaptureWidth = 2560;
     int32 VisualCaptureHeight = 1440;
+    FString UiLayoutReceiptPath;
+    FString UiLayoutToken;
+    bool bUiInputIsolationValid = false;
+    FString UiInputIsolationError;
 };

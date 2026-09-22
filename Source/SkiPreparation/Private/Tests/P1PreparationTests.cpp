@@ -1,24 +1,112 @@
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "Misc/AutomationTest.h"
+#include "Async/Async.h"
 #include "Misc/Base64.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeLock.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformProcess.h"
 #include "SkiApplication/TerrainSession.h"
 #include "SkiPreparation/FixtureTerrainProvider.h"
 #include "SkiPreparation/GeoTiffDecoder.h"
 #include "SkiPreparation/NativeTerrainProvider.h"
 #include "SkiPreparation/SelectorProtocol.h"
+#include "SkiPreparation/TerrainAcquisition.h"
 #include "SkiPreparation/TerrainPackageStore.h"
 #include "Misc/FileHelper.h"
 #include "tiffio.h"
+
+#include <atomic>
 
 namespace
 {
 constexpr uint32 ModelPixelScaleTag = 33550;
 constexpr uint32 ModelTiepointTag = 33922;
 constexpr uint32 GeoKeyDirectoryTag = 34735;
+
+class FScriptedAcquisitionTransport final : public SkiPreparation::IAcquisitionTransport
+{
+public:
+    TArray<SkiPreparation::HttpAcquisitionResult> Script;
+    TArray<SkiPreparation::HttpAcquisitionRequest> Observed;
+    bool bCancelOnFirstGet = false;
+
+    SkiPreparation::HttpAcquisitionResult Get(const SkiPreparation::HttpAcquisitionRequest& Request,
+        const TSharedRef<SkiPreparation::Cancellation>& Cancellation) override
+    {
+        Observed.Add(Request);
+        Observed.Last().BackendLifetime.Reset();
+        if (bCancelOnFirstGet && Observed.Num() == 1) Cancellation->Cancel();
+        return Script.IsValidIndex(Observed.Num() - 1) ? Script[Observed.Num() - 1] : Script.Last();
+    }
+};
+
+class FConcurrentAcquisitionTransport final : public SkiPreparation::IAcquisitionTransport
+{
+public:
+    std::atomic<int32> Active{0};
+    std::atomic<int32> Maximum{0};
+    bool bDetachBackend = true;
+
+    void WaitForBackends()
+    {
+        TArray<TFuture<void>> Pending;
+        {
+            FScopeLock Lock(&FutureMutex);
+            Pending = std::move(BackendFutures);
+        }
+        for (TFuture<void>& Future : Pending) Future.Get();
+    }
+
+    SkiPreparation::HttpAcquisitionResult Get(const SkiPreparation::HttpAcquisitionRequest& Request,
+        const TSharedRef<SkiPreparation::Cancellation>& Cancellation) override
+    {
+        const int32 Current = Active.fetch_add(1) + 1;
+        int32 Observed = Maximum.load();
+        while (Current > Observed && !Maximum.compare_exchange_weak(Observed, Current)) {}
+        if (bDetachBackend)
+        {
+            TSharedPtr<SkiPreparation::AcquisitionResourceLease, ESPMode::ThreadSafe> BackendLifetime =
+                Request.BackendLifetime;
+            TFuture<void> Backend = Async(EAsyncExecution::Thread,
+                [this, BackendLifetime = std::move(BackendLifetime)]()
+                {
+                    FPlatformProcess::SleepNoStats(0.075F);
+                    Active.fetch_sub(1);
+                });
+            FScopeLock Lock(&FutureMutex);
+            BackendFutures.Add(std::move(Backend));
+            SkiPreparation::HttpAcquisitionResult Result;
+            Result.HttpStatus = 200;
+            Result.Bytes = {1};
+            Result.BytesReceived = 1;
+            return Result;
+        }
+        const double Began = FPlatformTime::Seconds();
+        while (!Cancellation->IsCancelled() && FPlatformTime::Seconds() - Began < 0.075)
+            FPlatformProcess::SleepNoStats(0.005F);
+        Active.fetch_sub(1);
+        SkiPreparation::HttpAcquisitionResult Result;
+        if (Cancellation->IsCancelled())
+        {
+            Result.FailureReason = SkiPreparation::TransportFailureReason::Cancelled;
+            Result.RequestStatus = TEXT("Cancelled");
+        }
+        else
+        {
+            Result.HttpStatus = 200;
+            Result.Bytes = {1};
+            Result.BytesReceived = 1;
+        }
+        return Result;
+    }
+
+private:
+    FCriticalSection FutureMutex;
+    TArray<TFuture<void>> BackendFutures;
+};
 
 bool WriteFloatTiff(const FString& Path, const uint32 Width, const uint32 Height,
     const bool Tiled, const uint16 Compression, const uint16 Orientation,
@@ -123,6 +211,7 @@ bool FP1PreparationContractTest::RunTest(const FString&)
     Request.Profile = SkiPreparation::SourceProfile::Standard;
     Request.SessionGeneration = 1;
     Request.OperationGeneration = 1;
+    Request.Lease = MakeShared<SkiPreparation::PreparationOperationLease, ESPMode::ThreadSafe>(1, 1);
     const FString Root = FPaths::Combine(FPaths::ProjectIntermediateDir(), TEXT("P1Tests"),
         FGuid::NewGuid().ToString(EGuidFormats::Digits));
     IFileManager::Get().MakeDirectory(*Root, true);
@@ -134,6 +223,11 @@ bool FP1PreparationContractTest::RunTest(const FString&)
         static_cast<int32>(Result.Manifest.Assets.size()), 7);
     TestEqual(TEXT("Verified cover grid is returned for runtime presentation"),
         Result.Cover.Num(), static_cast<int32>(Result.Manifest.CoverWidth * Result.Manifest.CoverHeight));
+    TestTrue(TEXT("Reloaded package remains centered on its declared local origin"),
+        FMath::IsNearlyZero(Result.Heightfield.WestM
+            + Result.Heightfield.EastM(Result.Heightfield.Width - 1), 1.0e-6)
+        && FMath::IsNearlyZero(Result.Heightfield.NorthM
+            + Result.Heightfield.SampleNorthM(Result.Heightfield.Height - 1), 1.0e-6));
 
     SkiApplication::TerrainSession Session;
     std::vector<std::uint8_t> Cover(Result.Cover.GetData(), Result.Cover.GetData() + Result.Cover.Num());
@@ -233,6 +327,14 @@ bool FP1GeoTiffLiveNoDataRegressionTest::RunTest(const FString&)
     TestEqual(TEXT("Nodata metadata"), Raster.NoDataValue, -9999.0);
     TestEqual(TEXT("Storage organization"), static_cast<uint8>(Raster.Storage),
         static_cast<uint8>(SkiPreparation::TiffStorageOrganization::Tiled));
+    int32 CancellationChecks = 0;
+    TestFalse(TEXT("Tiled decode observes cancellation between bounded tile operations"),
+        SkiPreparation::DecodeElevationGeoTiff(Bytes, Requested,
+            SkiPreparation::ProviderProduct::CoreElevation, Raster, Failure,
+            [&]() { return ++CancellationChecks >= 3; }));
+    TestEqual(TEXT("Cancelled decode has stable code"), Failure.Code,
+        FString(TEXT("PREPARATION_CANCELLED")));
+    TestEqual(TEXT("Cancelled decode exposes no partial heightfield"), Raster.SourceWidth, 0U);
     return true;
 }
 
@@ -309,6 +411,283 @@ bool FP1ProviderDiagnosticsTest::RunTest(const FString&)
     TArray<FString> Receipts;
     IFileManager::Get().FindFiles(Receipts, *FPaths::Combine(Diagnostics, TEXT("*.json")), true, false);
     TestEqual(TEXT("Exactly one terminal diagnostic receipt remains"), Receipts.Num(), 1);
+    IFileManager::Get().DeleteDirectory(*Root, false, true);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FP1AcquisitionPlanTest,
+    "MountainPlanner.P1.Preparation.Acquisition.Plan",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FP1AcquisitionPlanTest::RunTest(const FString&)
+{
+    const SkiDomain::GeographicBounds MountWashington{-71.365, 44.225, -71.241, 44.315};
+    const SkiPreparation::AcquisitionPlan Standard = SkiPreparation::BuildElevationAcquisitionPlan(
+        MountWashington, SkiPreparation::SourceProfile::Standard);
+    const SkiPreparation::AcquisitionPlan High = SkiPreparation::BuildElevationAcquisitionPlan(
+        MountWashington, SkiPreparation::SourceProfile::High);
+    TestEqual(TEXT("Standard longest axis is 1000"), FMath::Max(Standard.Width, Standard.Height), 1000U);
+    TestEqual(TEXT("Standard is one bounded request"), Standard.Tiles.Num(), 1);
+    TestEqual(TEXT("High longest axis is 2000"), FMath::Max(High.Width, High.Height), 2000U);
+    TestEqual(TEXT("Mount Washington High is a 2x2 request plan"), High.Tiles.Num(), 4);
+    TestTrue(TEXT("High retains near-square physical sample spacing"),
+        FMath::Abs(High.WidthM / High.Width - High.HeightM / High.Height) < 0.02);
+    TestTrue(TEXT("High remains within the package sample envelope"),
+        static_cast<uint64>(High.Width) * High.Height <= SkiDomain::MaxHeightSamples);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FP1AcquisitionRetryPolicyTest,
+    "MountainPlanner.P1.Preparation.Acquisition.RetryPolicy",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FP1AcquisitionRetryPolicyTest::RunTest(const FString&)
+{
+    SkiPreparation::HttpAcquisitionResult Result;
+    Result.FailureReason = SkiPreparation::TransportFailureReason::TimedOut;
+    TestTrue(TEXT("Timeout is retryable"), SkiPreparation::IsRetryableTransportFailure(Result));
+    Result.FailureReason = SkiPreparation::TransportFailureReason::ConnectionError;
+    TestTrue(TEXT("Connection error is retryable"), SkiPreparation::IsRetryableTransportFailure(Result));
+    Result.FailureReason = SkiPreparation::TransportFailureReason::HttpStatus;
+    for (const int32 Status : {408, 425, 429, 500, 502, 503, 504})
+    {
+        Result.HttpStatus = Status;
+        TestTrue(FString::Printf(TEXT("HTTP %d is retryable"), Status),
+            SkiPreparation::IsRetryableTransportFailure(Result));
+    }
+    for (const int32 Status : {400, 401, 403, 404})
+    {
+        Result.HttpStatus = Status;
+        TestFalse(FString::Printf(TEXT("HTTP %d is permanent"), Status),
+            SkiPreparation::IsRetryableTransportFailure(Result));
+    }
+    Result.RetryAfter = TEXT("90");
+    TestEqual(TEXT("Retry-After is capped"), SkiPreparation::RetryDelaySeconds(Result, 1, 0), 30.0);
+    Result.RetryAfter = TEXT("invalid");
+    const double Delay = SkiPreparation::RetryDelaySeconds(Result, 2, 250);
+    TestTrue(TEXT("Backoff and jitter are bounded"), Delay >= 2.0 && Delay <= 2.25);
+
+    SkiPreparation::RetryPolicy Policy;
+    Policy.OperationDeadlineSeconds = 5.0;
+    SkiPreparation::HttpAcquisitionResult Timeout;
+    Timeout.FailureReason = SkiPreparation::TransportFailureReason::TimedOut;
+    Timeout.RetryAfter = TEXT("0");
+    SkiPreparation::HttpAcquisitionResult Busy;
+    Busy.FailureReason = SkiPreparation::TransportFailureReason::HttpStatus;
+    Busy.HttpStatus = 503;
+    Busy.RetryAfter = TEXT("0");
+    SkiPreparation::HttpAcquisitionResult Success;
+    Success.HttpStatus = 200;
+    Success.Bytes = {1};
+    Success.BytesReceived = 1;
+    FScriptedAcquisitionTransport Scripted;
+    Scripted.Script = {Timeout, Busy, Success};
+    SkiPreparation::HttpAcquisitionRequest Request;
+    Request.ActivityTimeoutSeconds = Policy.ActivityTimeoutSeconds;
+    Request.TotalTimeoutSeconds = Policy.TotalTimeoutSeconds;
+    SkiPreparation::HttpAcquisitionResult ObservedResult;
+    const TSharedRef<SkiPreparation::Cancellation> Cancellation = MakeShared<SkiPreparation::Cancellation>();
+    TestTrue(TEXT("Production retry loop reaches a third successful attempt"),
+        SkiPreparation::ExecuteAcquisitionWithRetry(Scripted, Request, Policy, Cancellation,
+            FPlatformTime::Seconds(), [](){return true;}, {}, ObservedResult));
+    TestEqual(TEXT("Exactly three transport attempts execute"), Scripted.Observed.Num(), 3);
+    TestEqual(TEXT("Successful result records the final attempt"), ObservedResult.Attempt, 3);
+    for (const SkiPreparation::HttpAcquisitionRequest& Attempt : Scripted.Observed)
+    {
+        TestEqual(TEXT("Activity timeout is forwarded"), Attempt.ActivityTimeoutSeconds, 90.0F);
+        TestEqual(TEXT("Total timeout is forwarded"), Attempt.TotalTimeoutSeconds, 180.0F);
+        TestTrue(TEXT("Operation deadline is forwarded to active transport"),
+            Attempt.AbsoluteOperationDeadlineSeconds > 0.0);
+    }
+
+    FScriptedAcquisitionTransport CancelledTransport;
+    CancelledTransport.Script = {Timeout};
+    CancelledTransport.bCancelOnFirstGet = true;
+    const TSharedRef<SkiPreparation::Cancellation> Cancelled = MakeShared<SkiPreparation::Cancellation>();
+    const double CancelBegan = FPlatformTime::Seconds();
+    TestFalse(TEXT("Cancellation interrupts retry backoff"),
+        SkiPreparation::ExecuteAcquisitionWithRetry(CancelledTransport, Request, Policy, Cancelled,
+            CancelBegan, [](){return true;}, {}, ObservedResult));
+    TestTrue(TEXT("Cancellation acknowledgement remains below 250 ms"),
+        FPlatformTime::Seconds() - CancelBegan <= 0.250);
+    TestEqual(TEXT("Cancellation prevents another transport attempt"), CancelledTransport.Observed.Num(), 1);
+
+    auto RunConcurrentAcquisitions = [&](const SkiPreparation::ProviderProduct Product,
+        const int32 Count, int32& OutMaximum)
+    {
+        FConcurrentAcquisitionTransport Concurrent;
+        TArray<TFuture<bool>> Futures;
+        SkiPreparation::RetryPolicy ConcurrentPolicy;
+        ConcurrentPolicy.MaximumAttempts = 1;
+        ConcurrentPolicy.OperationDeadlineSeconds = 3.0;
+        for (int32 Index = 0; Index < Count; ++Index)
+        {
+            Futures.Add(Async(EAsyncExecution::ThreadPool, [&, Product]()
+            {
+                SkiPreparation::HttpAcquisitionRequest ConcurrentRequest;
+                ConcurrentRequest.Product = Product;
+                SkiPreparation::HttpAcquisitionResult ConcurrentResult;
+                const TSharedRef<SkiPreparation::Cancellation> ConcurrentCancellation =
+                    MakeShared<SkiPreparation::Cancellation>();
+                return SkiPreparation::ExecuteAcquisitionWithRetry(Concurrent, ConcurrentRequest,
+                    ConcurrentPolicy, ConcurrentCancellation, FPlatformTime::Seconds(),
+                    [](){ return true; }, {}, ConcurrentResult);
+            }));
+        }
+        bool bAllSucceeded = true;
+        for (TFuture<bool>& Future : Futures) bAllSucceeded &= Future.Get();
+        Concurrent.WaitForBackends();
+        OutMaximum = Concurrent.Maximum.load();
+        return bAllSucceeded;
+    };
+    int32 ElevationMaximum = 0;
+    TestTrue(TEXT("Concurrent elevation probes complete"), RunConcurrentAcquisitions(
+        SkiPreparation::ProviderProduct::CoreElevation, 6, ElevationMaximum));
+    TestTrue(TEXT("At most two elevation-provider requests run globally"),
+        ElevationMaximum > 0 && ElevationMaximum <= 2);
+    int32 GlobalMaximum = 0;
+    TestTrue(TEXT("Concurrent non-elevation probes complete"), RunConcurrentAcquisitions(
+        SkiPreparation::ProviderProduct::WorldCover, 8, GlobalMaximum));
+    TestTrue(TEXT("At most four network requests run globally"),
+        GlobalMaximum > 0 && GlobalMaximum <= 4);
+
+    FConcurrentAcquisitionTransport InFlightTransport;
+    InFlightTransport.bDetachBackend = false;
+    const TSharedRef<SkiPreparation::Cancellation> InFlightCancellation =
+        MakeShared<SkiPreparation::Cancellation>();
+    TFuture<bool> InFlight = Async(EAsyncExecution::ThreadPool, [&]()
+    {
+        SkiPreparation::HttpAcquisitionRequest InFlightRequest;
+        InFlightRequest.Product = SkiPreparation::ProviderProduct::CoreElevation;
+        SkiPreparation::RetryPolicy InFlightPolicy;
+        InFlightPolicy.MaximumAttempts = 1;
+        InFlightPolicy.OperationDeadlineSeconds = 3.0;
+        SkiPreparation::HttpAcquisitionResult InFlightResult;
+        return SkiPreparation::ExecuteAcquisitionWithRetry(InFlightTransport, InFlightRequest,
+            InFlightPolicy, InFlightCancellation, FPlatformTime::Seconds(),
+            [](){ return true; }, {}, InFlightResult);
+    });
+    const double InFlightStartDeadline = FPlatformTime::Seconds() + 1.0;
+    while (InFlightTransport.Active.load() == 0 && FPlatformTime::Seconds() < InFlightStartDeadline)
+        FPlatformProcess::SleepNoStats(0.001F);
+    TestTrue(TEXT("In-flight transport entered its active request"), InFlightTransport.Active.load() > 0);
+    const double InFlightCancelBegan = FPlatformTime::Seconds();
+    InFlightCancellation->Cancel();
+    TestFalse(TEXT("In-flight transport reports cancellation"), InFlight.Get());
+    TestTrue(TEXT("In-flight transport cancellation acknowledges below 250 ms"),
+        FPlatformTime::Seconds() - InFlightCancelBegan <= 0.250);
+
+    std::atomic<int32> ActiveDecodes{0};
+    std::atomic<int32> MaximumDecodes{0};
+    TArray<TFuture<bool>> DecodeFutures;
+    for (int32 Index = 0; Index < 6; ++Index)
+    {
+        DecodeFutures.Add(Async(EAsyncExecution::ThreadPool, [&]()
+        {
+            const TSharedRef<SkiPreparation::Cancellation> DecodeCancellation =
+                MakeShared<SkiPreparation::Cancellation>();
+            return SkiPreparation::ExecuteBoundedDecodeJob(DecodeCancellation,
+                [](){ return true; }, [&]()
+                {
+                    const int32 Current = ActiveDecodes.fetch_add(1) + 1;
+                    int32 Observed = MaximumDecodes.load();
+                    while (Current > Observed
+                        && !MaximumDecodes.compare_exchange_weak(Observed, Current)) {}
+                    FPlatformProcess::SleepNoStats(0.075F);
+                    ActiveDecodes.fetch_sub(1);
+                    return true;
+                });
+        }));
+    }
+    bool bDecodesSucceeded = true;
+    for (TFuture<bool>& Future : DecodeFutures) bDecodesSucceeded &= Future.Get();
+    TestTrue(TEXT("Concurrent decode probes complete"), bDecodesSucceeded);
+    TestTrue(TEXT("At most two decode jobs run globally"),
+        MaximumDecodes.load() > 0 && MaximumDecodes.load() <= 2);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FP1AcquisitionStitchTest,
+    "MountainPlanner.P1.Preparation.Acquisition.Stitch",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FP1AcquisitionStitchTest::RunTest(const FString&)
+{
+    SkiPreparation::AcquisitionPlan Plan;
+    Plan.Width = 4; Plan.Height = 4; Plan.WidthM = 40.0; Plan.HeightM = 40.0;
+    TArray<SkiPreparation::DecodedElevationRaster> Tiles;
+    for (int32 Row = 0; Row < 2; ++Row)
+    {
+        for (int32 Column = 0; Column < 2; ++Column)
+        {
+            SkiPreparation::RasterTileKey Key{Column, Row, 2, 2,
+                static_cast<uint32>(Column * 2), static_cast<uint32>(Row * 2), 2, 2};
+            Plan.Tiles.Add(Key);
+            SkiPreparation::DecodedElevationRaster Raster;
+            Raster.Heightfield.Width = 2; Raster.Heightfield.Height = 2;
+            Raster.Heightfield.EastSpacingM = 10.0; Raster.Heightfield.NorthSpacingM = 10.0;
+            Raster.Heightfield.NoDataValue = -9999.0; Raster.Heightfield.CurrentRevision = 1;
+            for (int32 LocalRow = 0; LocalRow < 2; ++LocalRow)
+                for (int32 LocalColumn = 0; LocalColumn < 2; ++LocalColumn)
+                    Raster.Heightfield.Samples.push_back(static_cast<float>((Row * 2 + LocalRow) * 10
+                        + Column * 2 + LocalColumn));
+            Raster.NoDataValue = -9999.0;
+            Raster.ActualOuterBounds = {static_cast<double>(Column * 2), static_cast<double>(2 - Row * 2),
+                static_cast<double>(Column * 2 + 2), static_cast<double>(4 - Row * 2)};
+            Tiles.Add(std::move(Raster));
+        }
+    }
+    SkiPreparation::DecodedElevationRaster Stitched;
+    FString Error;
+    TestTrue(TEXT("Four tiles stitch"), SkiPreparation::StitchElevationTiles(Plan, Tiles, Stitched, Error));
+    TestEqual(TEXT("Stitched width"), Stitched.Heightfield.Width, 4U);
+    TestEqual(TEXT("Stitched height"), Stitched.Heightfield.Height, 4U);
+    TestEqual(TEXT("Stitched west sample is centered"), Stitched.Heightfield.WestM, -15.0);
+    TestEqual(TEXT("Stitched north sample is centered"), Stitched.Heightfield.NorthM, 15.0);
+    TestEqual(TEXT("Stitched east sample is centered"), Stitched.Heightfield.EastM(3), 15.0);
+    TestEqual(TEXT("Stitched south sample is centered"), Stitched.Heightfield.SampleNorthM(3), -15.0);
+    for (uint32 Row = 0; Row < 4; ++Row)
+        for (uint32 Column = 0; Column < 4; ++Column)
+            TestEqual(FString::Printf(TEXT("Sample %u,%u"), Row, Column),
+                Stitched.Heightfield.Samples[Row * 4 + Column], static_cast<float>(Row * 10 + Column));
+
+    const double OriginalWest = Tiles[1].ActualOuterBounds.WestDeg;
+    Tiles[1].ActualOuterBounds.WestDeg += 0.25;
+    TestFalse(TEXT("Georeferenced seam gaps are rejected"),
+        SkiPreparation::StitchElevationTiles(Plan, Tiles, Stitched, Error));
+    Tiles[1].ActualOuterBounds.WestDeg = OriginalWest;
+    const uint32 OriginalStart = Plan.Tiles[1].StartColumn;
+    Plan.Tiles[1].StartColumn = 1;
+    TestFalse(TEXT("Output pixel overlap is rejected"),
+        SkiPreparation::StitchElevationTiles(Plan, Tiles, Stitched, Error));
+    Plan.Tiles[1].StartColumn = OriginalStart;
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FP1AcquisitionActivationFenceTest,
+    "MountainPlanner.P1.Preparation.Acquisition.ActivationFence",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FP1AcquisitionActivationFenceTest::RunTest(const FString&)
+{
+    const FString Root = FPaths::Combine(FPaths::ProjectIntermediateDir(), TEXT("P1ActivationFence"),
+        FGuid::NewGuid().ToString(EGuidFormats::Digits));
+    SkiDomain::Heightfield Field;
+    Field.Width = 2; Field.Height = 2; Field.EastSpacingM = 10.0; Field.NorthSpacingM = 10.0;
+    Field.NoDataValue = -9999.0; Field.CurrentRevision = 1; Field.Samples = {1,2,3,4};
+    SkiDomain::TerrainManifest Manifest;
+    Manifest.Name = "stale"; Manifest.Source = "fixture"; Manifest.RequestedAtUtc = "2026-09-21T00:00:00Z";
+    Manifest.RequestedBounds = {-71.0,44.0,-70.9,44.1}; Manifest.ActualBounds = Manifest.RequestedBounds;
+    Manifest.LocalOrigin = {44.05,-70.95,2.0};
+    const TSharedPtr<SkiPreparation::PreparationOperationLease, ESPMode::ThreadSafe> Lease =
+        MakeShared<SkiPreparation::PreparationOperationLease, ESPMode::ThreadSafe>(1, 2);
+    Lease->Invalidate();
+    FString Directory, Error; SkiDomain::TerrainManifest Output;
+    SkiPreparation::PackageStore Store(Root);
+    TestFalse(TEXT("Invalidated operation cannot stage or activate"), Store.WriteAndActivate(
+        Manifest, Field, Directory, Output, Error, {}, Lease, 1, 2));
+    TestFalse(TEXT("No package root was created"),
+        IFileManager::Get().DirectoryExists(*FPaths::Combine(Root, TEXT("TerrainPackages"))));
     IFileManager::Get().DeleteDirectory(*Root, false, true);
     return true;
 }

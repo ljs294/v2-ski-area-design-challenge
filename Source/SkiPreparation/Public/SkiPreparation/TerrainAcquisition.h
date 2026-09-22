@@ -1,0 +1,119 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "SkiDomain/TerrainPackage.h"
+#include "SkiPreparation/GeoTiffDecoder.h"
+
+namespace SkiPreparation
+{
+enum class TransportFailureReason : uint8
+{
+    None,
+    QueueFailure,
+    ConnectionError,
+    TimedOut,
+    Cancelled,
+    ResponseTooLarge,
+    HttpStatus,
+    EmptyResponse,
+    Other,
+};
+
+struct SKIPREPARATION_API RasterTileKey
+{
+    int32 Column = 0;
+    int32 Row = 0;
+    int32 ColumnCount = 1;
+    int32 RowCount = 1;
+    uint32 StartColumn = 0;
+    uint32 StartRow = 0;
+    uint32 Width = 0;
+    uint32 Height = 0;
+};
+
+struct SKIPREPARATION_API AcquisitionPlan
+{
+    uint32 Width = 0;
+    uint32 Height = 0;
+    double WidthM = 0.0;
+    double HeightM = 0.0;
+    TArray<RasterTileKey> Tiles;
+};
+
+struct SKIPREPARATION_API RetryPolicy
+{
+    int32 MaximumAttempts = 3;
+    float ActivityTimeoutSeconds = 90.0F;
+    float TotalTimeoutSeconds = 180.0F;
+    double OperationDeadlineSeconds = 300.0;
+    uint64 MaximumResponseBytes = 16ULL * 1024ULL * 1024ULL;
+};
+
+class SKIPREPARATION_API AcquisitionResourceLease
+{
+public:
+    virtual ~AcquisitionResourceLease() = default;
+};
+
+struct SKIPREPARATION_API HttpAcquisitionRequest
+{
+    FString Url;
+    ProviderProduct Product = ProviderProduct::None;
+    RasterTileKey Tile;
+    int32 Attempt = 1;
+    float ActivityTimeoutSeconds = 90.0F;
+    float TotalTimeoutSeconds = 180.0F;
+    double AbsoluteOperationDeadlineSeconds = 0.0;
+    uint64 MaximumResponseBytes = 16ULL * 1024ULL * 1024ULL;
+    TSharedPtr<AcquisitionResourceLease, ESPMode::ThreadSafe> BackendLifetime;
+};
+
+struct SKIPREPARATION_API HttpAcquisitionResult
+{
+    TArray<uint8> Bytes;
+    TransportFailureReason FailureReason = TransportFailureReason::None;
+    FString RequestStatus;
+    FString ContentType;
+    FString RetryAfter;
+    int32 HttpStatus = 0;
+    uint64 BytesReceived = 0;
+    double TimeToFirstByteSeconds = -1.0;
+    double ElapsedSeconds = 0.0;
+    int32 Attempt = 0;
+    bool Ok() const noexcept { return FailureReason == TransportFailureReason::None && HttpStatus >= 200 && HttpStatus < 300 && !Bytes.IsEmpty(); }
+};
+
+class SKIPREPARATION_API IAcquisitionTransport
+{
+public:
+    virtual ~IAcquisitionTransport() = default;
+    virtual HttpAcquisitionResult Get(const HttpAcquisitionRequest& Request,
+        const TSharedRef<Cancellation>& Cancellation) = 0;
+};
+
+class SKIPREPARATION_API UnrealHttpAcquisitionTransport final : public IAcquisitionTransport
+{
+public:
+    HttpAcquisitionResult Get(const HttpAcquisitionRequest& Request,
+        const TSharedRef<Cancellation>& Cancellation) override;
+};
+
+SKIPREPARATION_API AcquisitionPlan BuildElevationAcquisitionPlan(
+    const SkiDomain::GeographicBounds& Bounds, SourceProfile Profile, uint32 MaximumTileAxis = 1000);
+SKIPREPARATION_API bool IsRetryableTransportFailure(const HttpAcquisitionResult& Result) noexcept;
+SKIPREPARATION_API double RetryDelaySeconds(const HttpAcquisitionResult& Result, int32 Attempt,
+    uint32 DeterministicJitterSeed) noexcept;
+SKIPREPARATION_API bool ExecuteAcquisitionWithRetry(IAcquisitionTransport& Transport,
+    HttpAcquisitionRequest Request, const RetryPolicy& Policy,
+    const TSharedRef<Cancellation>& Cancellation, double OperationBeganSeconds,
+    const TFunction<bool()>& IsCurrent,
+    const TFunction<void(const HttpAcquisitionRequest&)>& BeforeAttempt,
+    HttpAcquisitionResult& OutResult);
+SKIPREPARATION_API bool ExecuteBoundedDecodeJob(
+    const TSharedRef<Cancellation>& Cancellation,
+    const TFunction<bool()>& IsCurrent,
+    TFunctionRef<bool()> Job);
+SKIPREPARATION_API const TCHAR* TransportFailureReasonName(TransportFailureReason Value) noexcept;
+SKIPREPARATION_API bool StitchElevationTiles(const AcquisitionPlan& Plan,
+    const TArray<DecodedElevationRaster>& Tiles, DecodedElevationRaster& OutRaster, FString& OutError);
+}

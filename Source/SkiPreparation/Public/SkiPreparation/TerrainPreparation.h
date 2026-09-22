@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Misc/ScopeLock.h"
 #include "SkiDomain/Heightfield.h"
 #include "SkiDomain/TerrainPackage.h"
 
@@ -81,6 +82,56 @@ struct SKIPREPARATION_API ProviderFailure
     bool MetadataPassCount = false;
     FString GeoreferenceStatus;
     FString DiagnosticReceipt;
+    FString TransportFailure;
+    FString RequestStatus;
+    double TimeToFirstByteSeconds = -1.0;
+    double ElapsedSeconds = 0.0;
+    int32 Attempt = 0;
+    int32 MaximumAttempts = 0;
+    int32 TileIndex = 0;
+    int32 TileCount = 0;
+    uint32 RequestedWidth = 0;
+    uint32 RequestedHeight = 0;
+    float ActivityTimeoutSeconds = 0.0F;
+    float TotalTimeoutSeconds = 0.0F;
+    FString RetryOutcome;
+};
+
+class SKIPREPARATION_API PreparationOperationLease
+{
+public:
+    PreparationOperationLease(uint64 InSessionGeneration, uint64 InOperationGeneration) noexcept
+        : SessionGeneration(InSessionGeneration), OperationGeneration(InOperationGeneration) {}
+    void Invalidate() noexcept
+    {
+        FScopeLock Lock(&Mutex);
+        bActive = false;
+    }
+    bool IsCurrent(uint64 Session, uint64 Operation) const noexcept
+    {
+        FScopeLock Lock(&Mutex);
+        return bActive && Session == SessionGeneration && Operation == OperationGeneration;
+    }
+    bool IsActive() const noexcept
+    {
+        FScopeLock Lock(&Mutex);
+        return bActive;
+    }
+    bool RunIfCurrent(uint64 Session, uint64 Operation, TFunctionRef<void()> Action) noexcept
+    {
+        FScopeLock Lock(&Mutex);
+        if (!bActive || Session != SessionGeneration || Operation != OperationGeneration) return false;
+        Action();
+        return true;
+    }
+    uint64 Session() const noexcept { return SessionGeneration; }
+    uint64 Operation() const noexcept { return OperationGeneration; }
+
+private:
+    mutable FCriticalSection Mutex;
+    bool bActive = true;
+    uint64 SessionGeneration = 0;
+    uint64 OperationGeneration = 0;
 };
 
 struct SKIPREPARATION_API Request
@@ -90,6 +141,7 @@ struct SKIPREPARATION_API Request
     SourceProfile Profile = SourceProfile::Standard;
     uint64 SessionGeneration = 0;
     uint64 OperationGeneration = 0;
+    TSharedPtr<PreparationOperationLease, ESPMode::ThreadSafe> Lease;
 };
 
 struct SKIPREPARATION_API Progress
@@ -99,6 +151,10 @@ struct SKIPREPARATION_API Progress
     TOptional<uint64> Total;
     double ElapsedSeconds = 0.0;
     FString Detail;
+    int32 Attempt = 0;
+    int32 MaximumAttempts = 0;
+    int32 TileIndex = 0;
+    int32 TileCount = 0;
 };
 
 struct SKIPREPARATION_API Result

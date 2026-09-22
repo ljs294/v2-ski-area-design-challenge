@@ -28,5 +28,6 @@ struct SKIPREPARATION_API DecodedElevationRaster
 
 SKIPREPARATION_API bool DecodeElevationGeoTiff(const TArray<uint8>& Bytes,
     const SkiDomain::GeographicBounds& RequestedBounds,
-    ProviderProduct Product, DecodedElevationRaster& OutRaster, ProviderFailure& OutFailure);
+    ProviderProduct Product, DecodedElevationRaster& OutRaster, ProviderFailure& OutFailure,
+    const TFunction<bool()>& IsCancelled = {});
 }

@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import sys
 import uuid
 import zipfile
@@ -22,6 +24,19 @@ TIFF_TESTS = (
     "MountainPlanner.P1.Preparation.GeoTiff.LiveShapedNoData",
     "MountainPlanner.P1.Preparation.GeoTiff.MetadataValidation",
 )
+ACQUISITION_TESTS = (
+    "MountainPlanner.P1.Preparation.Acquisition.Plan",
+    "MountainPlanner.P1.Preparation.Acquisition.RetryPolicy",
+    "MountainPlanner.P1.Preparation.Acquisition.Stitch",
+    "MountainPlanner.P1.Preparation.Acquisition.ActivationFence",
+)
+UI_TESTS = (
+    "MountainPlanner.P1.Presentation.UI.ResponsiveLayout",
+)
+P1_TESTS = tuple(sorted(TIFF_TESTS + ACQUISITION_TESTS + UI_TESTS + (
+    "MountainPlanner.P1.Preparation.PackageAndProtocol",
+    "MountainPlanner.P1.Preparation.ProviderDiagnostics",
+)))
 
 spec = importlib.util.spec_from_file_location("p0_harness", ROOT / "Tools/Build/p0.py")
 if spec is None or spec.loader is None:
@@ -35,6 +50,7 @@ def required_inputs() -> dict:
         "Source/SkiPreparation/SkiPreparation.Build.cs",
         "Source/SkiTerrainRuntime/SkiTerrainRuntime.Build.cs",
         "Source/SkiPreparation/Public/SkiPreparation/TerrainPackageStore.h",
+        "Source/SkiPreparation/Public/SkiPreparation/TerrainAcquisition.h",
         "Source/SkiPreparation/Public/SkiPreparation/SelectorProtocol.h",
         "Source/SkiTerrainRuntime/Public/SkiTerrainRuntime/SkiTerrainActor.h",
         "Content/P1Selector/index.html",
@@ -44,6 +60,7 @@ def required_inputs() -> dict:
         "Content/P1Fixtures/usgs-tiled-nodata-synthetic.tif.base64",
         "Tools/Preparation/generate_tiff_fixture.py",
         "docs/UnrealRebuild/P1-runbook.md",
+        "docs/UnrealRebuild/P1-requirement-matrix.md",
         ".codex/config.toml",
         "Start-Unreal-MCP.bat",
     ]
@@ -99,18 +116,36 @@ def retained_checks() -> dict:
     return {"status": "PASS", "pure_sources": len(actual_sources), "archive_entries": len(expected)}
 
 
+def require_exact_automation(output: str, expected: tuple[str, ...], test_filter: str) -> None:
+    found = re.findall(rf"Found (\d+) automation tests based on '{re.escape(test_filter)}'", output)
+    if found != [str(len(expected))]:
+        raise p0.Failed(f"Automation discovery count is not exact for {test_filter}: {found}")
+    started = re.findall(r"Test Started\..*?Path=\{([^}]+)\}", output)
+    completed = re.findall(r"Test Completed\. Result=\{([^}]+)\}.*?Path=\{([^}]+)\}", output)
+    completed_paths = [path for _, path in completed]
+    duplicates = sorted({path for path in completed_paths if completed_paths.count(path) != 1})
+    unexpected = sorted(set(completed_paths) - set(expected))
+    missing = sorted(set(expected) - set(completed_paths))
+    failed = sorted(path for result, path in completed if result != "Success")
+    if sorted(started) != sorted(expected) or duplicates or unexpected or missing or failed:
+        raise p0.Failed("Automation execution set/result is not exact: "
+                        f"missing={missing}, unexpected={unexpected}, duplicates={duplicates}, failed={failed}")
+    if "Automation Test Queue Empty" not in output:
+        raise p0.Failed("Automation queue did not report completion")
+
+
 def automation(environment: dict, run_output: Path) -> dict:
     engine = p0.engine_path(environment)
     log_name = "p1-automation.log"
     output = p0.checked([
         str(engine / "Engine/Binaries/Win64/UnrealEditor-Cmd.exe"), str(PROJECT),
-        "-ExecCmds=Automation RunTests MountainPlanner.P1.Preparation;Quit",
+        "-ExecCmds=Automation RunTests MountainPlanner.P1;Quit",
         "-TestExit=Automation Test Queue Empty", "-unattended", "-nop4", "-NullRHI",
         "-stdout", "-FullStdOutLogOutput",
     ], timeout=300, log=log_name)
-    if "Test Completed. Result={Success}" not in output or "Automation Test Queue Empty" not in output:
-        raise p0.Failed("P1 automation did not report a successful, completed test queue")
-    return {"status": "PASS", "kind": "unreal_automation", "filter": "MountainPlanner.P1.Preparation"}
+    require_exact_automation(output, P1_TESTS, "MountainPlanner.P1")
+    return {"status": "PASS", "kind": "unreal_automation", "filter": "MountainPlanner.P1",
+            "tests": list(P1_TESTS)}
 
 
 def tiff(environment: dict, run_output: Path) -> dict:
@@ -122,10 +157,7 @@ def tiff(environment: dict, run_output: Path) -> dict:
         "-TestExit=Automation Test Queue Empty", "-unattended", "-nop4", "-NullRHI",
         "-stdout", "-FullStdOutLogOutput",
     ], timeout=180, log="p1-tiff-automation.log")
-    missing = [name for name in TIFF_TESTS if name not in output]
-    success_count = output.count("Test Completed. Result={Success}")
-    if missing or success_count < len(TIFF_TESTS) or "Automation Test Queue Empty" not in output:
-        raise p0.Failed(f"Focused TIFF automation was incomplete; missing={missing}, successes={success_count}")
+    require_exact_automation(output, TIFF_TESTS, "MountainPlanner.P1.Preparation.GeoTiff")
     fixture = ROOT / "Content/P1Fixtures/usgs-tiled-nodata-synthetic.tif.base64"
     import base64
     fixture_hash = hashlib.sha256(base64.b64decode(fixture.read_text(encoding="ascii"))).hexdigest()
@@ -133,6 +165,33 @@ def tiff(environment: dict, run_output: Path) -> dict:
         raise p0.Failed("Immutable GeoTIFF fixture hash differs")
     return {"status": "PASS", "kind": "focused_geotiff", "tests": list(TIFF_TESTS),
             "fixture_sha256": fixture_hash, "build": build}
+
+
+def acquisition(environment: dict, run_output: Path) -> dict:
+    build = p0.native_build(environment, "Editor", "Development")
+    engine = p0.engine_path(environment)
+    output = p0.checked([
+        str(engine / "Engine/Binaries/Win64/UnrealEditor-Cmd.exe"), str(PROJECT),
+        "-ExecCmds=Automation RunTests MountainPlanner.P1.Preparation.Acquisition;Quit",
+        "-TestExit=Automation Test Queue Empty", "-unattended", "-nop4", "-NullRHI",
+        "-stdout", "-FullStdOutLogOutput",
+    ], timeout=180, log="p1-acquisition-automation.log")
+    require_exact_automation(output, ACQUISITION_TESTS, "MountainPlanner.P1.Preparation.Acquisition")
+    return {"status": "PASS", "kind": "focused_acquisition", "tests": list(ACQUISITION_TESTS),
+            "build": build}
+
+
+def ui(environment: dict, run_output: Path) -> dict:
+    build = p0.native_build(environment, "Editor", "Development")
+    engine = p0.engine_path(environment)
+    output = p0.checked([
+        str(engine / "Engine/Binaries/Win64/UnrealEditor-Cmd.exe"), str(PROJECT),
+        "-ExecCmds=Automation RunTests MountainPlanner.P1.Presentation.UI;Quit",
+        "-TestExit=Automation Test Queue Empty", "-unattended", "-nop4", "-NullRHI",
+        "-stdout", "-FullStdOutLogOutput",
+    ], timeout=180, log="p1-ui-automation.log")
+    require_exact_automation(output, UI_TESTS, "MountainPlanner.P1.Presentation.UI")
+    return {"status": "PASS", "kind": "focused_ui", "tests": list(UI_TESTS), "build": build}
 
 
 def create_assets(environment: dict, before: dict) -> dict:
@@ -164,11 +223,9 @@ def verify_package_report(configuration: str, source_digest: str) -> tuple[dict,
     if not path.is_file():
         raise p0.Blocked(f"Package {configuration} with p1.py before packaged smoke")
     report = json.loads(path.read_text(encoding="utf-8"))
-    if report.get("source_before") != source_digest or report.get("result", {}).get("status") != "PASS":
-        raise p0.Failed("P1 package receipt is stale or failed")
-    launcher = Path(report["result"]["launcher"]).resolve()
-    if not launcher.is_file() or p0.sha(launcher) != report["result"]["launcher_sha256"]:
-        raise p0.Failed("Recorded P1 packaged launcher is missing or changed")
+    launcher = p0.verify_package_receipt(report, source_digest, configuration).resolve()
+    if p0.sha(launcher) != report["result"]["launcher_sha256"]:
+        raise p0.Failed("Recorded P1 packaged launcher changed")
     package_root = launcher.parent
     forbidden = ("modelcontextprotocol", "editortoolset", "automationtesttoolset",
                  "slateinspectortoolset", "umgtoolset")
@@ -188,7 +245,8 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
     unreal_user_dir = data_root / "unreal-user" / token
     unreal_user_dir.mkdir(parents=True, exist_ok=True)
     receipt = data_root / f"{token}.receipt.json"
-    smoke_flag = "-SkiP1SelectorSmoke" if scenario == "selector" else "-SkiP1Smoke"
+    smoke_flag = ("-SkiP1SelectorSmoke" if scenario == "selector" else
+                  "-SkiP1UiLayoutSmoke" if scenario == "ui-layout" else "-SkiP1Smoke")
     command = [str(launcher), smoke_flag, f"-SkiP1Token={token}",
                f"-SkiP1Receipt={receipt}", f"-SkiP1DataRoot={data_root}",
                f"-SkiP1Scenario={scenario}", f"-UserDir={unreal_user_dir}",
@@ -198,15 +256,43 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
         if not content_id or len(content_id) != 64:
             raise p0.Failed("Offline reopen requires the exact contentId from an import receipt")
         command.append(f"-SkiP1ContentId={content_id}")
+
+    def collect_failure_context(reason: str) -> str:
+        destination = run_output / "packaged-failure-context"
+        destination.mkdir(parents=True, exist_ok=True)
+        copied = []
+        allowed_names = {"crashcontext.runtime-xml", "diagnostics.txt", "wermetadata.xml"}
+        allowed_suffixes = {".log", ".dmp", ".xml"}
+        candidates = sorted((path for path in unreal_user_dir.rglob("*")
+                             if path.is_file()
+                             and (path.name.lower() in allowed_names
+                                  or path.suffix.lower() in allowed_suffixes)),
+                            key=lambda path: path.stat().st_mtime, reverse=True)
+        for source in candidates[:20]:
+            if source.stat().st_size > 16 * 1024 * 1024:
+                continue
+            relative = source.relative_to(unreal_user_dir)
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            copied.append(relative.as_posix())
+        (destination / "failure.json").write_text(json.dumps({
+            "scenario": scenario,
+            "token": token,
+            "reason": reason,
+            "isolated_user_dir": str(unreal_user_dir),
+            "copied_files": copied,
+        }, indent=2) + "\n", encoding="utf-8")
+        return str(destination)
+
     try:
         p0.checked(command, timeout=120, log=f"p1-{scenario}-{token}.log")
     except p0.Failed as error:
-        crash_contexts = sorted(unreal_user_dir.rglob("CrashContext.runtime-xml"),
-                                key=lambda path: path.stat().st_mtime, reverse=True)
-        crash_note = f"; crash context: {crash_contexts[0]}" if crash_contexts else "; no isolated crash context found"
-        raise p0.Failed(str(error) + crash_note) from error
+        context = collect_failure_context(str(error))
+        raise p0.Failed(f"{error}; packaged failure context: {context}") from error
     if not receipt.is_file():
-        raise p0.Failed("Packaged player exited without its tokened P1 receipt")
+        context = collect_failure_context("Packaged player exited without its tokened P1 receipt")
+        raise p0.Failed(f"Packaged player exited without its tokened P1 receipt; context: {context}")
     observed = json.loads(receipt.read_text(encoding="utf-8-sig"))
     if scenario == "selector":
         if observed != {"token": token, "selector": True, "profile": "standard"}:
@@ -218,6 +304,24 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                 or observed.get("dimensions") != [19, 18] or observed.get("nodata") != -9999.0 \
                 or observed.get("organization") != "tiled":
             raise p0.Failed("Packaged GeoTIFF regression receipt is invalid")
+    elif scenario == "acquisition-regression":
+        dimensions = observed.get("dimensions", [])
+        if observed.get("token") != token or observed.get("scenario") != scenario \
+                or not observed.get("passed") or observed.get("attempts") != 3 \
+                or not observed.get("stitchedCentered") \
+                or not observed.get("activationBlocked") \
+                or not observed.get("networkCaps") or not observed.get("decodeCaps") \
+                or observed.get("cancellationMilliseconds", 1000) > 250 \
+                or observed.get("tileCount") != 4 or max(dimensions, default=0) != 2000 \
+                or observed.get("activityTimeoutSeconds") != 90 \
+                or observed.get("totalTimeoutSeconds") != 180:
+            raise p0.Failed("Packaged acquisition-policy regression receipt is invalid")
+    elif scenario == "ui-layout":
+        if observed.get("token") != token or observed.get("scenario") != scenario \
+                or not observed.get("recoveryActionsReachable") \
+                or not observed.get("inputIsolation") \
+                or observed.get("resolution") != [1280, 720] or observed.get("rightInset", 0) <= 0:
+            raise p0.Failed("Packaged UI-layout regression receipt is invalid")
     elif observed.get("token") != token or observed.get("scenario") != scenario \
             or not observed.get("ready") or not observed.get("picked") or not observed.get("reopened"):
         raise p0.Failed("Packaged P1 receipt is stale or qualification steps failed")
@@ -285,11 +389,11 @@ def visual(configuration: str, source_digest: str) -> dict:
 
 def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["doctor", "check", "domain", "build", "automation", "tiff", "assets", "package", "smoke", "visual"])
+    parser.add_argument("command", choices=["freeze", "freeze-check", "doctor", "check", "domain", "build", "automation", "tiff", "acquisition", "ui", "assets", "package", "smoke", "visual"])
     parser.add_argument("--engine-root")
     parser.add_argument("--configuration", choices=["Development", "Shipping"], default="Development")
     parser.add_argument("--target", choices=["Editor", "Game"], default="Editor")
-    parser.add_argument("--scenario", choices=["selector", "import", "offline-reopen", "geotiff-regression"], default="import")
+    parser.add_argument("--scenario", choices=["selector", "import", "offline-reopen", "geotiff-regression", "acquisition-regression", "ui-layout"], default="import")
     parser.add_argument("--content-id")
     args = parser.parse_args()
     OUTPUT.mkdir(parents=True, exist_ok=True)
@@ -301,9 +405,31 @@ def _main() -> int:
     p0.RUN_OUTPUT = run_output
     environment = p0.doctor(args.engine_root)
     before = p0.source_snapshot()
+    freeze_setting = os.environ.get("SKI_P1_RELEASE_FREEZE")
+    freeze_path = Path(freeze_setting) if freeze_setting else OUTPUT / "release-freeze.json"
+    if not freeze_path.is_absolute():
+        freeze_path = (ROOT / freeze_path).resolve()
+    freeze_error = None
+    if args.command != "freeze" and freeze_setting:
+        if not freeze_path.is_file():
+            freeze_error = f"Release freeze receipt is missing: {freeze_path}"
+        else:
+            try:
+                frozen = json.loads(freeze_path.read_text(encoding="utf-8"))
+                if frozen.get("command") != "freeze" or frozen.get("result", {}).get("status") != "PASS" \
+                        or frozen.get("source_before") != before["sha256"]:
+                    freeze_error = "Source no longer matches the release-wide freeze receipt"
+            except (OSError, ValueError) as error:
+                freeze_error = f"Release freeze receipt is invalid: {error}"
     code = 0
     try:
-        if args.command == "doctor":
+        if freeze_error:
+            raise p0.Failed(freeze_error)
+        if args.command == "freeze":
+            result = {"status": "PASS", "kind": "release_source_freeze", "source_digest": before["sha256"]}
+        elif args.command == "freeze-check":
+            result = {"status": "PASS", "kind": "release_source_freeze_check", "source_digest": before["sha256"]}
+        elif args.command == "doctor":
             result = environment
             code = 2 if environment["missing"] else 0
         elif args.command == "check":
@@ -317,6 +443,10 @@ def _main() -> int:
             result = automation(environment, run_output)
         elif args.command == "tiff":
             result = tiff(environment, run_output)
+        elif args.command == "acquisition":
+            result = acquisition(environment, run_output)
+        elif args.command == "ui":
+            result = ui(environment, run_output)
         elif args.command == "assets":
             result = create_assets(environment, before)
         elif args.command == "package":
@@ -344,8 +474,15 @@ def _main() -> int:
               "source_before": before["sha256"], "environment": environment, "result": result}
     serialized = json.dumps(report, indent=2) + "\n"
     (run_output / "report.json").write_text(serialized, encoding="utf-8")
+    (run_output / "source-manifest.json").write_text(
+        json.dumps(before, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     latest = args.command + ("-" + args.configuration if args.command in ("package", "smoke", "visual") else "")
     (OUTPUT / f"{latest}.json").write_text(serialized, encoding="utf-8")
+    if args.command == "freeze":
+        freeze_path.parent.mkdir(parents=True, exist_ok=True)
+        freeze_path.write_text(serialized, encoding="utf-8")
+    if args.command == "smoke":
+        (OUTPUT / f"smoke-{args.configuration}-{args.scenario}.json").write_text(serialized, encoding="utf-8")
     print(serialized, end="")
     return code
 
