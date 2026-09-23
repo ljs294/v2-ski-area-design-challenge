@@ -46,5 +46,8 @@ SKI_DOMAIN_API bool IsValidGeodetic(const GeodeticPoint& Point) noexcept;
 SKI_DOMAIN_API Cartesian3 GeodeticToEcef(const GeodeticPoint& Point) noexcept;
 SKI_DOMAIN_API bool TryMakeLocalFrame(const GeodeticPoint& Origin, LocalFrame& OutFrame) noexcept;
 SKI_DOMAIN_API EnuPoint ToEnu(const LocalFrame& Frame, const GeodeticPoint& Point) noexcept;
+/** Invert horizontal ENU coordinates for a point on the WGS84 ellipsoid. */
+SKI_DOMAIN_API bool TrySeaLevelGeodeticFromEnu(const LocalFrame& Frame,
+    double EastM, double NorthM, GeodeticPoint& OutPoint) noexcept;
 SKI_DOMAIN_API UnrealPointCm ToUnrealCentimeters(const EnuPoint& Point) noexcept;
 }

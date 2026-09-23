@@ -560,6 +560,7 @@ FString SkiPreparation::SerializeInstalledTerrainReceipt(
         Root->SetStringField(TEXT("contentId"), UTF8_TO_TCHAR(Receipt.ContentId.c_str()));
     Root->SetStringField(TEXT("generatorVersion"), UTF8_TO_TCHAR(Receipt.GeneratorVersion.c_str()));
     Root->SetStringField(TEXT("terrainCoreId"), UTF8_TO_TCHAR(Receipt.TerrainCoreId.c_str()));
+    Root->SetStringField(TEXT("surroundTerrainCoreId"), UTF8_TO_TCHAR(Receipt.SurroundTerrainCoreId.c_str()));
     Root->SetStringField(TEXT("coverEcologyId"), UTF8_TO_TCHAR(Receipt.CoverEcologyId.c_str()));
     TArray<TSharedPtr<FJsonValue>> Outcomes;
     for (const OptionalSourceOutcome& Outcome : Receipt.OptionalSources)
@@ -598,6 +599,7 @@ bool SkiPreparation::ParseInstalledTerrainReceipt(const FString& Json,
         || !ReadString(Root, TEXT("contentId"), Value.ContentId)
         || !ReadString(Root, TEXT("generatorVersion"), Value.GeneratorVersion)
         || !ReadString(Root, TEXT("terrainCoreId"), Value.TerrainCoreId)
+        || !ReadString(Root, TEXT("surroundTerrainCoreId"), Value.SurroundTerrainCoreId)
         || !ReadString(Root, TEXT("coverEcologyId"), Value.CoverEcologyId))
     {
         OutError = TEXT("Installed-terrain receipt fields are missing or invalid.");
@@ -832,10 +834,13 @@ bool SkiPreparation::InstalledTerrainStore::WriteAndActivate(InstalledTerrainRec
     TerrainCorePackageStore CoreStore(Root);
     CoverEcologyStore CoverStore(Root);
     TerrainCorePackageIndex Core;
+    TerrainCorePackageIndex Surround;
     CoverEcologyPackageIndex Cover;
     const FString CoreId = UTF8_TO_TCHAR(Receipt.TerrainCoreId.c_str());
+    const FString SurroundId = UTF8_TO_TCHAR(Receipt.SurroundTerrainCoreId.c_str());
     const FString CoverId = UTF8_TO_TCHAR(Receipt.CoverEcologyId.c_str());
     if (!CoreStore.Open(CoreId, Core, OutError) || !CoreStore.Verify(Core, OutError)
+        || !CoreStore.Open(SurroundId, Surround, OutError) || !CoreStore.Verify(Surround, OutError)
         || !CoverStore.Open(CoverId, Cover, OutError) || !CoverStore.Verify(Cover, OutError))
     {
         if (OutError.IsEmpty()) OutError = TEXT("Installed-terrain components could not be reopened and verified.");
@@ -947,9 +952,12 @@ bool SkiPreparation::InstalledTerrainStore::Open(const FString& ContentId,
     TerrainCorePackageStore CoreStore(Root);
     CoverEcologyStore CoverStore(Root);
     TerrainCorePackageIndex Core;
+    TerrainCorePackageIndex Surround;
     CoverEcologyPackageIndex Cover;
     if (!CoreStore.Open(UTF8_TO_TCHAR(Candidate.Receipt.TerrainCoreId.c_str()), Core, OutError)
         || !CoreStore.Verify(Core, OutError)
+        || !CoreStore.Open(UTF8_TO_TCHAR(Candidate.Receipt.SurroundTerrainCoreId.c_str()), Surround, OutError)
+        || !CoreStore.Verify(Surround, OutError)
         || !CoverStore.Open(UTF8_TO_TCHAR(Candidate.Receipt.CoverEcologyId.c_str()), Cover, OutError)
         || !CoverStore.Verify(Cover, OutError))
     {

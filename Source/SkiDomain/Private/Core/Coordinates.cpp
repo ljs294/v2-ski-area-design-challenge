@@ -65,6 +65,56 @@ SkiDomain::EnuPoint SkiDomain::ToEnu(const LocalFrame& Frame, const GeodeticPoin
     };
 }
 
+bool SkiDomain::TrySeaLevelGeodeticFromEnu(const LocalFrame& Frame,
+    const double EastM, const double NorthM, GeodeticPoint& OutPoint) noexcept
+{
+    OutPoint = {};
+    if (!std::isfinite(EastM) || !std::isfinite(NorthM)
+        || !IsValidGeodetic(Frame.Origin) || std::abs(Frame.CosLatitude) < 1.0e-6)
+    {
+        return false;
+    }
+    // TerrainCore's horizontal samples are ENU offsets of sea-level source pixels.
+    // Solve the two horizontal coordinates at height zero; the local tangent plane's
+    // Up coordinate cannot be assumed to be zero away from the origin.
+    double Latitude = Frame.Origin.LatitudeDeg + NorthM / 111320.0;
+    double Longitude = Frame.Origin.LongitudeDeg
+        + EastM / (111320.0 * Frame.CosLatitude);
+    constexpr double DeltaDeg = 1.0e-5;
+    for (int Iteration = 0; Iteration < 5; ++Iteration)
+    {
+        const GeodeticPoint Candidate{Latitude, Longitude, 0.0};
+        if (!IsValidGeodetic(Candidate)
+            || Latitude + DeltaDeg > 90.0 || Longitude + DeltaDeg > 180.0)
+        {
+            return false;
+        }
+        const EnuPoint Current = ToEnu(Frame, Candidate);
+        const double EastError = EastM - Current.EastM;
+        const double NorthError = NorthM - Current.NorthM;
+        if (std::abs(EastError) < 0.001 && std::abs(NorthError) < 0.001)
+        {
+            OutPoint = Candidate;
+            return true;
+        }
+        const EnuPoint LatitudeOffset = ToEnu(Frame, {Latitude + DeltaDeg, Longitude, 0.0});
+        const EnuPoint LongitudeOffset = ToEnu(Frame, {Latitude, Longitude + DeltaDeg, 0.0});
+        const double EastLat = (LatitudeOffset.EastM - Current.EastM) / DeltaDeg;
+        const double NorthLat = (LatitudeOffset.NorthM - Current.NorthM) / DeltaDeg;
+        const double EastLon = (LongitudeOffset.EastM - Current.EastM) / DeltaDeg;
+        const double NorthLon = (LongitudeOffset.NorthM - Current.NorthM) / DeltaDeg;
+        const double Determinant = EastLat * NorthLon - EastLon * NorthLat;
+        if (!std::isfinite(Determinant) || std::abs(Determinant) < 1.0) return false;
+        Latitude += (EastError * NorthLon - EastLon * NorthError) / Determinant;
+        Longitude += (EastLat * NorthError - EastError * NorthLat) / Determinant;
+    }
+    OutPoint = {Latitude, Longitude, 0.0};
+    if (!IsValidGeodetic(OutPoint)) return false;
+    const EnuPoint Check = ToEnu(Frame, OutPoint);
+    return std::abs(Check.EastM - EastM) < 0.01
+        && std::abs(Check.NorthM - NorthM) < 0.01;
+}
+
 SkiDomain::UnrealPointCm SkiDomain::ToUnrealCentimeters(const EnuPoint& Point) noexcept
 {
     return {100.0 * Point.NorthM, 100.0 * Point.EastM, 100.0 * Point.UpM};

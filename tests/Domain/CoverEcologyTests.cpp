@@ -1,4 +1,5 @@
 #include "SkiDomain/CoverEcology.h"
+#include "SkiDomain/Coordinates.h"
 
 #include <cmath>
 #include <iostream>
@@ -53,6 +54,47 @@ int main()
         && std::abs(Outer.NorthDeg - 44.25) < 1.0e-12,
         "sample-center/outer bounds math is wrong");
 
+    // This cover grid is shifted relative to a terrain grid and has a masked
+    // interior cell. Its geographic transform, not normalized terrain UVs,
+    // determines the categorical sample.
+    {
+        const auto Transform = Manifest().Transform;
+        const std::vector<std::uint8_t> Classes{
+            10, 20, 30, 40,
+            50, 60, 70, 80,
+            90, 95, 100, 1};
+        std::vector<std::uint8_t> Validity{0xff, 0x0f};
+        std::uint8_t Class = 0;
+        Require(SkiDomain::SampleCoverEcologyClass(Transform, Classes, Validity,
+            44.22, -71.28, Class) && Class == 70,
+            "geographic source-pixel sampling selected the wrong cell");
+        Validity[0] &= static_cast<std::uint8_t>(~(1U << 6U));
+        Require(!SkiDomain::SampleCoverEcologyClass(Transform, Classes, Validity,
+            44.22, -71.28, Class) && Class == 0,
+            "masked cover cell was sampled");
+        Require(!SkiDomain::SampleCoverEcologyClass(Transform, Classes, Validity,
+            44.22, -71.31, Class), "outside cover footprint was clamped to an edge");
+        Require(SkiDomain::SampleCoverEcologyClass(Transform, Classes, Validity,
+            44.24, -71.30, Class) && Class == 10,
+            "northwestern sample center was not selected");
+        Validity.pop_back();
+        Require(!SkiDomain::SampleCoverEcologyClass(Transform, Classes, Validity,
+            44.24, -71.30, Class), "short validity channel was accepted");
+    }
+    {
+        SkiDomain::LocalFrame Frame;
+        Require(SkiDomain::TryMakeLocalFrame({46.935, -121.475, 0.0}, Frame),
+            "local frame for cover sampling is invalid");
+        const SkiDomain::GeodeticPoint Expected{46.942, -121.463, 0.0};
+        const SkiDomain::EnuPoint Offset = SkiDomain::ToEnu(Frame, Expected);
+        SkiDomain::GeodeticPoint Recovered;
+        Require(SkiDomain::TrySeaLevelGeodeticFromEnu(Frame, Offset.EastM,
+            Offset.NorthM, Recovered)
+            && std::abs(Recovered.LatitudeDeg - Expected.LatitudeDeg) < 1.0e-8
+            && std::abs(Recovered.LongitudeDeg - Expected.LongitudeDeg) < 1.0e-8,
+            "terrain ENU coordinates did not recover source geography");
+    }
+
     auto Cover = Manifest();
     Require(SkiDomain::ValidateCoverEcology(Cover).Ok(), "valid cover rejected");
     Cover.Transform.OuterBounds.EastDeg += 0.1;
@@ -100,6 +142,7 @@ int main()
     Receipt.ContentId = std::string(64, 'd');
     Receipt.GeneratorVersion = "install-test-v1";
     Receipt.TerrainCoreId = std::string(64, 'e');
+    Receipt.SurroundTerrainCoreId = std::string(64, 'a');
     Receipt.CoverEcologyId = std::string(64, 'f');
     Receipt.OptionalSources = {
         {"naip", "USDA NAIP RGBN", SkiDomain::OptionalSourceStatus::Unavailable,
@@ -110,6 +153,23 @@ int main()
     };
     Require(SkiDomain::ValidateInstalledTerrainReceipt(Receipt).Ok(),
         "valid composite receipt rejected");
+    {
+        SkiDomain::InstalledTerrainReceipt Legacy = Receipt;
+        Legacy.SchemaVersion = 1;
+        Require(SkiDomain::ValidateInstalledTerrainReceipt(Legacy).Error
+            == SkiDomain::CoverEcologyError::UnsupportedSchema,
+            "schema-1 receipt without surround accepted");
+        SkiDomain::InstalledTerrainReceipt Missing = Receipt;
+        Missing.SurroundTerrainCoreId.clear();
+        Require(SkiDomain::ValidateInstalledTerrainReceipt(Missing).Error
+            == SkiDomain::CoverEcologyError::InvalidContentId,
+            "receipt without required surround accepted");
+        SkiDomain::InstalledTerrainReceipt Aliased = Receipt;
+        Aliased.SurroundTerrainCoreId = Aliased.TerrainCoreId;
+        Require(SkiDomain::ValidateInstalledTerrainReceipt(Aliased).Error
+            == SkiDomain::CoverEcologyError::InvalidContentId,
+            "surround aliased to the core terrain accepted");
+    }
     Receipt.OptionalSources[0].ArtifactId = std::string(64, '2');
     Require(SkiDomain::ValidateInstalledTerrainReceipt(Receipt).Error
         == SkiDomain::CoverEcologyError::InvalidOptionalSource,

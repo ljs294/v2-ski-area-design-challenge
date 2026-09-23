@@ -311,18 +311,38 @@ bool ASkiTerrainActor::BeginTerrainCoreStreaming(
 
 void ASkiTerrainActor::SetTerrainCoreCover(
     std::shared_ptr<const std::vector<std::uint8_t>> Cover,
-    const std::uint32_t Width, const std::uint32_t Height)
+    std::shared_ptr<const std::vector<std::uint8_t>> PackedValidity,
+    const SkiDomain::CoverEcologyGridTransform& Transform)
 {
-    const std::uint64_t Count = static_cast<std::uint64_t>(Width) * Height;
-    if (!Cover || Width == 0 || Height == 0 || Count != Cover->size())
+    const std::uint64_t Count = static_cast<std::uint64_t>(Transform.Width) * Transform.Height;
+    SkiDomain::GeographicBounds ExpectedOuter;
+    const bool bValidTransform = Transform.HorizontalCrs == "EPSG:4326"
+        && Transform.PixelRegistration == "sample-center"
+        && Transform.RowOrientation == "north-to-south"
+        && SkiDomain::ComputeCoverEcologyOuterBounds(Transform.Width, Transform.Height,
+            Transform.LongitudeStepDeg, Transform.LatitudeStepDeg,
+            Transform.SampleCenterBounds, ExpectedOuter)
+        && FMath::IsNearlyEqual(ExpectedOuter.WestDeg, Transform.OuterBounds.WestDeg, 1.0e-9)
+        && FMath::IsNearlyEqual(ExpectedOuter.SouthDeg, Transform.OuterBounds.SouthDeg, 1.0e-9)
+        && FMath::IsNearlyEqual(ExpectedOuter.EastDeg, Transform.OuterBounds.EastDeg, 1.0e-9)
+        && FMath::IsNearlyEqual(ExpectedOuter.NorthDeg, Transform.OuterBounds.NorthDeg, 1.0e-9);
+    if (!Cover || !PackedValidity || !bValidTransform
+        || Count > SkiDomain::CoverEcologyMaxCells || Count != Cover->size()
+        || PackedValidity->size() != (Count + 7U) / 8U)
     {
         PresentedCover.reset();
+        PresentedCoverValidity.reset();
+        PresentedCoverTransform = {};
+        bPresentedCoverGeographic = false;
         PresentedCoverWidth = PresentedCoverHeight = 0;
         return;
     }
     PresentedCover = MoveTemp(Cover);
-    PresentedCoverWidth = Width;
-    PresentedCoverHeight = Height;
+    PresentedCoverValidity = MoveTemp(PackedValidity);
+    PresentedCoverTransform = Transform;
+    bPresentedCoverGeographic = true;
+    PresentedCoverWidth = Transform.Width;
+    PresentedCoverHeight = Transform.Height;
 }
 
 bool ASkiTerrainActor::PresentTerrainCoreLod(const uint8 Lod,
@@ -802,6 +822,18 @@ bool ASkiTerrainActor::CreateTileComponent(const SkiDomain::TerrainTileMesh& Sou
     Mesh.EnableVertexColors(FVector3f(0.42F, 0.40F, 0.34F));
     TArray<FVector4f> RenderColors;
     RenderColors.Reserve(static_cast<int32>(SourceMesh.Vertices.size()));
+    SkiDomain::LocalFrame CoverFrame;
+    bool bHaveCoverFrame = false;
+    if (bPresentedCoverGeographic && CoreSession)
+    {
+        const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+        if (Snapshot.Metadata)
+        {
+            const SkiDomain::GeodeticPoint& Origin = Snapshot.Metadata->LocalOrigin;
+            bHaveCoverFrame = SkiDomain::TryMakeLocalFrame(
+                {Origin.LatitudeDeg, Origin.LongitudeDeg, 0.0}, CoverFrame);
+        }
+    }
     for (const SkiDomain::TerrainVertex& Vertex : SourceMesh.Vertices)
     {
         const int32 VertexId = Mesh.AppendVertex(FVector3d(
@@ -831,7 +863,22 @@ bool ASkiTerrainActor::CreateTileComponent(const SkiDomain::TerrainTileMesh& Sou
             const FLinearColor Hsv = FLinearColor::MakeFromHSV8(static_cast<uint8>(Hue), 210, 235);
             Color = FVector3f(Hsv.R, Hsv.G, Hsv.B);
         }
-        else if (PresentedCover && PresentedCoverWidth > 0 && PresentedCoverHeight > 0)
+        else if (PresentedCover && bPresentedCoverGeographic && PresentedCoverValidity
+            && bHaveCoverFrame)
+        {
+            SkiDomain::GeodeticPoint Geographic;
+            uint8 CoverClass = 0;
+            if (SkiDomain::TrySeaLevelGeodeticFromEnu(CoverFrame,
+                    Vertex.EastM, Vertex.NorthM, Geographic)
+                && SkiDomain::SampleCoverEcologyClass(PresentedCoverTransform,
+                    *PresentedCover, *PresentedCoverValidity,
+                    Geographic.LatitudeDeg, Geographic.LongitudeDeg, CoverClass))
+            {
+                Color = CoverColor(CoverClass);
+            }
+        }
+        else if (PresentedCover && !bPresentedCoverGeographic
+            && PresentedCoverWidth > 0 && PresentedCoverHeight > 0)
         {
             const uint32 Column = FMath::Min(PresentedCoverWidth - 1,
                 static_cast<uint32>(FMath::RoundToInt(Vertex.U * (PresentedCoverWidth - 1))));
@@ -902,6 +949,9 @@ bool ASkiTerrainActor::Present(const SkiApplication::TerrainSnapshot& Snapshot, 
     ClearTiles();
     PresentedOriginHeightM = Snapshot.Manifest ? Snapshot.Manifest->LocalOrigin.HeightM : 0.0;
     PresentedCover = Snapshot.Cover;
+    PresentedCoverValidity.reset();
+    PresentedCoverTransform = {};
+    bPresentedCoverGeographic = false;
     PresentedCoverWidth = Snapshot.CoverWidth;
     PresentedCoverHeight = Snapshot.CoverHeight;
     ValidLocalBounds = FBox(ForceInit);
@@ -1702,6 +1752,7 @@ FString ASkiTerrainActor::DescribeProbe(const SkiDomain::RayHit& Hit) const
     if (!Hit.Hit) return TEXT("No canonical terrain hit.");
     double SlopeDegrees = std::numeric_limits<double>::quiet_NaN();
     uint8 CoverClass = 0;
+    bool bHaveCoverClass = false;
     if (CoreSession && CoreCache)
     {
         const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
@@ -1725,15 +1776,20 @@ FString ASkiTerrainActor::DescribeProbe(const SkiDomain::RayHit& Hit) const
                     / Snapshot.Metadata->DeliveredNorthSpacingM));
                 SlopeDegrees = FMath::RadiansToDegrees(FMath::Atan(Gradient));
             }
-            if (PresentedCover && PresentedCoverWidth && PresentedCoverHeight)
+            if (PresentedCover && PresentedCoverValidity && bPresentedCoverGeographic)
             {
-                const uint32 Column = FMath::Min(PresentedCoverWidth - 1,
-                    static_cast<uint32>((static_cast<uint64>(Hit.Column) * PresentedCoverWidth)
-                        / Snapshot.Metadata->Width));
-                const uint32 Row = FMath::Min(PresentedCoverHeight - 1,
-                    static_cast<uint32>((static_cast<uint64>(Hit.Row) * PresentedCoverHeight)
-                        / Snapshot.Metadata->Height));
-                CoverClass = (*PresentedCover)[static_cast<size_t>(Row) * PresentedCoverWidth + Column];
+                const SkiDomain::GeodeticPoint& Origin = Snapshot.Metadata->LocalOrigin;
+                SkiDomain::LocalFrame Frame;
+                SkiDomain::GeodeticPoint Geographic;
+                if (SkiDomain::TryMakeLocalFrame(
+                        {Origin.LatitudeDeg, Origin.LongitudeDeg, 0.0}, Frame)
+                    && SkiDomain::TrySeaLevelGeodeticFromEnu(Frame,
+                        Hit.Position.East, Hit.Position.North, Geographic))
+                {
+                    bHaveCoverClass = SkiDomain::SampleCoverEcologyClass(PresentedCoverTransform,
+                        *PresentedCover, *PresentedCoverValidity,
+                        Geographic.LatitudeDeg, Geographic.LongitudeDeg, CoverClass);
+                }
             }
         }
     }
@@ -1757,8 +1813,10 @@ FString ASkiTerrainActor::DescribeProbe(const SkiDomain::RayHit& Hit) const
     }
     const FString Slope = FMath::IsFinite(SlopeDegrees)
         ? FString::Printf(TEXT("%.1f°"), SlopeDegrees) : TEXT("unavailable");
-    return FString::Printf(TEXT("Probe r%u c%u | %.2f m | slope %s | cover %u | revision %llu"),
-        Hit.Row, Hit.Column, Hit.Position.Up, *Slope, CoverClass,
+    const FString Cover = bHaveCoverClass
+        ? FString::Printf(TEXT("%u"), CoverClass) : TEXT("unavailable");
+    return FString::Printf(TEXT("Probe r%u c%u | %.2f m | slope %s | cover %s | revision %llu"),
+        Hit.Row, Hit.Column, Hit.Position.Up, *Slope, *Cover,
         static_cast<uint64>(Hit.SourceRevision));
 }
 

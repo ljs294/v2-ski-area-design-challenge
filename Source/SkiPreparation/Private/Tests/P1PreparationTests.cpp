@@ -452,7 +452,7 @@ bool FP1WorldCoverCogTest::RunTest(const FString&)
     TestTrue(TEXT("WorldCover class fixture base64 decodes"),
         FBase64::Decode(Encoded.TrimStartAndEnd(), Bytes));
     TestEqual(TEXT("WorldCover class fixture SHA-256 is immutable"), SkiPreparation::Sha256(Bytes),
-        FString(TEXT("deeb0dcdd224e1332e15da3ada72a31e54a80757c4ca7cc7c16287a7e6905386")));
+        FString(TEXT("ac8e330fa563b3e5237590f14d27f3425e23c865bcffaf203e454b51fc70c2e6")));
     FMemoryCogSource Source(MoveTemp(Bytes));
     SkiPreparation::DecodedCoverWindow Window;
     SkiPreparation::ProviderFailure Failure;

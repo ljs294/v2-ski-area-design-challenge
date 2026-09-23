@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import importlib.util
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -57,6 +58,9 @@ P1_PRODUCT_TESTS = (
     "MountainPlanner.P1.Product.CoverEcology.CompositeActivation",
     "MountainPlanner.P1.Product.CoverEcology.ContractAndStore",
     "MountainPlanner.P1.Product.Medium.ProfileContract",
+    "MountainPlanner.P1.Product.Medium.ProvenanceHonesty",
+    "MountainPlanner.P1.Product.Medium.RequiredCoverBlocksActivation",
+    "MountainPlanner.P1.Product.Medium.ScriptedProvider",
     "MountainPlanner.P1.Product.WorldCoverCog.AnalyticalClasses",
 )
 DEFAULT_TERRAINCORE_CACHE_BYTES = 512 * 1024 * 1024
@@ -251,15 +255,61 @@ def shipping_target_module_proof(root: Path = ROOT) -> dict:
             "forbidden_plugins_absent": list(FORBIDDEN_SHIPPING_PLUGINS)}
 
 
-def validate_tcp_audit(audit: dict, *, require_no_connections: bool) -> None:
+def validate_tcp_audit(audit: dict, *, require_no_connections: bool,
+                       label: str = "Packaged process") -> None:
     if audit.get("method") != "GetExtendedTcpTable process-attributed polling" \
             or audit.get("snapshots", 0) < 1:
-        raise p0.Failed("Packaged process TCP audit is missing or was not observed")
+        raise p0.Failed(f"{label}: TCP audit is missing or was not observed")
     if audit.get("listen_ports"):
-        raise p0.Failed(f"Packaged process opened TCP listeners: {audit['listen_ports']}")
+        raise p0.Failed(f"{label}: opened TCP listeners: {audit['listen_ports']}")
     if require_no_connections and audit.get("remote_endpoints"):
+        owners = audit.get("endpoint_owners") or []
+        detail = ", ".join(f"{owner.get('image')}#{owner.get('pid')}->{owner.get('remote')}"
+                           for owner in owners) or str(audit["remote_endpoints"])
         raise p0.Failed(
-            f"Offline reopen attempted TCP connections: {audit['remote_endpoints']}")
+            f"{label}: attempted TCP connections under a zero-network policy: {detail}")
+
+
+SELECTOR_TILE_HOSTS = ("tile.openstreetmap.org",)
+CEF_HELPER_IMAGES = ("epicwebhelper.exe", "unrealcefsubprocess.exe")
+
+
+def resolved_addresses(hosts: tuple[str, ...]) -> set[str]:
+    addresses = set()
+    for host in hosts:
+        try:
+            for info in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP):
+                addresses.add(info[4][0])
+        except OSError:
+            continue
+    return addresses
+
+
+def endpoint_address(remote: str) -> str:
+    address = remote.rsplit(":", 1)[0]
+    return address[1:-1] if address.startswith("[") else address
+
+
+def validate_selector_audit(audit: dict, user_dir: Path, *, label: str,
+                            tile_addresses: set[str] | None = None) -> None:
+    """CEF may contact only the approved OSM tile host."""
+    validate_tcp_audit(audit, require_no_connections=False, label=label)
+    allowed = tile_addresses if tile_addresses is not None else resolved_addresses(SELECTOR_TILE_HOSTS)
+    for owner in audit.get("endpoint_owners") or []:
+        image = str(owner.get("image", "")).lower()
+        remote = str(owner.get("remote", ""))
+        if image not in CEF_HELPER_IMAGES:
+            raise p0.Failed(f"{label}: unexpected process {owner.get('image')} connected to {remote}")
+        if endpoint_address(remote) not in allowed or not remote.endswith(":443"):
+            raise p0.Failed(f"{label}: CEF connected outside the OSM allow-list: {remote}")
+    hosts = cef_contacted_hosts(user_dir)
+    if any(host != "https://tile.openstreetmap.org" for host in hosts):
+        raise p0.Failed(f"{label}: browser profile recorded contacts outside the allow-list: {hosts}")
+
+
+def require_no_browser_profile(user_dir: Path, label: str) -> None:
+    if any(user_dir.rglob("webcache_*")):
+        raise p0.Failed(f"{label}: a CEF browser profile was created outside the Selecting state")
 
 
 def exact_tree_manifest(directory: Path) -> dict:
@@ -286,7 +336,7 @@ def terraincore_contract_trees(data_root: Path) -> dict:
 
 def installed_medium_contract_trees(data_root: Path) -> dict:
     return {name: exact_tree_manifest(data_root / name)
-            for name in ("TerrainCore", "CoverEcology", "InstalledTerrain")}
+            for name in ("TerrainCore", "TerrainEdits", "CoverEcology", "InstalledTerrain")}
 
 
 def require_terraincore_renderer(receipt: dict, label: str) -> None:
@@ -376,6 +426,9 @@ def _windows_ipv6_tcp_rows(pid: int) -> list[dict]:
     return rows
 
 
+_PROCESS_IMAGES: dict[int, str] = {}
+
+
 def _windows_process_descendants(root_pid: int, known: set[int]) -> set[int]:
     """Track a packaged bootstrap process and any child game/helper processes it creates."""
     class ProcessEntry(ctypes.Structure):
@@ -400,6 +453,7 @@ def _windows_process_descendants(root_pid: int, known: set[int]) -> set[int]:
         present = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
         while present:
             parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            _PROCESS_IMAGES[int(entry.th32ProcessID)] = str(entry.szExeFile)
             present = kernel.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel.CloseHandle(snapshot)
@@ -423,6 +477,7 @@ def checked_with_tcp_audit(command: list[str], *, timeout: float, log: str) -> d
     snapshots = 0
     observed = set()
     tracked_pids = set()
+    first_seen: dict[tuple[int, str], float] = {}
     with log_path.open("w", encoding="utf-8") as stream:
         process = subprocess.Popen(command, cwd=ROOT, stdout=stream,
                                    stderr=subprocess.STDOUT, text=True, **options)
@@ -433,6 +488,9 @@ def checked_with_tcp_audit(command: list[str], *, timeout: float, log: str) -> d
                     for row in (_windows_ipv4_tcp_rows(tracked_pid)
                                 + _windows_ipv6_tcp_rows(tracked_pid)):
                         observed.add((tracked_pid, row["state"], row["local"], row["remote"]))
+                        key = (tracked_pid, row["remote"])
+                        if row["state"] != 2 and not row["remote"].endswith(":0")                                 and key not in first_seen:
+                            first_seen[key] = round((time.monotonic() - began) * 1000.0, 1)
                 snapshots += 1
                 if time.monotonic() - began > timeout:
                     raise p0.TimedOut(f"Timed out after {timeout}s: {command[0]}")
@@ -456,11 +514,34 @@ def checked_with_tcp_audit(command: list[str], *, timeout: float, log: str) -> d
                            if state == 2})
     remote_endpoints = sorted({remote for _, state, _, remote in observed
                                if state != 2 and not remote.endswith(":0")})
-    return {"method": "GetExtendedTcpTable process-attributed polling",
+    audit = {"method": "GetExtendedTcpTable process-attributed polling",
             "root_pid": process.pid, "observed_pids": sorted(tracked_pids),
             "snapshots": snapshots,
             "poll_interval_milliseconds": 10, "listen_ports": listen_ports,
-            "remote_endpoints": remote_endpoints}
+            "remote_endpoints": remote_endpoints,
+            "endpoint_owners": [
+                {"pid": pid, "image": _PROCESS_IMAGES.get(pid, "unknown"),
+                 "remote": remote, "first_seen_ms": first_seen[(pid, remote)]}
+                for pid, remote in sorted(first_seen)],
+             "process_images": {str(pid): _PROCESS_IMAGES.get(pid, "unknown")
+                                for pid in sorted(tracked_pids)}}
+    log_path.with_suffix(".tcp-audit.json").write_text(
+        json.dumps(audit, indent=2) + "\n", encoding="utf-8")
+    return audit
+
+
+def cef_contacted_hosts(user_dir: Path) -> list[str]:
+    """Hosts Chromium recorded as contacted in an isolated CEF profile (diagnostic only)."""
+    hosts = set()
+    for state in user_dir.rglob("Network Persistent State"):
+        try:
+            data = json.loads(state.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        for server in data.get("net", {}).get("http_server_properties", {}).get("servers", []):
+            if isinstance(server, dict) and isinstance(server.get("server"), str):
+                hosts.add(server["server"])
+    return sorted(hosts)
 
 
 def automation(environment: dict, run_output: Path) -> dict:
@@ -637,31 +718,35 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                   "-SkiP1UiLayoutSmoke" if scenario == "ui-layout" else
                   "-SkiP1PerformanceSmoke" if scenario == "performance-regression"
                   else "-SkiP1Smoke")
+    smoke_width, smoke_height = ((2560, 1440) if scenario == "performance-regression"
+                                 else (1280, 720))
     command = [str(launcher), smoke_flag, f"-SkiP1Token={token}",
                f"-SkiP1Receipt={receipt}", f"-SkiP1DataRoot={data_root}",
                f"-SkiP1Scenario={scenario}", f"-UserDir={unreal_user_dir}",
-               "-windowed", "-ResX=1280", "-ResY=720",
+               "-windowed", f"-ResX={smoke_width}", f"-ResY={smoke_height}",
                "-unattended", "-nosplash"]
     if scenario == "offline-reopen":
         if not content_id or len(content_id) != 64:
             raise p0.Failed("Offline reopen requires the exact contentId from an import receipt")
         command.append(f"-SkiP1ContentId={content_id}")
 
-    def collect_failure_context(reason: str) -> str:
+    def collect_failure_context(reason: str, user_dir: Path | None = None) -> str:
+        source_dir = user_dir if user_dir is not None else unreal_user_dir
         destination = run_output / "packaged-failure-context"
         destination.mkdir(parents=True, exist_ok=True)
         copied = []
         allowed_names = {"crashcontext.runtime-xml", "diagnostics.txt", "wermetadata.xml"}
         allowed_suffixes = {".log", ".dmp", ".xml"}
-        candidates = sorted((path for path in unreal_user_dir.rglob("*")
+        candidates = sorted((path for path in source_dir.rglob("*")
                              if path.is_file()
-                             and (path.name.lower() in allowed_names
+                             and (path.name == "Network Persistent State"
+                                  or path.name.lower() in allowed_names
                                   or path.suffix.lower() in allowed_suffixes)),
                             key=lambda path: path.stat().st_mtime, reverse=True)
         for source in candidates[:20]:
             if source.stat().st_size > 16 * 1024 * 1024:
                 continue
-            relative = source.relative_to(unreal_user_dir)
+            relative = source.relative_to(source_dir)
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
@@ -670,8 +755,9 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
             "scenario": scenario,
             "token": token,
             "reason": reason,
-            "isolated_user_dir": str(unreal_user_dir),
+            "isolated_user_dir": str(source_dir),
             "copied_files": copied,
+            "cef_contacted_hosts": cef_contacted_hosts(source_dir),
         }, indent=2) + "\n", encoding="utf-8")
         return str(destination)
 
@@ -690,13 +776,14 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                 audit = checked_with_tcp_audit(
                     child_command, timeout=120,
                     log=f"p1-{child_scenario}-{child_token}.log")
-                validate_tcp_audit(audit, require_no_connections=True)
+                validate_tcp_audit(audit, require_no_connections=True,
+                                   label=f"{scenario} child {child_scenario}")
             except p0.Failed as error:
-                context = collect_failure_context(f"{child_scenario}: {error}")
+                context = collect_failure_context(f"{child_scenario}: {error}", child_user_dir)
                 raise p0.Failed(f"{error}; packaged failure context: {context}") from error
             if not child_receipt.is_file():
                 context = collect_failure_context(
-                    f"{child_scenario} exited without its tokened receipt")
+                    f"{child_scenario} exited without its tokened receipt", child_user_dir)
                 raise p0.Failed(
                     f"{child_scenario} exited without its tokened receipt; context: {context}")
             return json.loads(child_receipt.read_text(encoding="utf-8-sig")), audit
@@ -819,10 +906,17 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                     audit = checked_with_tcp_audit(
                         child_command, timeout=120,
                         log=f"p1-ui-layout-{width}x{height}-{state}-{child_token}.log")
-                    validate_tcp_audit(audit, require_no_connections=True)
+                    if state == "selecting":
+                        validate_selector_audit(
+                            audit, child_user_dir, label=f"ui-layout {width}x{height} {state}")
+                    else:
+                        validate_tcp_audit(audit, require_no_connections=True,
+                                           label=f"ui-layout {width}x{height} {state}")
+                        require_no_browser_profile(
+                            child_user_dir, f"ui-layout {width}x{height} {state}")
                 except p0.Failed as error:
                     context = collect_failure_context(
-                        f"ui-layout {width}x{height} {state}: {error}")
+                        f"ui-layout {width}x{height} {state}: {error}", child_user_dir)
                     raise p0.Failed(f"{error}; packaged failure context: {context}") from error
                 if not child_receipt.is_file():
                     raise p0.Failed(
@@ -867,9 +961,10 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                 audit = checked_with_tcp_audit(
                     child_command, timeout=180,
                     log=f"p1-medium-{child_scenario}-{child_token}.log")
-                validate_tcp_audit(audit, require_no_connections=True)
+                validate_tcp_audit(audit, require_no_connections=True,
+                                   label=f"{scenario} child {child_scenario}")
             except p0.Failed as error:
-                context = collect_failure_context(f"{child_scenario}: {error}")
+                context = collect_failure_context(f"{child_scenario}: {error}", child_user_dir)
                 raise p0.Failed(f"{error}; packaged failure context: {context}") from error
             if not child_receipt.is_file():
                 raise p0.Failed(f"Medium {child_scenario} omitted its tokened receipt")
@@ -879,6 +974,10 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
         imported, import_audit = run_medium_child(
             "import", import_token, data_root / f"{import_token}.receipt.json", data_root, [])
         content_id = imported.get("contentId", "")
+        edit_set_id = imported.get("editSetId", "")
+        base_height = imported.get("baseQueryHeightM")
+        edited_height = imported.get("editedQueryHeightM")
+        edit_delta = imported.get("editDeltaM")
         component_ids = (imported.get("terrainCoreId", ""),
                          imported.get("coverEcologyId", ""))
         if imported.get("token") != import_token or imported.get("qualityTier") != "medium" \
@@ -886,10 +985,15 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                 or not imported.get("ready") or not imported.get("picked") \
                 or not imported.get("mutationObserved") or not imported.get("reopened") \
                 or imported.get("optionalOutcomes") != 2 \
+                or imported.get("editDeltaReconstructed") is not True \
                 or imported.get("syntheticGuestMarkers") != 3000 \
                 or imported.get("overlaySegments", 0) <= 0 \
                 or not all(re.fullmatch(r"[0-9a-f]{64}", value or "")
-                           for value in (content_id,) + component_ids):
+                           for value in (content_id, edit_set_id) + component_ids) \
+                or not all(type(value) in (int, float) and math.isfinite(value)
+                           for value in (base_height, edited_height, edit_delta)) \
+                or edit_delta <= 0.01 \
+                or abs((edited_height - base_height) - edit_delta) > 1e-4:
             raise p0.Failed("Packaged Medium import/edit receipt is invalid")
         first_trees = installed_medium_contract_trees(data_root)
 
@@ -900,6 +1004,7 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
             "import", repeat_token, repeat_root / f"{repeat_token}.receipt.json",
             repeat_root, [])
         if repeated.get("contentId") != content_id \
+                or repeated.get("editSetId") != edit_set_id \
                 or repeated.get("terrainCoreId") != component_ids[0] \
                 or repeated.get("coverEcologyId") != component_ids[1] \
                 or installed_medium_contract_trees(repeat_root) != first_trees:
@@ -908,12 +1013,18 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
         reopen_token = str(uuid.uuid4())
         reopened, reopen_audit = run_medium_child(
             "offline-reopen", reopen_token, data_root / f"{reopen_token}.receipt.json",
-            data_root, [f"-SkiP1ContentId={content_id}"])
+            data_root, [f"-SkiP1ContentId={content_id}",
+                        f"-SkiP1EditSetId={edit_set_id}"])
         if reopened.get("token") != reopen_token or reopened.get("contentId") != content_id \
+                or reopened.get("editSetId") != edit_set_id \
                 or reopened.get("terrainCoreId") != component_ids[0] \
                 or reopened.get("coverEcologyId") != component_ids[1] \
                 or not reopened.get("offlineReopen") or not reopened.get("ready") \
-                or not reopened.get("picked") or not reopened.get("reopened"):
+                or not reopened.get("picked") or not reopened.get("reopened") \
+                or reopened.get("editDeltaReconstructed") is not True \
+                or type(reopened.get("editedQueryHeightM")) not in (int, float) \
+                or not math.isfinite(reopened["editedQueryHeightM"]) \
+                or abs(reopened["editedQueryHeightM"] - edited_height) > 1e-4:
             raise p0.Failed("Packaged Medium offline-reopen receipt is invalid")
         require_acquisition_port_guard(reopened)
         if installed_medium_contract_trees(data_root) != first_trees:
@@ -922,6 +1033,9 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
             "token": token, "scenario": scenario, "schemaVersion": 2,
             "qualityTier": "medium", "contentId": content_id,
             "terrainCoreId": component_ids[0], "coverEcologyId": component_ids[1],
+            "editSetId": edit_set_id, "baseQueryHeightM": base_height,
+            "editedQueryHeightM": edited_height, "editDeltaM": edit_delta,
+            "editDeltaReconstructed": True,
             "nativeV2": True, "ready": True, "picked": True,
             "mutationObserved": True, "offlineReopen": True,
             "reopened": True, "deterministicIds": True, "deterministicTrees": True,
@@ -941,7 +1055,15 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
         try:
             process_audit = checked_with_tcp_audit(
                 command, timeout=120, log=f"p1-{scenario}-{token}.log")
-            validate_tcp_audit(process_audit, require_no_connections=scenario == "offline-reopen")
+            if scenario != "selector":
+                validate_tcp_audit(process_audit,
+                                   require_no_connections=scenario == "offline-reopen",
+                                   label=scenario)
+                if scenario in ("geotiff-regression", "acquisition-regression",
+                                "offline-reopen", "performance-regression"):
+                    require_no_browser_profile(unreal_user_dir, scenario)
+            else:
+                validate_selector_audit(process_audit, unreal_user_dir, label="selector")
         except p0.Failed as error:
             context = collect_failure_context(str(error))
             raise p0.Failed(f"{error}; packaged failure context: {context}") from error
@@ -953,7 +1075,11 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
         if observed.get("token") != token or observed.get("selector") is not True \
                 or observed.get("profile") != "medium" \
                 or observed.get("closedBeforeAcceptance") is not True \
+                or observed.get("bridgeUnbound") is not True \
+                or observed.get("cefBrowserClosed") is not True \
+                or observed.get("windowReleased") is not True \
                 or observed.get("blockedNavigation", 0) < 1 \
+                or observed.get("popupDelegateProbeDenied") is not True \
                 or observed.get("blockedPopup", 0) < 1:
             raise p0.Failed("Packaged selector receipt is stale or CEF/WebGL/bridge validation failed")
     elif scenario == "geotiff-regression":
@@ -1017,6 +1143,8 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
         low = observed.get("low", {})
         reference = observed.get("reference", {})
         frames_name = observed.get("frameSamples", "")
+        if frames_name != f"{token}.frames.json":
+            raise p0.Failed("Packaged performance frame-sample name is invalid")
         frames_path = data_root / frames_name
         if observed.get("token") != token or observed.get("scenario") != scenario \
                 or not observed.get("passed") or low.get("frames") != 240 \
@@ -1026,17 +1154,45 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                 or reference.get("p99Ms", 1e9) > 33.3 \
                 or reference.get("maxMs", 1e9) > 250 \
                 or observed.get("preparedReopenSeconds", 1e9) > 30 \
+                or observed.get("cameraFramed") is not True \
+                or type(observed.get("lowRenderedTiles")) is not int \
+                or observed["lowRenderedTiles"] <= 0 \
+                or type(observed.get("referenceRenderedTiles")) is not int \
+                or observed["referenceRenderedTiles"] <= 0 \
+                or observed.get("resolution") != [2560, 1440] \
                 or observed.get("internalResolutionPercent") != 100 \
+                or not all(isinstance(observed.get(field), str) and observed[field]
+                           for field in ("rhi", "cpu", "gpu")) \
+                or type(observed.get("availablePhysicalBytes")) is not int \
+                or observed["availablePhysicalBytes"] <= 0 \
                 or not frames_path.is_file() \
                 or observed.get("frameSamplesSha256") != p0.sha(frames_path) \
                 or observed.get("cacheBudgetBytes") != DEFAULT_TERRAINCORE_CACHE_BYTES:
             raise p0.Failed("Packaged performance-regression receipt is invalid")
+        frames = json.loads(frames_path.read_text(encoding="utf-8-sig"))
+        for field, summary in (("lowMs", low), ("referenceMs", reference)):
+            values = frames.get(field)
+            if not isinstance(values, list) or len(values) != 240 \
+                    or not all(type(value) in (int, float) and math.isfinite(value)
+                               and value >= 0 for value in values):
+                raise p0.Failed(f"Packaged performance frame samples are invalid: {field}")
+            ordered = sorted(values)
+            for key, fraction in (("p95Ms", .95), ("p99Ms", .99)):
+                index = math.ceil(fraction * len(ordered)) - 1
+                if abs(ordered[index] - summary.get(key, -1)) > 1e-4:
+                    raise p0.Failed(f"Packaged performance {field} {key} is inconsistent")
+            if abs(ordered[-1] - summary.get("maxMs", -1)) > 1e-4 \
+                    or any(summary.get(f"over{limit}") != sum(value > limit for value in values)
+                           for limit in (50, 100, 250)):
+                raise p0.Failed(f"Packaged performance {field} gap counts are inconsistent")
     elif scenario == "medium-regression":
         if observed.get("token") != token or observed.get("scenario") != scenario \
                 or observed.get("qualityTier") != "medium" \
                 or observed.get("schemaVersion") != 2 or not observed.get("nativeV2") \
                 or not observed.get("ready") or not observed.get("picked") \
                 or not observed.get("mutationObserved") or not observed.get("offlineReopen") \
+                or not observed.get("editDeltaReconstructed") \
+                or not re.fullmatch(r"[0-9a-f]{64}", observed.get("editSetId", "")) \
                 or not observed.get("deterministicIds") or not observed.get("deterministicTrees") \
                 or observed.get("syntheticGuestMarkers") != 3000 \
                 or observed.get("overlaySegments", 0) <= 0:

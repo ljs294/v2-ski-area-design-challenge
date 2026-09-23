@@ -16,6 +16,7 @@ class SKIPRESENTATION_API ASkiBootstrapGameMode : public AGameModeBase
 
 public:
     ASkiBootstrapGameMode();
+    void OpenLatestInstalledTerrain();
 
 protected:
     virtual void BeginPlay() override;
@@ -35,6 +36,7 @@ private:
         uint64 OperationGeneration, TSharedRef<SkiPreparation::Cancellation> Cancellation);
     void RetryPreparation();
     void ChangeSelection();
+    bool OpenInstalledTerrain(const FString& ContentId);
 
     UPROPERTY()
     TObjectPtr<USkiP1Widget> P1Widget;
@@ -85,4 +87,7 @@ private:
     int32 PerformancePhase = 0;
     double PerformanceReopenSeconds = 0.0;
     double PerformanceFirstRenderSeconds = 0.0;
+    bool bPerformanceCameraFramed = false;
+    int32 PerformanceLowRenderedTiles = 0;
+    int32 PerformanceReferenceRenderedTiles = 0;
 };

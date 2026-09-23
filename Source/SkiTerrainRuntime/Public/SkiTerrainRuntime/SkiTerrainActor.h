@@ -4,6 +4,7 @@
 #include "GameFramework/Actor.h"
 #include "SkiApplication/TerrainCoreSession.h"
 #include "SkiApplication/TerrainSession.h"
+#include "SkiDomain/CoverEcology.h"
 #include "SkiDomain/TerrainTile.h"
 #include "SkiTerrainRuntime/TerrainCoreTileCache.h"
 #include "SkiTerrainRuntime/TerrainCoreLodController.h"
@@ -48,7 +49,8 @@ public:
     bool BeginTerrainCoreStreaming(TSharedPtr<SkiApplication::TerrainCoreSession> InSession,
         uint8 Lod = 4);
     void SetTerrainCoreCover(std::shared_ptr<const std::vector<std::uint8_t>> Cover,
-        std::uint32_t Width, std::uint32_t Height);
+        std::shared_ptr<const std::vector<std::uint8_t>> PackedValidity,
+        const SkiDomain::CoverEcologyGridTransform& Transform);
     void SetTerrainCoreReadyHandler(TFunction<void(bool)> Handler)
     { CoreReadyHandler = MoveTemp(Handler); }
     bool ApplyScratchMutation(const FVector2D& CenterEastNorthM, double RadiusM, double DeltaM);
@@ -153,6 +155,9 @@ private:
     float CoreAutoLodElapsedSeconds = 0.0F;
     bool bTerrainCoreAutoLod = false;
     std::shared_ptr<const std::vector<std::uint8_t>> PresentedCover;
+    std::shared_ptr<const std::vector<std::uint8_t>> PresentedCoverValidity;
+    SkiDomain::CoverEcologyGridTransform PresentedCoverTransform;
+    bool bPresentedCoverGeographic = false;
     std::uint32_t PresentedCoverWidth = 0;
     std::uint32_t PresentedCoverHeight = 0;
     SkiDomain::Revision PresentedRevision = 0;

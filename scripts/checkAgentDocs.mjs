@@ -18,6 +18,7 @@ const ignoredDirectories = new Set([
   'dist-electron',
   'dist-ssr',
   'dist-web',
+  'handoff',
   'node_modules',
   'playwright-report',
   'release',

@@ -38,3 +38,6 @@ test-results
 /.vs/
 **/__pycache__/
 *.pyc
+
+# Extracted handoff package (the zip is tracked)
+/handoff/*/

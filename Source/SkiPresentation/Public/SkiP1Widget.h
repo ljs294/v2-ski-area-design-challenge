@@ -11,6 +11,8 @@ class SKIPRESENTATION_API USkiP1Widget : public UUserWidget
     GENERATED_BODY()
 public:
     void SetSelectionHandler(TFunction<void(const SkiPreparation::Request&)> Handler);
+    void SetOpenInstalledHandler(TFunction<void()> Handler);
+    void SetSelectorStatus(const FString& Status);
     void SetPreparationProgress(const SkiPreparation::Progress& Progress);
     void SetTransientStatus(const FString& Status);
     void SetProbeStatus(const FString& Status);
@@ -20,11 +22,17 @@ public:
     void ShowPreparationFailure(const TOptional<SkiPreparation::ProviderFailure>& Failure, const FString& Fallback,
         TFunction<void()> Retry, TFunction<void()> ChangeSelection);
     void ResetSelector();
+    // Creates the CEF selector for the Selecting state; no other state owns a browser.
+    void OpenSelector();
+    bool HasLiveSelector() const;
+    bool GetSelectorTeardownProof(bool& OutBridgeUnbound, bool& OutCefClosed, bool& OutReleased,
+        double& OutCloseMs) const;
     void SetViewCommandHandler(TFunction<void(FName)> Handler);
     void CloseSelector();
     bool IsSelectorClosed() const;
     int32 GetBlockedSelectorNavigationCount() const;
     int32 GetBlockedSelectorPopupCount() const;
+    bool WasSelectorPopupDelegateProbeDenied() const;
     bool IsP1Ready() const;
     bool IsPointerOverStatusPanel() const;
     bool DoesUiOwnKeyboardInput() const;
@@ -44,6 +52,7 @@ public:
     static FVector2D CalculateSelectorPanelSize(FIntPoint ViewportSize) noexcept;
 protected:
     virtual void NativeOnInitialized() override;
+    virtual void NativeDestruct() override;
     virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
 private:
     void AcceptSelection(const SkiPreparation::Request& Request);
@@ -54,6 +63,7 @@ private:
     void BindCommandButton(UButton* Button, FName Name);
     void SetShellState(EP1ShellState State);
     UFUNCTION() void RetryClicked(); UFUNCTION() void ChangeSelectionClicked();
+    UFUNCTION() void OpenInstalledClicked();
     UFUNCTION() void PresentationClicked(); UFUNCTION() void ElevationClicked();
     UFUNCTION() void SlopeClicked(); UFUNCTION() void CoverClicked(); UFUNCTION() void LodClicked();
     UFUNCTION() void LodAutoClicked();
@@ -73,9 +83,14 @@ private:
     UPROPERTY() TObjectPtr<UTextBlock> NodeText;
     UPROPERTY() TObjectPtr<UButton> RetryButton;
     UPROPERTY() TObjectPtr<UButton> ChangeSelectionButton;
+    UPROPERTY() TObjectPtr<UButton> OpenInstalledButton;
+    UPROPERTY() TObjectPtr<UTextBlock> SelectorStatusText;
     TFunction<void(const SkiPreparation::Request&)> SelectionHandler;
+    TFunction<void()> OpenInstalledHandler;
     TFunction<void()> RetryHandler; TFunction<void()> ChangeSelectionHandler;
     TFunction<void(FName)> ViewCommandHandler;
     uint64 SelectorGeneration = 0;
+    double OpenInstalledCloseStartedSeconds = 0.0;
+    bool bOpenInstalledPending = false;
     EP1ShellState ShellState = EP1ShellState::Selecting;
 };

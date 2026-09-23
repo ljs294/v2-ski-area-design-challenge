@@ -7,9 +7,54 @@ requires owner visual or workflow acceptance. A blank or `OPEN` row is not made
 complete by another row passing.
 
 The Section 0 remediation is frozen in commit `de7413dee3e011529c6289ce631c782a58873b1e`.
-For the remaining-plan execution begun 2026-09-22, the owner explicitly authorized
-the main Sol agent to stage and commit each tested section boundary while the owner
-is away. That authorization is limited to this implementation sequence.
+The current repository guidance reserves staging and committing to the owner.
+Keep Section 2 changes unstaged until the owner accepts a tested checkpoint.
+
+## Section 2 working audit — 2026-09-23
+
+Section 2 is **blocked, not accepted**. The Shipping selector audit
+`20260923T161841.669597Z-71afeabb` observed an established CEF-helper TCP
+connection outside the sole approved OSM tile host; the isolated browser profile
+also recorded `accounts.google.com` as a server. An
+isolated three-phase Shipping comparison under
+`test-results/p1/selector-diagnostic/11a4a3e1-a568-42de-a700-420bd335a846`
+reproduced the contact with the browser held on `about:blank` and with map tiles
+disabled. Project-scoped experiments with process-local identity/DNS preferences
+and project-owned direct CEF initialization with default-deny handlers for
+CEF-exposed resource requests and a resolver rule in browser/child launch hooks
+also left unapproved helper connections. A later project-local CEF proxy plus
+native tile scheme loaded two real map tiles, but the packaged audit
+`20260923T185139.038595Z-135966a4` still saw late CEF-helper connections to
+Comcast DNS-over-HTTPS endpoints after about six seconds. The CEF runtime did not
+permit changing its secure-DNS preference. A project-owned helper-wrapper probe
+failed CEF child-process startup (GPU exit 777006); the original helper binary
+was restored. These experiments did not establish an egress boundary. Their
+ignored receipts are in the neighboring `selector-diagnostic` run directories;
+unaccepted experimental source was removed from production. The fail-closed
+teardown fix remains unqualified in Shipping.
+Neither a code change nor a focused Editor pass can waive the Shipping network
+gate. The owner directed that Section 2 remain blocked if an in-scope fix cannot
+stop the contact. Medium composite/edit/reopen, visual,
+performance, live Crystal/Mount Washington, and owner-review receipts must still
+be rerun or obtained from one frozen source digest. Synthetic receipts do not
+establish live-provider or owner acceptance.
+
+After removing the unaccepted selector experiment, the Development Editor build
+passed in `test-results/p1/runs/20260923T190600.841430Z-c6ac883d` and the exact
+seven-test focused Medium P1 gate passed in
+`test-results/p1/runs/20260923T191455.671084Z-42db6fac` at source digest
+`24e78c32df9fc580c1c8c3ef5966dc6972d034727611a429d0fec65a828601c9`.
+These source-level checks do not establish a passing Shipping selector audit or
+Section 2 acceptance.
+
+A bounded project-owned AppContainer helper probe on 2026-09-23 also failed
+before packaged qualification. An uncontained standalone CEF 128 process
+rendered the local MapLibre selector with WebGL and paint callbacks; the same
+process inside a no-network-capability AppContainer exited with status
+`0x80000003`. A container-local `about:blank` control reproduced CEF's
+`platform_channel.cc(76)` access-denied fatal. The socket probe returned a
+timeout, not a conclusive OS denial. See `Tools/SelectorSandbox/README.md`.
+The existing Shipping selector path and network gate remain unchanged and red.
 
 | ID | Requirement | Implementation | Deterministic test | Packaged evidence | Status |
 | --- | --- | --- | --- | --- | --- |
@@ -31,13 +76,13 @@ is away. That authorization is limited to this implementation sequence.
 | P1.1-04 | Canonical heightfield ray query uses the renderer cell split and revision | domain/runtime query path | domain query tests | packaged pick/query-alignment receipt | Implemented; integrated evidence OPEN |
 | P1.1-05 | Bounded asynchronous scratch mutation, stale-result rejection and readiness coherence | runtime mutation path | mutation tests | packaged edit/reopen receipt | Implemented; persistence/reopen acceptance OPEN |
 | P1.2-01 | Slope/altitude/cover presentation and three lighting presets on the same terrain | P1 generated assets and presentation controller | asset recipe and presentation automation | 2560x1440 visual captures | Implemented; final captures and OWNER review OPEN |
-| P1.2-02 | Batched thin overlays and 3,000 guest markers without per-marker actors/controllers | runtime overlay batches | explicit count/ownership test required | packaged visual/performance receipt | OPEN |
+| P1.2-02 | Batched thin overlays and 3,000 guest markers without per-marker actors/controllers | runtime overlay batches | focused actor/count tests | packaged Medium and visual receipts require exact 3,000 count | Implemented; current frozen Shipping and owner evidence OPEN |
 | P1.3-01 | One responsive selector/progress/view/status/node-view shell | `SkiP1Widget` | UI focused gate | Shipping UI-layout | Implemented; final frozen evidence OPEN |
 | P1.3-02 | Single-owner pointer, focus, Escape, camera and drag state | widget and terrain view controller | UI input tests are partial | packaged interaction workflow | Implemented; complete interaction acceptance OPEN |
 | P1.4-01 | Local MapLibre bundle with allow-listed navigation, popup denial and token/generation validation | P1 selector and browser wrapper | selector protocol tests | packaged selector smoke | Implemented; final CEF/WebGL qualification OPEN |
 | P1.4-02 | Native 2-10 km validation; JavaScript cannot submit paths, commands, credentials or terrain arrays | domain selector protocol | `PackageAndProtocol` | packaged selector smoke | Implemented; final frozen evidence OPEN |
 | P1.4-03 | Browser binding/resource teardown before terrain gameplay | presentation browser lifecycle | explicit cleanup test required | packaged selector-to-terrain workflow | OPEN |
-| P1.5-01 | Required core/surround elevation and analytical WorldCover; optional NAIP/vector with explicit reasons | native provider/derivation | provider tests are partial | live preparation receipts | OPEN: current RGB WorldCover route must be replaced by class-value COG in P1 Section 2 |
+| P1.5-01 | Required core/surround elevation and analytical WorldCover; optional NAIP/vector with explicit reasons | native provider now reads class-value COG and writes a separate required CoverEcology component | focused analytical-class/activation tests | live preparation receipts | Implemented in worktree; frozen Shipping and live source evidence OPEN |
 | P1.5-02 | Maximum four network, two elevation-provider requests and two decode jobs with generation-fenced cancellation | process-wide acquisition/decode permits and operation lease | acquisition gate exercises overlapping operations, in-flight cancellation and decode caps | Shipping acquisition regression records the caps and cancellation latency; live cancellation receipt remains required | Implemented; final frozen and live evidence OPEN |
 | P1.5-03 | Contours and compact cover-display geometry | derivation/runtime presentation | deterministic geometry tests required | packaged diagnostic views | OPEN |
 | P1.6-01 | Sibling staging, complete validation and atomic content-addressed activation | package store | package/activation tests | packaged import and offline reopen | Implemented for schema 1; final frozen evidence OPEN |

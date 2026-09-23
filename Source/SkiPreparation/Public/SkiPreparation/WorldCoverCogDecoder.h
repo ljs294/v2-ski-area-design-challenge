@@ -26,6 +26,7 @@ struct SKIPREPARATION_API DecodedCoverWindow
     double LongitudeSpacingDeg = 0.0;
     double LatitudeSpacingDeg = 0.0;
     uint8 NoDataValue = 0;
+    bool bHasNoData = false;
     uint16 Compression = 0;
     uint32 SourceWidth = 0;
     uint32 SourceHeight = 0;

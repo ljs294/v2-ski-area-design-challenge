@@ -240,12 +240,15 @@ class TerrainCoreEvidenceTests(unittest.TestCase):
         valid = {"rendererPath": True, "renderedTileCount": 1,
                  "revisionAligned": True, "actorPicked": True,
                  "actorMutationObserved": True,
-                 "actorStaleMeshRejected": True}
+                 "actorStaleMeshRejected": True,
+                 "syntheticGuestMarkers": 3000, "overlaySegments": 1}
         p1.require_terraincore_renderer(valid, "fixture")
         for key, value in (("rendererPath", False), ("renderedTileCount", 0),
                            ("revisionAligned", False), ("actorPicked", False),
                            ("actorMutationObserved", False),
-                           ("actorStaleMeshRejected", False)):
+                           ("actorStaleMeshRejected", False),
+                           ("syntheticGuestMarkers", 2999), ("overlaySegments", 0),
+                           ("overlaySegments", 1.0)):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 p1.require_terraincore_renderer({**valid, key: value}, "fixture")
 
@@ -307,7 +310,8 @@ class EvidenceLedgerTests(unittest.TestCase):
             + "</testsuite>", encoding="utf-8")
         (self.run / "terraincore-ctest-run.log").write_text(
             "\n".join(evidence_ledger.TERRAINCORE_CTESTS)
-            + "\n100% tests passed, 0 tests failed out of 3", encoding="utf-8")
+            + f"\n100% tests passed, 0 tests failed out of {len(evidence_ledger.TERRAINCORE_CTESTS)}",
+            encoding="utf-8")
         (self.run / "retained.bin").write_bytes(b"all retained evidence is hashed")
 
     def tearDown(self):
@@ -365,7 +369,8 @@ class EvidenceLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing or empty"):
             self.collect()
         log.write_text("\n".join(evidence_ledger.TERRAINCORE_CTESTS)
-                       + "\n100% tests passed, 0 tests failed out of 3", encoding="utf-8")
+                       + f"\n100% tests passed, 0 tests failed out of "
+                       f"{len(evidence_ledger.TERRAINCORE_CTESTS)}", encoding="utf-8")
         junit = self.run / "terraincore-ctest-results.xml"
         junit.write_text('<testsuite><testcase name="SkiDomain.Revision"/></testsuite>',
                          encoding="utf-8")
@@ -567,10 +572,10 @@ class ReleaseResolverTests(unittest.TestCase):
         attacker = self.release / "attacker.exe"
         shutil.copy2(Path(os.environ["WINDIR"]) / "System32/where.exe", attacker)
         process = subprocess.Popen(
-            self.resolver_command(launch=True, provider="live", delay=1500),
+            self.resolver_command(launch=True, provider="live", delay=3000),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         pinned = False
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 15
         while process.poll() is None and time.monotonic() < deadline:
             try:
                 with self.launcher.open("r+b"):
@@ -709,3 +714,50 @@ class ReleaseResolverTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NetworkPolicyTests(unittest.TestCase):
+    def audit(self, owners):
+        return {"method": "GetExtendedTcpTable process-attributed polling", "snapshots": 3,
+                "listen_ports": [], "remote_endpoints": [o["remote"] for o in owners],
+                "endpoint_owners": owners}
+
+    def test_zero_policy_names_owning_image(self):
+        audit = self.audit([{"pid": 7, "image": "UnrealCEFSubProcess.exe",
+                             "remote": "[2607:f8b0::54]:443", "first_seen_ms": 5.0}])
+        with self.assertRaisesRegex(RuntimeError, "ui-layout 1280x720 ready.*UnrealCEFSubProcess"):
+            p1.validate_tcp_audit(audit, require_no_connections=True,
+                                  label="ui-layout 1280x720 ready")
+
+    def test_selector_policy_allows_only_browser_to_tile_host(self):
+        with tempfile.TemporaryDirectory() as folder:
+            user = Path(folder)
+            ok = self.audit([{"pid": 7, "image": "EpicWebHelper.exe",
+                              "remote": "[2a04:4e42::347]:443", "first_seen_ms": 1.0}])
+            p1.validate_selector_audit(ok, user, label="selector",
+                                       tile_addresses={"2a04:4e42::347"})
+            for owner in ({"pid": 7, "image": "EpicWebHelper.exe",
+                           "remote": "[2607:f8b0::54]:443"},
+                          {"pid": 8, "image": "SkiAreaDesignChallenge.exe",
+                           "remote": "[2a04:4e42::347]:443"}):
+                with self.subTest(owner=owner), self.assertRaises(RuntimeError):
+                    p1.validate_selector_audit(self.audit([{**owner, "first_seen_ms": 1.0}]),
+                                               user, label="selector",
+                                               tile_addresses={"2a04:4e42::347"})
+
+    def test_selector_policy_rejects_recorded_google_contact(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder) / "Saved/webcache_1/Default/Network/Network Persistent State"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({"net": {"http_server_properties": {"servers": [
+                {"server": "https://accounts.google.com"}]}}}), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "accounts.google.com"):
+                p1.validate_selector_audit(self.audit([]), Path(folder), label="selector",
+                                           tile_addresses=set())
+
+    def test_non_selecting_state_rejects_browser_profile(self):
+        with tempfile.TemporaryDirectory() as folder:
+            p1.require_no_browser_profile(Path(folder), "ready")
+            (Path(folder) / "Saved/webcache_6613").mkdir(parents=True)
+            with self.assertRaisesRegex(RuntimeError, "outside the Selecting state"):
+                p1.require_no_browser_profile(Path(folder), "ready")

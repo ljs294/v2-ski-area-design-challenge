@@ -19,8 +19,10 @@
       attributionControl: false,
       style: {
         version: 8,
-        sources: { base: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256 } },
-        layers: [{ id: 'base', type: 'raster', source: 'base' }]
+        sources: params.get('diagnostic') === 'no-tiles' ? {} :
+          { base: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256 } },
+        layers: params.get('diagnostic') === 'no-tiles' ? [] :
+          [{ id: 'base', type: 'raster', source: 'base' }]
       }
     });
     const marker = new maplibregl.Marker({ color: '#ef7d4f' }).setLngLat(center).addTo(map);
@@ -66,13 +68,7 @@
       attempts += 1;
       if (window.ue && window.ue.skiselector && typeof window.ue.skiselector.submit === 'function') {
         clearInterval(waitForBridge);
-        const popupProbe = document.createElement('a');
-        popupProbe.href = 'https://example.com/blocked-popup';
-        popupProbe.target = '_blank';
-        document.body.appendChild(popupProbe);
-        popupProbe.click();
-        popupProbe.remove();
-        location.assign('https://example.com/blocked-navigation');
+        location.assign('https://blocked.invalid/navigation');
         setTimeout(submitSelection, 100);
       } else if (attempts >= 50) {
         clearInterval(waitForBridge);

@@ -16,6 +16,7 @@
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Framework/Application/SlateApplication.h"
+#include "HAL/PlatformTime.h"
 #include "SkiSelectorBrowser.h"
 
 double USkiP1Widget::CalculateStatusPanelWidth(const double ViewportWidth) noexcept
@@ -32,6 +33,21 @@ FVector2D USkiP1Widget::CalculateSelectorPanelSize(const FIntPoint ViewportSize)
 void USkiP1Widget::NativeTick(const FGeometry& MyGeometry, const float InDeltaTime)
 {
     Super::NativeTick(MyGeometry, InDeltaTime);
+    if (bOpenInstalledPending)
+    {
+        if (IsSelectorClosed())
+        {
+            bOpenInstalledPending = false;
+            if (OpenInstalledButton) OpenInstalledButton->SetIsEnabled(true);
+            if (OpenInstalledHandler) OpenInstalledHandler();
+        }
+        else if (FPlatformTime::Seconds() - OpenInstalledCloseStartedSeconds > 2.0)
+        {
+            bOpenInstalledPending = false;
+            if (OpenInstalledButton) OpenInstalledButton->SetIsEnabled(true);
+            SetSelectorStatus(TEXT("The map browser did not release; installed terrain was not opened."));
+        }
+    }
     if (StatusPanel)
     {
         if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(StatusPanel->Slot))
@@ -56,7 +72,11 @@ void USkiP1Widget::NativeOnInitialized()
     if (UCanvasPanelSlot* CanvasSlot = Root->AddChildToCanvas(SelectorPanel)) { CanvasSlot->SetPosition({24,24}); CanvasSlot->SetSize({640,600}); }
     UTextBlock* Heading = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("P1Heading"));
     Heading->SetText(FText::FromString(TEXT("Mountain Planner — Terrain Preparation")));
-    SelectorPanel->AddChildToVerticalBox(Heading); ConfigureSelector();
+    SelectorPanel->AddChildToVerticalBox(Heading);
+    OpenInstalledButton = AddCommandButton(SelectorPanel, TEXT("Open last installed terrain (offline)"), TEXT("OpenInstalled"));
+    SelectorStatusText = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("SelectorStatus"));
+    SelectorStatusText->SetAutoWrapText(true);
+    SelectorPanel->AddChildToVerticalBox(SelectorStatusText);
     StatusPanel = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), TEXT("StatusPanel"));
     if (UCanvasPanelSlot* CanvasSlot = Root->AddChildToCanvas(StatusPanel))
     {
@@ -106,8 +126,12 @@ void USkiP1Widget::ConfigureSelector()
     const FString Token = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower);
     FString Path = FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir() / TEXT("P1Selector/index.html")); Path.ReplaceInline(TEXT("\\"), TEXT("/"));
     ++SelectorGeneration; const FString Auto = FParse::Param(FCommandLine::Get(), TEXT("SkiP1SelectorSmoke")) ? TEXT("&autotest=1") : TEXT("");
-    const FString Url = FString::Printf(TEXT("file:///%s?token=%s&generation=%llu%s"), *Path, *Token, SelectorGeneration, *Auto);
-    Selector->Configure(Url, Token, SelectorGeneration, [this](const SkiPreparation::Request& R){ AcceptSelection(R); }, [this](const FString& E){ SetTransientStatus(E); });
+    FString DiagnosticPhase;
+    const bool bDiagnostic = FParse::Value(FCommandLine::Get(), TEXT("SkiP1SelectorDiagnostic="), DiagnosticPhase);
+    const FString Diagnostic = bDiagnostic && DiagnosticPhase == TEXT("no-tiles")
+        ? TEXT("&diagnostic=no-tiles") : TEXT("");
+    const FString Url = FString::Printf(TEXT("file:///%s?token=%s&generation=%llu%s%s"), *Path, *Token, SelectorGeneration, *Auto, *Diagnostic);
+    Selector->Configure(Url, Token, SelectorGeneration, [this](const SkiPreparation::Request& R){ AcceptSelection(R); }, [this](const FString& E){ SetSelectorStatus(E); });
     if (UVerticalBoxSlot* BrowserSlot = SelectorPanel->AddChildToVerticalBox(Selector)) BrowserSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
 }
 
@@ -136,6 +160,7 @@ UButton* USkiP1Widget::AddGridCommandButton(UUniformGridPanel* Parent, const TCH
 void USkiP1Widget::BindCommandButton(UButton* Button, const FName Name)
 {
     if (Name==TEXT("Retry")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::RetryClicked); else if (Name==TEXT("ChangeSelection")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::ChangeSelectionClicked);
+    else if (Name==TEXT("OpenInstalled")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::OpenInstalledClicked);
     else if (Name==TEXT("Presentation")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::PresentationClicked); else if (Name==TEXT("Elevation")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::ElevationClicked);
     else if (Name==TEXT("Slope")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::SlopeClicked); else if (Name==TEXT("Cover")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::CoverClicked);
     else if (Name==TEXT("Lod")) Button->OnClicked.AddDynamic(this,&USkiP1Widget::LodClicked); else if(Name==TEXT("LodAuto"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::LodAutoClicked); else if(Name==TEXT("Lod0"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Lod0Clicked); else if(Name==TEXT("Lod1"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Lod1Clicked); else if(Name==TEXT("Lod2"))Button->OnClicked.AddDynamic(this,&USkiP1Widget::Lod2Clicked);
@@ -144,6 +169,8 @@ void USkiP1Widget::BindCommandButton(UButton* Button, const FName Name)
 }
 
 void USkiP1Widget::SetSelectionHandler(TFunction<void(const SkiPreparation::Request&)> H){SelectionHandler=std::move(H);} void USkiP1Widget::AcceptSelection(const SkiPreparation::Request& R){SetTransientStatus(TEXT("Selection accepted; browser resources released."));if(SelectionHandler)SelectionHandler(R);}
+void USkiP1Widget::SetOpenInstalledHandler(TFunction<void()> H){OpenInstalledHandler=std::move(H);}
+void USkiP1Widget::SetSelectorStatus(const FString& Status){if(SelectorStatusText)SelectorStatusText->SetText(FText::FromString(Status));}
 void USkiP1Widget::SetPreparationProgress(const SkiPreparation::Progress& P){SetShellState(EP1ShellState::Preparing);if(ProgressText){FString Detail=P.Detail.Left(120);Detail.ReplaceInline(TEXT("\n"),TEXT(" "));ProgressText->SetText(FText::FromString(FString::Printf(TEXT("%s — %s"),SkiPreparation::StateName(P.Phase),*Detail)));}if(ProgressBar)ProgressBar->SetPercent(P.Total.IsSet()&&P.Total.GetValue()?static_cast<float>(P.Completed)/P.Total.GetValue():0);}
 void USkiP1Widget::SetTransientStatus(const FString& S){if(StatusText)StatusText->SetText(FText::FromString(S));} void USkiP1Widget::SetProbeStatus(const FString& S){if(ProbeText)ProbeText->SetText(FText::FromString(S));}
 void USkiP1Widget::SetNodeStatus(const FString& S){if(NodeText)NodeText->SetText(FText::FromString(S));}
@@ -151,11 +178,18 @@ void USkiP1Widget::SetTerrainDetails(const FString& D,const bool Synthetic){SetS
 void USkiP1Widget::BeginPreparationUI(TFunction<void()> Change){ChangeSelectionHandler=std::move(Change);SetShellState(EP1ShellState::Preparing);if(ChangeSelectionButton)ChangeSelectionButton->SetVisibility(ESlateVisibility::Visible);}
 void USkiP1Widget::ShowPreparationFailure(const TOptional<SkiPreparation::ProviderFailure>& Failure,const FString& Fallback,TFunction<void()> Retry,TFunction<void()> Change)
 {RetryHandler=std::move(Retry);ChangeSelectionHandler=std::move(Change);SetShellState(EP1ShellState::Failed);FString M=Fallback;if(Failure.IsSet()){const auto& F=Failure.GetValue();const FString Receipt=F.DiagnosticReceipt.IsEmpty()?TEXT("not written"):FPaths::GetCleanFilename(F.DiagnosticReceipt);if(F.Stage==SkiPreparation::FailureStage::Acquisition){M=FString::Printf(TEXT("%s\n%s — %s (HTTP %d)\n%ux%u · tile %d/%d · attempt %d/%d · %.1f s\nDiagnostic: %s"),SkiPreparation::ProviderProductName(F.Product),F.TransportFailure.IsEmpty()?TEXT("Acquisition failed"):*F.TransportFailure,*F.RequestStatus,F.HttpStatus,F.RequestedWidth,F.RequestedHeight,F.TileIndex,F.TileCount,F.Attempt,F.MaximumAttempts,F.ElapsedSeconds,*Receipt);}else{const FString Metadata=F.MetadataTag?FString::Printf(TEXT("\nMetadata tag %u type %d count %d pass-count %s"),F.MetadataTag,F.MetadataType,F.MetadataReadCount,F.MetadataPassCount?TEXT("yes"):TEXT("no")):FString();M=FString::Printf(TEXT("%s\n%s — %s\n%s%s\nDiagnostic: %s"),*F.Code,SkiPreparation::ProviderProductName(F.Product),SkiPreparation::FailureStageName(F.Stage),F.Width?*FString::Printf(TEXT("%s %ux%u compression %u"),*F.Organization,F.Width,F.Height,F.Compression):TEXT("No decoded raster"),*Metadata,*Receipt);}}SetTransientStatus(M);RetryButton->SetVisibility(Failure.IsSet()&&Failure->Retry==SkiPreparation::RetryClassification::Retryable?ESlateVisibility::Visible:ESlateVisibility::Collapsed);RetryButton->SetIsEnabled(true);ChangeSelectionButton->SetVisibility(ESlateVisibility::Visible);}
-void USkiP1Widget::ResetSelector(){SetShellState(EP1ShellState::Selecting);ConfigureSelector();SetTransientStatus(TEXT("Choose new bounds; selector token and generation were replaced."));}
-void USkiP1Widget::SetViewCommandHandler(TFunction<void(FName)> H){ViewCommandHandler=std::move(H);} void USkiP1Widget::CloseSelector(){if(Selector)Selector->Close();} bool USkiP1Widget::IsP1Ready()const{return WidgetTree&&WidgetTree->RootWidget&&Selector&&ProgressText&&ProgressBar&&StatusText;}
-bool USkiP1Widget::IsSelectorClosed()const{return Selector&&Selector->IsClosed();}
+// CEF is created only while the Selecting state owns the shell: every other state (and every
+// scene-only capture or regression) runs without a browser process or network-capable profile.
+void USkiP1Widget::OpenSelector(){bOpenInstalledPending=false;if(OpenInstalledButton)OpenInstalledButton->SetIsEnabled(true);SetShellState(EP1ShellState::Selecting);ConfigureSelector();}
+void USkiP1Widget::NativeDestruct(){bOpenInstalledPending=false;CloseSelector();Super::NativeDestruct();}
+bool USkiP1Widget::HasLiveSelector()const{return Selector&&!Selector->IsClosed();}
+bool USkiP1Widget::GetSelectorTeardownProof(bool& OutBridgeUnbound,bool& OutCefClosed,bool& OutReleased,double& OutCloseMs)const{if(!Selector)return false;OutBridgeUnbound=Selector->WasBridgeUnbound();OutCefClosed=Selector->WasCefBrowserClosed();OutReleased=Selector->WasWindowReleased();OutCloseMs=Selector->GetCloseMilliseconds();return true;}
+void USkiP1Widget::ResetSelector(){bOpenInstalledPending=false;if(OpenInstalledButton)OpenInstalledButton->SetIsEnabled(true);SetShellState(EP1ShellState::Selecting);ConfigureSelector();SetSelectorStatus(TEXT("Choose new bounds; selector token and generation were replaced."));}
+void USkiP1Widget::SetViewCommandHandler(TFunction<void(FName)> H){ViewCommandHandler=std::move(H);} void USkiP1Widget::CloseSelector(){if(Selector&&!Selector->IsClosed())Selector->Close();} bool USkiP1Widget::IsP1Ready()const{return WidgetTree&&WidgetTree->RootWidget&&SelectorPanel&&ProgressText&&ProgressBar&&StatusText;}
+bool USkiP1Widget::IsSelectorClosed()const{return !Selector||Selector->IsClosed();}
 int32 USkiP1Widget::GetBlockedSelectorNavigationCount()const{return Selector?Selector->GetBlockedNavigationCount():0;}
 int32 USkiP1Widget::GetBlockedSelectorPopupCount()const{return Selector?Selector->GetBlockedPopupCount():0;}
+bool USkiP1Widget::WasSelectorPopupDelegateProbeDenied()const{return Selector&&Selector->WasPopupDelegateProbeDenied();}
 bool USkiP1Widget::IsPointerOverStatusPanel()const{return StatusPanel&&FSlateApplication::IsInitialized()&&StatusPanel->GetCachedGeometry().IsUnderLocation(FSlateApplication::Get().GetCursorPos());}
 bool USkiP1Widget::DoesUiOwnKeyboardInput()const{APlayerController* Owner=GetOwningPlayer();return (Selector&&Selector->HasAnyUserFocus())||(StatusPanel&&(StatusPanel->HasAnyUserFocus()||(Owner&&StatusPanel->HasUserFocusedDescendants(Owner))));}
 double USkiP1Widget::GetRightPanelInsetPixels()const{return StatusPanel?StatusPanel->GetCachedGeometry().GetAbsoluteSize().X+24.0:0.0;}
@@ -191,7 +225,8 @@ bool USkiP1Widget::ValidateShellLayout(const FIntPoint ViewportSize,const EP1She
         &&(StatusPanel->GetVisibility()==(Selecting?ESlateVisibility::Collapsed:ESlateVisibility::Visible))
         &&(RetryVisible==(ExpectedState==EP1ShellState::Failed))
         &&(ChangeVisible==(ExpectedState==EP1ShellState::Preparing||ExpectedState==EP1ShellState::Failed||ExpectedState==EP1ShellState::Ready))
-        &&(ReadyVisible==(ExpectedState==EP1ShellState::Ready));
+        &&(ReadyVisible==(ExpectedState==EP1ShellState::Ready))
+        &&(Selecting?HasLiveSelector():!HasLiveSelector());
     const bool GeometryOk=RootSize.X>0&&RootSize.Y>0&&ViewportSize.X>0&&ViewportSize.Y>0
         &&(Selecting?InsideRoot(SelectorPanel):(InsideRoot(StatusPanel)&&StatusScroll->GetCachedGeometry().GetAbsoluteSize().Y>0));
     if(!(VisibilityValid&&GeometryOk))OutError=FString::Printf(TEXT("state %d root %.0fx%.0f selector %d status %d retry %d change %d ready %d scroll %.0f"),static_cast<int32>(ExpectedState),RootSize.X,RootSize.Y,SelectorPanel->GetVisibility()==ESlateVisibility::Visible,StatusPanel->GetVisibility()==ESlateVisibility::Visible,RetryVisible,ChangeVisible,ReadyVisible,StatusScroll->GetCachedGeometry().GetAbsoluteSize().Y);
@@ -210,8 +245,17 @@ bool USkiP1Widget::ValidateRecoveryLayout(const FIntPoint ViewportSize,FString& 
     if(!Valid)OutError=FString::Printf(TEXT("root %.0fx%.0f panel %.0fx%.0f retry %d change %d scroll %.0f"),RootSize.X,RootSize.Y,PanelSize.X,PanelSize.Y,ActionInside(RetryButton),ActionInside(ChangeSelectionButton),StatusScroll->GetCachedGeometry().GetAbsoluteSize().Y);
     return Valid;
 }
-void USkiP1Widget::SetShellState(const EP1ShellState State){ShellState=State;const bool Selecting=State==EP1ShellState::Selecting;const bool Ready=State==EP1ShellState::Ready;if(SelectorPanel)SelectorPanel->SetVisibility(Selecting?ESlateVisibility::Visible:ESlateVisibility::Collapsed);if(StatusPanel)StatusPanel->SetVisibility(Selecting?ESlateVisibility::Collapsed:ESlateVisibility::Visible);if(ReadyControls)ReadyControls->SetVisibility(Ready?ESlateVisibility::Visible:ESlateVisibility::Collapsed);if(DetailsText)DetailsText->SetVisibility(Ready?ESlateVisibility::Visible:ESlateVisibility::Collapsed);if(ProbeText)ProbeText->SetVisibility(Ready?ESlateVisibility::Visible:ESlateVisibility::Collapsed);if(NodeText)NodeText->SetVisibility(Ready?ESlateVisibility::Visible:ESlateVisibility::Collapsed);if(RetryButton&&State!=EP1ShellState::Failed)RetryButton->SetVisibility(ESlateVisibility::Collapsed);if(ChangeSelectionButton)ChangeSelectionButton->SetVisibility(State==EP1ShellState::Preparing||State==EP1ShellState::Failed||State==EP1ShellState::Ready?ESlateVisibility::Visible:ESlateVisibility::Collapsed);}
+void USkiP1Widget::SetShellState(const EP1ShellState State){ShellState=State;const bool Selecting=State==EP1ShellState::Selecting;if(!Selecting)CloseSelector();const bool Ready=State==EP1ShellState::Ready;if(SelectorPanel)SelectorPanel->SetVisibility(Selecting?ESlateVisibility::Visible:ESlateVisibility::Collapsed);if(StatusPanel)StatusPanel->SetVisibility(Selecting?ESlateVisibility::Collapsed:ESlateVisibility::Visible);if(ReadyControls)ReadyControls->SetVisibility(Ready?ESlateVisibility::Visible:ESlateVisibility::Collapsed);if(DetailsText)DetailsText->SetVisibility(Ready?ESlateVisibility::Visible:ESlateVisibility::Collapsed);if(ProbeText)ProbeText->SetVisibility(Ready?ESlateVisibility::Visible:ESlateVisibility::Collapsed);if(NodeText)NodeText->SetVisibility(Ready?ESlateVisibility::Visible:ESlateVisibility::Collapsed);if(RetryButton&&State!=EP1ShellState::Failed)RetryButton->SetVisibility(ESlateVisibility::Collapsed);if(ChangeSelectionButton)ChangeSelectionButton->SetVisibility(State==EP1ShellState::Preparing||State==EP1ShellState::Failed||State==EP1ShellState::Ready?ESlateVisibility::Visible:ESlateVisibility::Collapsed);}
 void USkiP1Widget::RetryClicked(){if(RetryButton)RetryButton->SetIsEnabled(false);SetShellState(EP1ShellState::Preparing);if(RetryHandler)RetryHandler();} void USkiP1Widget::ChangeSelectionClicked(){if(ChangeSelectionHandler)ChangeSelectionHandler();}
+void USkiP1Widget::OpenInstalledClicked()
+{
+    if (bOpenInstalledPending || !OpenInstalledHandler) return;
+    bOpenInstalledPending = true;
+    OpenInstalledCloseStartedSeconds = FPlatformTime::Seconds();
+    if (OpenInstalledButton) OpenInstalledButton->SetIsEnabled(false);
+    SetSelectorStatus(TEXT("Closing the map before opening installed terrain..."));
+    CloseSelector();
+}
 void USkiP1Widget::PresentationClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Presentation"));} void USkiP1Widget::ElevationClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Elevation"));}
 void USkiP1Widget::SlopeClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Slope"));} void USkiP1Widget::CoverClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Cover"));} void USkiP1Widget::LodClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("Lod"));}
 void USkiP1Widget::LodAutoClicked(){if(ViewCommandHandler)ViewCommandHandler(TEXT("LodAuto"));}

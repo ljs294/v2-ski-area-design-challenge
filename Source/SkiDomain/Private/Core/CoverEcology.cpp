@@ -63,6 +63,41 @@ bool SkiDomain::ComputeCoverEcologyOuterBounds(const std::uint32_t Width,
     return FiniteGeographicBounds(OutOuterBounds);
 }
 
+bool SkiDomain::SampleCoverEcologyClass(const CoverEcologyGridTransform& Transform,
+    const std::vector<std::uint8_t>& Classes,
+    const std::vector<std::uint8_t>& PackedValidity,
+    const double LatitudeDeg, const double LongitudeDeg, std::uint8_t& OutClass) noexcept
+{
+    OutClass = 0;
+    const std::uint64_t Count = static_cast<std::uint64_t>(Transform.Width) * Transform.Height;
+    if (Transform.Width < 2 || Transform.Height < 2 || Count > CoverEcologyMaxCells
+        || Classes.size() != Count || PackedValidity.size() != (Count + 7U) / 8U
+        || !std::isfinite(LatitudeDeg) || !std::isfinite(LongitudeDeg)
+        || !std::isfinite(Transform.LongitudeStepDeg)
+        || !std::isfinite(Transform.LatitudeStepDeg)
+        || Transform.LongitudeStepDeg <= 0.0 || Transform.LatitudeStepDeg <= 0.0
+        || LongitudeDeg < Transform.OuterBounds.WestDeg
+        || LongitudeDeg >= Transform.OuterBounds.EastDeg
+        || LatitudeDeg <= Transform.OuterBounds.SouthDeg
+        || LatitudeDeg > Transform.OuterBounds.NorthDeg)
+    {
+        return false;
+    }
+    const double ColumnValue = (LongitudeDeg - Transform.OuterBounds.WestDeg)
+        / Transform.LongitudeStepDeg;
+    const double RowValue = (Transform.OuterBounds.NorthDeg - LatitudeDeg)
+        / Transform.LatitudeStepDeg;
+    if (!std::isfinite(ColumnValue) || !std::isfinite(RowValue)
+        || ColumnValue < 0.0 || RowValue < 0.0
+        || ColumnValue >= Transform.Width || RowValue >= Transform.Height) return false;
+    const std::uint64_t Column = static_cast<std::uint64_t>(ColumnValue);
+    const std::uint64_t Row = static_cast<std::uint64_t>(RowValue);
+    const std::uint64_t Index = Row * Transform.Width + Column;
+    if ((PackedValidity[Index / 8U] & (1U << (Index % 8U))) == 0) return false;
+    OutClass = Classes[Index];
+    return true;
+}
+
 SkiDomain::CoverEcologyValidation SkiDomain::ValidateCoverEcology(
     const CoverEcologyManifest& Manifest, const std::uint64_t SerializedManifestBytes) noexcept
 {
@@ -182,7 +217,9 @@ SkiDomain::CoverEcologyValidation SkiDomain::ValidateInstalledTerrainReceipt(
         return {CoverEcologyError::ManifestTooLarge, 0};
     if (!IsTerrainCoreSha256(Receipt.ContentId)
         || !IsTerrainCoreSha256(Receipt.TerrainCoreId)
-        || !IsTerrainCoreSha256(Receipt.CoverEcologyId))
+        || !IsTerrainCoreSha256(Receipt.SurroundTerrainCoreId)
+        || !IsTerrainCoreSha256(Receipt.CoverEcologyId)
+        || Receipt.SurroundTerrainCoreId == Receipt.TerrainCoreId)
         return {CoverEcologyError::InvalidContentId, 0};
     if (!ValidMetadata(Receipt.GeneratorVersion)
         || Receipt.OptionalSources.size() > InstalledTerrainMaxOptionalSources)

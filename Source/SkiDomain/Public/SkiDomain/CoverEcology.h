@@ -12,7 +12,9 @@
 namespace SkiDomain
 {
 constexpr std::uint32_t CoverEcologySchema = 1;
-constexpr std::uint32_t InstalledTerrainSchema = 1;
+// Schema 2 adds the required surround TerrainCore component. Schema 1 receipts were never
+// accepted and are rejected; the terrain must be re-prepared.
+constexpr std::uint32_t InstalledTerrainSchema = 2;
 constexpr std::uint64_t CoverEcologyMaxCells = 16'000'000ULL;
 constexpr std::size_t CoverEcologyMaxAssets = 16;
 constexpr std::size_t InstalledTerrainMaxOptionalSources = 32;
@@ -119,6 +121,8 @@ struct InstalledTerrainReceipt
     std::string ContentId;
     std::string GeneratorVersion;
     std::string TerrainCoreId;
+    /** Required coarse surrounding elevation, stored as its own immutable TerrainCore. */
+    std::string SurroundTerrainCoreId;
     std::string CoverEcologyId;
     std::vector<OptionalSourceOutcome> OptionalSources;
 };
@@ -133,6 +137,11 @@ struct CoverEcologyValidation
 SKI_DOMAIN_API bool ComputeCoverEcologyOuterBounds(std::uint32_t Width,
     std::uint32_t Height, double LongitudeStepDeg, double LatitudeStepDeg,
     const GeographicBounds& SampleCenters, GeographicBounds& OutOuterBounds) noexcept;
+/** Nearest categorical source pixel; false outside the grid or for an invalid cell. */
+SKI_DOMAIN_API bool SampleCoverEcologyClass(const CoverEcologyGridTransform& Transform,
+    const std::vector<std::uint8_t>& Classes,
+    const std::vector<std::uint8_t>& PackedValidity,
+    double LatitudeDeg, double LongitudeDeg, std::uint8_t& OutClass) noexcept;
 SKI_DOMAIN_API CoverEcologyValidation ValidateCoverEcology(
     const CoverEcologyManifest& Manifest,
     std::uint64_t SerializedManifestBytes = 0) noexcept;

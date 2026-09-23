@@ -56,6 +56,13 @@ bool SkiPreparation::ValidateRequest(const Request& RequestValue, FString& OutEr
         OutError = TEXT("Verified 1 m lidar High is unavailable until catalog preflight proves complete supported coverage. Choose Medium.");
         return false;
     }
+    if (RequestValue.Profile != SourceProfile::Medium)
+    {
+        // Legacy Standard remains an internal acquisition profile (the required surround) and a
+        // readable schema-1 label; it is never a new user preparation tier.
+        OutError = TEXT("New preparations use the Medium tier.");
+        return false;
+    }
     return true;
 }
 

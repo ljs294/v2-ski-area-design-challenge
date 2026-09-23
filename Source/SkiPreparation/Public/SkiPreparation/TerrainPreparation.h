@@ -177,6 +177,9 @@ struct SKIPREPARATION_API Result
     TArray<uint8> CoverValidity;
     bool HasNativeV2Installation = false;
     SkiDomain::TerrainCoreManifest TerrainCoreManifest;
+    /** Required coarse surround, installed as its own TerrainCore in the core's local frame. */
+    SkiDomain::TerrainCoreManifest SurroundTerrainCoreManifest;
+    SkiDomain::Heightfield SurroundHeightfield;
     SkiDomain::CoverEcologyManifest CoverEcologyManifest;
     SkiDomain::InstalledTerrainReceipt InstallationReceipt;
 };

@@ -58,7 +58,9 @@ def build_fixture() -> bytes:
         (323, 4, 1, long(TILE)), (324, 4, 4, long(offsets_slot)),
         (325, 4, 4, long(counts_slot)), (339, 3, 1, short(1)),
         (33550, 12, 3, long(scale)), (33922, 12, 6, long(tie)),
-        (34735, 3, 12, long(keys)), (42113, 2, 2, long(nodata)),
+        (34735, 3, 16, long(keys)),
+        # Two ASCII bytes fit in the entry, so TIFF stores them inline rather than by offset.
+        (42113, 2, 2, b"0\x00" + bytes(2)),
     ]
     entries.sort()
     output = bytearray(cursor)

@@ -17,6 +17,7 @@
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #include "Misc/ScopeExit.h"
+#include "GenericPlatform/GenericPlatformHttp.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
@@ -276,6 +277,107 @@ FString ElevationUrl(const SkiDomain::GeographicBounds& Bounds, const uint32 Wid
         Bounds.WestDeg, Bounds.SouthDeg, Bounds.EastDeg, Bounds.NorthDeg, Width, Height);
 }
 
+/** What the 3DEP mosaic actually used under the delivered grid, as reported by the service. */
+struct ElevationSourceMetadata
+{
+    bool bQueried = false;
+    bool bNativeSpacingUniform = false;
+    double NativeEastSpacingM = 0.0;
+    double NativeNorthSpacingM = 0.0;
+    FString VerticalDatum = TEXT("not reported by provider");
+    FString AcquisitionEpoch = TEXT("not reported by provider");
+    FString Products = TEXT("not reported by provider");
+    int32 DistinctSources = 0;
+};
+
+FString ElevationSamplesUrl(const SkiDomain::GeographicBounds& Bounds, const double PixelDegrees)
+{
+    FString Points;
+    for (int32 Row = 0; Row < 5; ++Row)
+    {
+        for (int32 Column = 0; Column < 5; ++Column)
+        {
+            const double Longitude = Bounds.WestDeg + (Column + 0.5) / 5.0 * (Bounds.EastDeg - Bounds.WestDeg);
+            const double Latitude = Bounds.SouthDeg + (Row + 0.5) / 5.0 * (Bounds.NorthDeg - Bounds.SouthDeg);
+            Points += FString::Printf(TEXT("%s[%.8f,%.8f]"), Points.IsEmpty() ? TEXT("") : TEXT(","), Longitude, Latitude);
+        }
+    }
+    const FString Geometry = FString::Printf(TEXT("{\"points\":[%s],\"spatialReference\":{\"wkid\":4326}}"), *Points);
+    const FString PixelSize = FString::Printf(TEXT("{\"x\":%.10f,\"y\":%.10f,\"spatialReference\":{\"wkid\":4326}}"),
+        PixelDegrees, PixelDegrees);
+    return FString::Printf(TEXT("https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/getSamples?geometry=%s&geometryType=esriGeometryMultipoint&returnFirstValueOnly=true&pixelSize=%s&outFields=%s&f=json"),
+        *FGenericPlatformHttp::UrlEncode(Geometry), *FGenericPlatformHttp::UrlEncode(PixelSize),
+        *FGenericPlatformHttp::UrlEncode(TEXT("Name,ProductName,VerticalDatum,LowPS,Resolution_X,Resolution_Y,AcquisitionDate")));
+}
+
+double JsonNumber(const TSharedPtr<FJsonObject>& Object, const TCHAR* Field)
+{
+    double Number = 0.0;
+    FString Text;
+    if (Object->TryGetNumberField(Field, Number)) return Number;
+    if (Object->TryGetStringField(Field, Text)) return FCString::Atod(*Text);
+    return 0.0;
+}
+
+/** Parses a getSamples response. Honest by construction: mixed or missing fields stay labelled. */
+bool ParseElevationSourceMetadata(const TArray<uint8>& Bytes, const double CenterLatitude,
+    ElevationSourceMetadata& Out)
+{
+    FString Json;
+    FFileHelper::BufferToString(Json, Bytes.GetData(), Bytes.Num());
+    TSharedPtr<FJsonObject> Root;
+    if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Root) || !Root) return false;
+    const TArray<TSharedPtr<FJsonValue>>* Samples = nullptr;
+    if (!Root->TryGetArrayField(TEXT("samples"), Samples) || !Samples || Samples->IsEmpty()) return false;
+    TSet<FString> Products, Datums;
+    TSet<int64> ResolutionKeys;
+    double ResolutionX = 0.0, ResolutionY = 0.0;
+    double MinDate = TNumericLimits<double>::Max(), MaxDate = 0.0;
+    for (const TSharedPtr<FJsonValue>& Value : *Samples)
+    {
+        const TSharedPtr<FJsonObject>* Sample = nullptr;
+        if (!Value.IsValid() || !Value->TryGetObject(Sample) || !Sample) continue;
+        const TSharedPtr<FJsonObject>* Attributes = nullptr;
+        if (!(*Sample)->TryGetObjectField(TEXT("attributes"), Attributes) || !Attributes) continue;
+        FString Product, Datum;
+        if ((*Attributes)->TryGetStringField(TEXT("ProductName"), Product) && !Product.IsEmpty())
+            Products.Add(Product.Left(96));
+        if ((*Attributes)->TryGetStringField(TEXT("VerticalDatum"), Datum) && !Datum.IsEmpty())
+            Datums.Add(Datum.Left(96));
+        const double X = JsonNumber(*Attributes, TEXT("Resolution_X"));
+        const double Y = JsonNumber(*Attributes, TEXT("Resolution_Y"));
+        if (X > 0.0)
+        {
+            ResolutionKeys.Add(FMath::RoundToInt64(X * 1.0e9));
+            ResolutionX = X;
+            ResolutionY = Y > 0.0 ? Y : X;
+        }
+        const double Date = JsonNumber(*Attributes, TEXT("AcquisitionDate"));
+        if (Date > 0.0) { MinDate = FMath::Min(MinDate, Date); MaxDate = FMath::Max(MaxDate, Date); }
+    }
+    Out.bQueried = true;
+    Out.DistinctSources = Products.Num();
+    if (!Products.IsEmpty()) Out.Products = FString::Join(Products.Array(), TEXT("; "));
+    if (Datums.Num() == 1) Out.VerticalDatum = *Datums.CreateConstIterator();
+    else if (Datums.Num() > 1) Out.VerticalDatum = TEXT("mixed: ") + FString::Join(Datums.Array(), TEXT("; "));
+    if (MaxDate > 0.0)
+    {
+        const FString First = FDateTime::FromUnixTimestamp(static_cast<int64>(MinDate / 1000.0)).ToString(TEXT("%Y-%m-%d"));
+        const FString Last = FDateTime::FromUnixTimestamp(static_cast<int64>(MaxDate / 1000.0)).ToString(TEXT("%Y-%m-%d"));
+        Out.AcquisitionEpoch = First == Last ? First : First + TEXT("/") + Last;
+    }
+    if (ResolutionKeys.Num() == 1)
+    {
+        // Geographic sources report resolution in degrees; projected sources in metres.
+        const bool bDegrees = ResolutionX < 0.01;
+        const double Cosine = std::cos(FMath::DegreesToRadians(CenterLatitude));
+        Out.NativeEastSpacingM = bDegrees ? ResolutionX * 111320.0 * Cosine : ResolutionX;
+        Out.NativeNorthSpacingM = bDegrees ? ResolutionY * 111320.0 : ResolutionY;
+        Out.bNativeSpacingUniform = Out.NativeEastSpacingM > 0.0 && Out.NativeNorthSpacingM > 0.0;
+    }
+    return true;
+}
+
 bool OperationCurrent(const SkiPreparation::Request& Request,
     const TSharedRef<SkiPreparation::Cancellation>& Cancellation)
 {
@@ -444,9 +546,15 @@ public:
         SkiPreparation::HttpAcquisitionResult Result;
         if (!Fetch(0, HeaderBytes, Result, OutFailure)) return false;
         uint64 ParsedSize = 0;
-        if (!SkiPreparation::ValidateContentRange(Result.ContentRange, {0, HeaderBytes},
-                Result.Bytes.Num(), ParsedSize) || ParsedSize < HeaderBytes
-            || ParsedSize > 512ULL * 1024ULL * 1024ULL)
+        const bool bFullHeader = SkiPreparation::ValidateContentRange(Result.ContentRange,
+            {0, HeaderBytes}, Result.Bytes.Num(), ParsedSize) && ParsedSize >= HeaderBytes;
+        // An object smaller than one header block is valid only when the single response is
+        // exactly the whole object.
+        const bool bWholeSmallObject = !bFullHeader && !Result.Bytes.IsEmpty()
+            && SkiPreparation::ValidateContentRange(Result.ContentRange,
+                {0, static_cast<uint64>(Result.Bytes.Num())}, Result.Bytes.Num(), ParsedSize)
+            && ParsedSize == static_cast<uint64>(Result.Bytes.Num());
+        if ((!bFullHeader && !bWholeSmallObject) || ParsedSize > 512ULL * 1024ULL * 1024ULL)
         {
             OutFailure = {};
             OutFailure.Code = TEXT("WORLDCOVER_COG_RANGE_INVALID");
@@ -456,6 +564,7 @@ public:
             return false;
         }
         TotalSize = ParsedSize;
+        CachedBytes = static_cast<uint64>(Result.Bytes.Num());
         Cache.Add(0, MoveTemp(Result.Bytes));
         CacheOrder.Add(0);
         return true;
@@ -543,15 +652,36 @@ private:
     TArray<uint64> CacheOrder;
 };
 
+/** Native WorldCover grid window: whole source pixels on the global lattice. */
+struct CoverGridWindow
+{
+    SkiDomain::GeographicBounds OuterBounds;
+    double StepDeg = 0.0;
+    uint32 Width = 0;
+    uint32 Height = 0;
+    FString SourceTiles;
+};
+
 bool AcquireWorldCover(SkiPreparation::IAcquisitionTransport& Transport,
     const SkiDomain::GeographicBounds& Bounds, const SkiPreparation::Request& PreparationRequest,
     const TSharedRef<SkiPreparation::Cancellation>& Cancellation, const double OperationBegan,
     const SkiPreparation::RetryPolicy& Policy,
     const TFunction<void(const SkiPreparation::HttpAcquisitionRequest&, int32, int32)>& BeforeAttempt,
-    TArray<uint8>& OutCover, TArray<uint8>& OutValidity,
-    uint32& OutWidth, uint32& OutHeight, FString& OutError,
-    SkiPreparation::ProviderFailure& OutFailure)
+    TArray<uint8>& OutCover, TArray<uint8>& OutValidity, CoverGridWindow& OutGrid,
+    FString& OutError, SkiPreparation::ProviderFailure& OutFailure)
 {
+    const auto Fail = [&](const TCHAR* Code, const FString& Summary,
+        const SkiPreparation::RetryClassification Retry)
+    {
+        OutError = Summary;
+        OutFailure = {};
+        OutFailure.Code = Code;
+        OutFailure.Stage = SkiPreparation::FailureStage::Derivation;
+        OutFailure.Product = SkiPreparation::ProviderProduct::WorldCover;
+        OutFailure.Retry = Retry;
+        OutFailure.Summary = Summary;
+        return false;
+    };
     const int32 MinWest = FMath::FloorToInt(Bounds.WestDeg / 3.0) * 3;
     const int32 MaxWest = FMath::FloorToInt((Bounds.EastDeg - 1.0e-10) / 3.0) * 3;
     const int32 MinSouth = FMath::FloorToInt(Bounds.SouthDeg / 3.0) * 3;
@@ -559,21 +689,26 @@ bool AcquireWorldCover(SkiPreparation::IAcquisitionTransport& Transport,
     const int32 TileCount = ((MaxWest - MinWest) / 3 + 1) * ((MaxSouth - MinSouth) / 3 + 1);
     int32 TileIndex = 0;
     TArray<SkiPreparation::DecodedCoverWindow> Tiles;
+    TArray<FString> Names;
     for (int32 South = MinSouth; South <= MaxSouth; South += 3)
     {
         for (int32 West = MinWest; West <= MaxWest; West += 3)
         {
             ++TileIndex;
             const FString Name = WorldCoverTileName(South, West);
+            Names.Add(Name);
             const FString Url = FString::Printf(TEXT("https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/ESA_WorldCover_10m_2021_v200_%s_Map.tif"), *Name);
             FHttpCogSource Source(Transport, Url, PreparationRequest, Cancellation, OperationBegan,
                 Policy, TileIndex, TileCount, BeforeAttempt);
             if (!Source.Initialize(OutFailure)) { OutError = OutFailure.Summary; return false; }
+            // Request the footprint expanded by one source pixel so every lattice cell that
+            // touches the terrain is decoded, not only those whose centres fall inside it.
+            constexpr double Margin = 2.0 / 12000.0;
             SkiDomain::GeographicBounds Intersection{
-                FMath::Max(Bounds.WestDeg, static_cast<double>(West)),
-                FMath::Max(Bounds.SouthDeg, static_cast<double>(South)),
-                FMath::Min(Bounds.EastDeg, static_cast<double>(West + 3)),
-                FMath::Min(Bounds.NorthDeg, static_cast<double>(South + 3))};
+                FMath::Max(Bounds.WestDeg - Margin, static_cast<double>(West)),
+                FMath::Max(Bounds.SouthDeg - Margin, static_cast<double>(South)),
+                FMath::Min(Bounds.EastDeg + Margin, static_cast<double>(West + 3)),
+                FMath::Min(Bounds.NorthDeg + Margin, static_cast<double>(South + 3))};
             SkiPreparation::DecodedCoverWindow Window;
             bool bDecoded = false;
             const bool bDecodeJobRan = SkiPreparation::ExecuteBoundedDecodeJob(Cancellation,
@@ -592,76 +727,69 @@ bool AcquireWorldCover(SkiPreparation::IAcquisitionTransport& Transport,
             Tiles.Add(MoveTemp(Window));
         }
     }
-    const double CenterLat = (Bounds.SouthDeg + Bounds.NorthDeg) * 0.5;
-    const double WidthM = (Bounds.EastDeg - Bounds.WestDeg) * 111320.0 * std::cos(FMath::DegreesToRadians(CenterLat));
-    const double HeightM = (Bounds.NorthDeg - Bounds.SouthDeg) * 111320.0;
-    OutWidth = FMath::Clamp(FMath::RoundToInt(WidthM / 10.0), 2, 1200);
-    OutHeight = FMath::Clamp(FMath::RoundToInt(HeightM / 10.0), 2, 1200);
-    OutCover.Init(0, static_cast<int32>(static_cast<uint64>(OutWidth) * OutHeight));
+    // Every tile must share one global lattice; mixed scales cannot be mosaicked honestly.
+    const double Step = Tiles[0].LongitudeSpacingDeg;
+    for (const SkiPreparation::DecodedCoverWindow& Tile : Tiles)
+    {
+        if (Step <= 0.0 || FMath::Abs(Tile.LongitudeSpacingDeg - Step) > Step * 1.0e-9
+            || FMath::Abs(Tile.LatitudeSpacingDeg - Step) > Step * 1.0e-9)
+            return Fail(TEXT("WORLDCOVER_GRID_MISMATCH"),
+                TEXT("WorldCover tiles do not share one native lattice."),
+                SkiPreparation::RetryClassification::NotRetryable);
+    }
+    // Round outward so the window always contains the footprint; an edge already on the
+    // lattice may gain one extra (still decoded) cell, never lose coverage.
+    const int64 FirstColumn = static_cast<int64>(FMath::FloorToDouble(Bounds.WestDeg / Step - 1.0e-9));
+    const int64 EndColumn = static_cast<int64>(FMath::CeilToDouble(Bounds.EastDeg / Step + 1.0e-9));
+    const int64 FirstRow = static_cast<int64>(FMath::FloorToDouble(-Bounds.NorthDeg / Step - 1.0e-9));
+    const int64 EndRow = static_cast<int64>(FMath::CeilToDouble(-Bounds.SouthDeg / Step + 1.0e-9));
+    const int64 Width = EndColumn - FirstColumn;
+    const int64 Height = EndRow - FirstRow;
+    if (Width < 2 || Height < 2 || Width * Height > 16000000)
+        return Fail(TEXT("WORLDCOVER_WINDOW_INVALID"), TEXT("WorldCover native window is empty or exceeds the cover cell limit."),
+            SkiPreparation::RetryClassification::ChangeSelection);
+    OutGrid.StepDeg = Step;
+    OutGrid.Width = static_cast<uint32>(Width);
+    OutGrid.Height = static_cast<uint32>(Height);
+    OutGrid.OuterBounds = {FirstColumn * Step, -EndRow * Step, EndColumn * Step, -FirstRow * Step};
+    OutGrid.SourceTiles = FString::Join(Names, TEXT(","));
+    OutCover.Init(0, static_cast<int32>(Width * Height));
     OutValidity.Init(0, OutCover.Num());
-    for (uint32 Row = 0; Row < OutHeight; ++Row)
+    int64 MissingInFootprint = 0;
+    for (int64 Row = 0; Row < Height; ++Row)
     {
         if (!OperationCurrent(PreparationRequest, Cancellation))
+            return Fail(TEXT("PREPARATION_CANCELLED"), TEXT("WorldCover derivation cancelled."),
+                SkiPreparation::RetryClassification::Retryable);
+        const double Latitude = -(FirstRow + Row + 0.5) * Step;
+        for (int64 Column = 0; Column < Width; ++Column)
         {
-            OutError = TEXT("WorldCover derivation cancelled.");
-            OutFailure = {};
-            OutFailure.Code = TEXT("PREPARATION_CANCELLED");
-            OutFailure.Stage = SkiPreparation::FailureStage::Derivation;
-            OutFailure.Product = SkiPreparation::ProviderProduct::WorldCover;
-            OutFailure.Retry = SkiPreparation::RetryClassification::Retryable;
-            OutFailure.Summary = OutError;
-            return false;
-        }
-        const double Latitude = Bounds.NorthDeg - (static_cast<double>(Row) + 0.5) / OutHeight
-            * (Bounds.NorthDeg - Bounds.SouthDeg);
-        for (uint32 Column = 0; Column < OutWidth; ++Column)
-        {
-            const double Longitude = Bounds.WestDeg + (static_cast<double>(Column) + 0.5) / OutWidth
-                * (Bounds.EastDeg - Bounds.WestDeg);
-            const SkiPreparation::DecodedCoverWindow* Tile = Tiles.FindByPredicate(
-                [&](const SkiPreparation::DecodedCoverWindow& Value)
-                {
-                    return Longitude >= Value.ActualOuterBounds.WestDeg
-                        && Longitude <= Value.ActualOuterBounds.EastDeg
-                        && Latitude >= Value.ActualOuterBounds.SouthDeg
-                        && Latitude <= Value.ActualOuterBounds.NorthDeg;
-                });
-            if (!Tile) continue;
-            const int32 PX = FMath::Clamp(FMath::RoundToInt((Longitude
-                - Tile->SampleCenterBounds.WestDeg) / Tile->LongitudeSpacingDeg), 0,
-                static_cast<int32>(Tile->Width) - 1);
-            const int32 PY = FMath::Clamp(FMath::RoundToInt((Tile->SampleCenterBounds.NorthDeg
-                - Latitude) / Tile->LatitudeSpacingDeg), 0, static_cast<int32>(Tile->Height) - 1);
-            const int32 SourceIndex = PY * Tile->Width + PX;
-            const int32 OutputIndex = Row * OutWidth + Column;
-            if (Tile->Validity[SourceIndex])
+            const double Longitude = (FirstColumn + Column + 0.5) * Step;
+            const int32 OutputIndex = static_cast<int32>(Row * Width + Column);
+            for (const SkiPreparation::DecodedCoverWindow& Tile : Tiles)
             {
-                OutCover[OutputIndex] = Tile->Classes[SourceIndex];
-                OutValidity[OutputIndex] = 1;
+                // Exact lattice mapping: the output cell centre is a source pixel centre.
+                const int64 PX = FMath::RoundToInt64((Longitude - Tile.SampleCenterBounds.WestDeg) / Step);
+                const int64 PY = FMath::RoundToInt64((Tile.SampleCenterBounds.NorthDeg - Latitude) / Step);
+                if (PX < 0 || PY < 0 || PX >= Tile.Width || PY >= Tile.Height) continue;
+                const int32 SourceIndex = static_cast<int32>(PY * Tile.Width + PX);
+                if (Tile.Validity[SourceIndex])
+                {
+                    OutCover[OutputIndex] = Tile.Classes[SourceIndex];
+                    OutValidity[OutputIndex] = 1;
+                }
+                break;
             }
+            if (!OutValidity[OutputIndex]) ++MissingInFootprint;
         }
     }
-    if (OutValidity.Contains(0))
-    {
-        OutError = TEXT("WorldCover contains missing cells.");
-        OutFailure = {};
-        OutFailure.Code = TEXT("WORLDCOVER_INCOMPLETE");
-        OutFailure.Stage = SkiPreparation::FailureStage::Derivation;
-        OutFailure.Product = SkiPreparation::ProviderProduct::WorldCover;
-        OutFailure.Retry = SkiPreparation::RetryClassification::Retryable;
-        OutFailure.Summary = OutError;
-        return false;
-    }
+    if (MissingInFootprint > 0)
+        return Fail(TEXT("WORLDCOVER_NODATA_IN_FOOTPRINT"), FString::Printf(
+            TEXT("WorldCover has %lld nodata or missing cells inside the selected terrain."), MissingInFootprint),
+            SkiPreparation::RetryClassification::ChangeSelection);
     return true;
 }
 
-TArray<uint8> FloatBytes(const SkiDomain::Heightfield& Field)
-{
-    TArray<uint8> Bytes;
-    Bytes.Append(reinterpret_cast<const uint8*>(Field.Samples.data()),
-        static_cast<int32>(Field.Samples.size() * sizeof(float)));
-    return Bytes;
-}
 }
 
 void SkiPreparation::InitializePreparationDiagnostics(const FString& DataRoot)
@@ -701,11 +829,33 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
     };
     auto FinishFailure = [&](ProviderFailure Failure)
     {
-        if (!OperationCurrent(RequestValue, CancellationValue)) Output.FinalState = State::Cancelled;
+        if (!OperationCurrent(RequestValue, CancellationValue))
+        {
+            // Whatever stage observed it, a failure caused by cancellation reports as one.
+            Output.FinalState = State::Cancelled;
+            Failure.Code = TEXT("PREPARATION_CANCELLED");
+            Failure.Retry = RetryClassification::Retryable;
+            if (Failure.Summary.IsEmpty())
+                Failure.Summary = TEXT("Preparation was cancelled or superseded before activation.");
+        }
         Output.Error = Failure.Summary;
         WriteFailureDiagnostic(DataRoot, RequestValue, Failure);
         AppendPreparationEvent(DataRoot, &RequestValue, TEXT("FAILURE"), Output.FinalState,
             Failure.Product, &Failure);
+        Output.Failure = std::move(Failure);
+    };
+    auto FinishCancelled = [&]()
+    {
+        ProviderFailure Failure;
+        Failure.Code = TEXT("PREPARATION_CANCELLED");
+        Failure.Stage = FailureStage::Validation;
+        Failure.Product = ActiveProduct;
+        Failure.Retry = RetryClassification::Retryable;
+        Failure.Summary = TEXT("Preparation was cancelled or superseded before activation.");
+        Output.FinalState = State::Cancelled;
+        Output.Error = Failure.Summary;
+        AppendPreparationEvent(DataRoot, &RequestValue, TEXT("CANCELLED"), State::Cancelled,
+            ActiveProduct, &Failure);
         Output.Failure = std::move(Failure);
     };
     auto BeforeAttempt = [&](const HttpAcquisitionRequest& Attempt, const int32 TileIndex, const int32 TileCount)
@@ -731,7 +881,7 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
         FinishFailure(std::move(Failure));
         return Output;
     }
-    if (!OperationCurrent(RequestValue, CancellationValue)) return Output;
+    if (!OperationCurrent(RequestValue, CancellationValue)) { FinishCancelled(); return Output; }
     ActiveProduct = ProviderProduct::CoreElevation;
     Report(State::Acquiring, 1, TEXT("Downloading USGS 3DEP core elevation"));
     DecodedElevationRaster CoreRaster;
@@ -743,6 +893,27 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
         FinishFailure(std::move(DecodeFailure));
         return Output;
     }
+    ElevationSourceMetadata SourceMetadata;
+    {
+        const double CenterLatitude = (CoreRaster.ActualOuterBounds.SouthDeg + CoreRaster.ActualOuterBounds.NorthDeg) * 0.5;
+        const double PixelDegrees = FMath::Max(1.0e-6,
+            (CoreRaster.ActualOuterBounds.NorthDeg - CoreRaster.ActualOuterBounds.SouthDeg)
+            / FMath::Max<uint32>(1U, CoreRaster.Heightfield.Height));
+        HttpAcquisitionRequest MetadataRequest;
+        MetadataRequest.Url = ElevationSamplesUrl(CoreRaster.ActualOuterBounds, PixelDegrees);
+        MetadataRequest.Product = ProviderProduct::CoreElevation;
+        MetadataRequest.ActivityTimeoutSeconds = Policy.ActivityTimeoutSeconds;
+        MetadataRequest.TotalTimeoutSeconds = Policy.TotalTimeoutSeconds;
+        MetadataRequest.MaximumResponseBytes = 256ULL * 1024ULL;
+        HttpAcquisitionResult MetadataResult;
+        ProviderFailure MetadataFailure;
+        if (DownloadWithRetry(*Transport, MetadataRequest, Policy, RequestValue, CancellationValue,
+                Began, 1, 1, BeforeAttempt, MetadataResult, MetadataFailure))
+            ParseElevationSourceMetadata(MetadataResult.Bytes, CenterLatitude, SourceMetadata);
+        if (!SourceMetadata.bQueried)
+            Output.Warnings.Add(TEXT("USGS did not report source products for this area; native spacing and datum are labelled not reported."));
+    }
+    if (!OperationCurrent(RequestValue, CancellationValue)) { FinishCancelled(); return Output; }
     const SkiDomain::GeographicBounds SurroundRequested = Expand(RequestValue.Bounds, 3000.0);
     ActiveProduct = ProviderProduct::SurroundingElevation;
     Report(State::Acquiring, 2, TEXT("Downloading required USGS surrounding elevation"));
@@ -763,21 +934,23 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
     Report(State::Acquiring, 4, TEXT("Downloading required ESA WorldCover tiles"));
     TArray<uint8> Cover;
     TArray<uint8> CoverValidity;
-    uint32 CoverWidth = 0, CoverHeight = 0;
+    CoverGridWindow CoverGrid;
     ProviderFailure CoverFailure;
     if (!AcquireWorldCover(*Transport, ActualBounds, RequestValue, CancellationValue, Began,
-            Policy, BeforeAttempt, Cover, CoverValidity, CoverWidth, CoverHeight, Output.Error, CoverFailure))
+            Policy, BeforeAttempt, Cover, CoverValidity, CoverGrid, Output.Error, CoverFailure))
     {
         if (Output.Error.IsEmpty()) Output.Error = TEXT("WorldCover contains missing cells.");
         if (CoverFailure.Summary.IsEmpty()) CoverFailure.Summary = Output.Error;
         FinishFailure(std::move(CoverFailure));
         return Output;
     }
+    const uint32 CoverWidth = CoverGrid.Width;
+    const uint32 CoverHeight = CoverGrid.Height;
     ActiveProduct = ProviderProduct::None;
-    if (!OperationCurrent(RequestValue, CancellationValue)) return Output;
-    Report(State::Deriving, 5, TEXT("Deriving compact cover and contour products"));
-    Output.Warnings.Add(TEXT("Optional NAIP imagery was not installed."));
-    Output.Warnings.Add(TEXT("Optional Overpass vector context was not installed."));
+    if (!OperationCurrent(RequestValue, CancellationValue)) { FinishCancelled(); return Output; }
+    Report(State::Deriving, 5, TEXT("Preparing TerrainCore and native-grid analytical cover"));
+    Output.Warnings.Add(TEXT("Optional NAIP imagery was not requested for Medium."));
+    Output.Warnings.Add(TEXT("Optional Overpass vector context was not requested for Medium."));
     SkiDomain::TerrainManifest Manifest;
     Manifest.Name = TCHAR_TO_UTF8(*RequestValue.Name);
     Manifest.Source = "USGS 3DEP; ESA WorldCover 2021 v200";
@@ -787,10 +960,14 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
     Manifest.LocalOrigin = {(ActualBounds.SouthDeg + ActualBounds.NorthDeg) * 0.5,
         (ActualBounds.WestDeg + ActualBounds.EastDeg) * 0.5,
         Core.Samples[static_cast<size_t>(Core.Height / 2) * Core.Width + Core.Width / 2]};
-    Manifest.VerticalDatum = "unknown";
+    Manifest.VerticalDatum = TCHAR_TO_UTF8(*SourceMetadata.VerticalDatum);
+    Manifest.HeightWidth = Core.Width;
+    Manifest.HeightHeight = Core.Height;
+    Manifest.EastSpacingM = Core.EastSpacingM;
+    Manifest.NorthSpacingM = Core.NorthSpacingM;
     Manifest.CoverWidth = CoverWidth;
     Manifest.CoverHeight = CoverHeight;
-    if (!OperationCurrent(RequestValue, CancellationValue)) return Output;
+    if (!OperationCurrent(RequestValue, CancellationValue)) { FinishCancelled(); return Output; }
     Report(State::WritingStaging, 6, TEXT("Writing TerrainCore and analytical CoverEcology staging"));
 
     SkiDomain::TerrainCoreManifest TerrainCore;
@@ -808,20 +985,40 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
         TerrainCore.DeliveredEastSpacingM, TerrainCore.DeliveredNorthSpacingM,
         TerrainCore.SampleCenterBounds, TerrainCore.OuterBounds);
     TerrainCore.Source.SourceId = "usgs-3dep-export";
-    TerrainCore.Source.Product = "USGS 3DEP dynamic export (Medium)";
-    TerrainCore.Source.AcquisitionEpoch = Manifest.RequestedAtUtc;
+    TerrainCore.Source.Product = TCHAR_TO_UTF8(*FString::Printf(
+        TEXT("USGS 3DEP dynamic export (Medium), bilinear from: %s"), *SourceMetadata.Products).Left(250));
+    TerrainCore.Source.AcquisitionEpoch = TCHAR_TO_UTF8(*SourceMetadata.AcquisitionEpoch);
     TerrainCore.Source.HorizontalCrs = "EPSG:4326/WGS84 to local ENU";
     TerrainCore.Source.HorizontalDatum = "WGS84";
     TerrainCore.Source.VerticalDatum = Manifest.VerticalDatum;
     TerrainCore.Source.License = "USGS public domain";
     TerrainCore.Source.Attribution = "USGS 3D Elevation Program";
-    TerrainCore.Source.NativeSpacingReported = false;
-    TerrainCore.Source.NativeEastSpacingM = 0.0;
-    TerrainCore.Source.NativeNorthSpacingM = 0.0;
-    SkiDomain::TerrainCoreSource SurroundSource = TerrainCore.Source;
-    SurroundSource.SourceId = "usgs-3dep-surround";
-    SurroundSource.Product = "USGS 3DEP required surrounding elevation";
-    TerrainCore.AdditionalSources.push_back(std::move(SurroundSource));
+    // Native spacing is claimed only when every sampled location reports one source resolution.
+    TerrainCore.Source.NativeSpacingReported = SourceMetadata.bNativeSpacingUniform;
+    TerrainCore.Source.NativeEastSpacingM = SourceMetadata.bNativeSpacingUniform ? SourceMetadata.NativeEastSpacingM : 0.0;
+    TerrainCore.Source.NativeNorthSpacingM = SourceMetadata.bNativeSpacingUniform ? SourceMetadata.NativeNorthSpacingM : 0.0;
+
+    // Required surround: its own TerrainCore, placed in the core's local frame.
+    SkiDomain::TerrainCoreManifest SurroundCore = TerrainCore;
+    {
+        const double OriginLatitude = Manifest.LocalOrigin.LatitudeDeg;
+        const double Cosine = std::cos(FMath::DegreesToRadians(OriginLatitude));
+        const double SurroundCenterLon = (SurroundRaster.ActualOuterBounds.WestDeg + SurroundRaster.ActualOuterBounds.EastDeg) * 0.5;
+        const double SurroundCenterLat = (SurroundRaster.ActualOuterBounds.SouthDeg + SurroundRaster.ActualOuterBounds.NorthDeg) * 0.5;
+        Surround.WestM += (SurroundCenterLon - Manifest.LocalOrigin.LongitudeDeg) * 111320.0 * Cosine;
+        Surround.NorthM += (SurroundCenterLat - OriginLatitude) * 111320.0;
+    }
+    SurroundCore.Width = Surround.Width;
+    SurroundCore.Height = Surround.Height;
+    SurroundCore.DeliveredEastSpacingM = Surround.EastSpacingM;
+    SurroundCore.DeliveredNorthSpacingM = Surround.NorthSpacingM;
+    SurroundCore.SampleCenterBounds = {Surround.WestM, Surround.SampleNorthM(Surround.Height - 1U),
+        Surround.EastM(Surround.Width - 1U), Surround.NorthM};
+    SkiDomain::ComputeTerrainCoreBounds(SurroundCore.Width, SurroundCore.Height,
+        SurroundCore.DeliveredEastSpacingM, SurroundCore.DeliveredNorthSpacingM,
+        SurroundCore.SampleCenterBounds, SurroundCore.OuterBounds);
+    SurroundCore.Source.SourceId = "usgs-3dep-surround";
+    SurroundCore.Source.Product = "USGS 3DEP required surrounding elevation (Standard export)";
 
     TerrainCorePackageStore CoreStore(DataRoot);
     FString CoreDirectory;
@@ -837,21 +1034,39 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
         return Output;
     }
 
+    TerrainCorePackageStore SurroundStore(DataRoot);
+    FString SurroundDirectory;
+    if (!SurroundStore.WriteAndActivate(SurroundCore, Surround, SurroundDirectory,
+            Output.SurroundTerrainCoreManifest, Output.Error, RequestValue.Lease,
+            RequestValue.SessionGeneration, RequestValue.OperationGeneration))
+    {
+        if (!OperationCurrent(RequestValue, CancellationValue)) { FinishCancelled(); return Output; }
+        ProviderFailure Failure;
+        Failure.Code = TEXT("SURROUND_WRITE_FAILED");
+        Failure.Stage = FailureStage::Writing;
+        Failure.Product = ProviderProduct::SurroundingElevation;
+        Failure.Summary = Output.Error;
+        FinishFailure(std::move(Failure));
+        return Output;
+    }
+
     SkiDomain::CoverEcologyManifest Ecology;
     Ecology.GeneratorVersion = "mountain-planner-cover-ecology-v1";
     Ecology.CoverRevision = 1;
+    // The cover is an unresampled window of whole source pixels on WorldCover's global lattice.
     Ecology.Source = {"esa-worldcover-2021-v200", "ESA WorldCover analytical class COG",
-        "2021", "official-class-value-cog", "CC BY 4.0",
+        "2021", TCHAR_TO_UTF8(*FString::Printf(TEXT("official-class-value-cog-native-grid-window:%s"),
+            *CoverGrid.SourceTiles).Left(250)), "CC BY 4.0",
         "ESA WorldCover project / Contains modified Copernicus Sentinel data (2021)"};
     Ecology.Transform.Width = CoverWidth;
     Ecology.Transform.Height = CoverHeight;
-    Ecology.Transform.LongitudeStepDeg = (ActualBounds.EastDeg - ActualBounds.WestDeg) / CoverWidth;
-    Ecology.Transform.LatitudeStepDeg = (ActualBounds.NorthDeg - ActualBounds.SouthDeg) / CoverHeight;
+    Ecology.Transform.LongitudeStepDeg = CoverGrid.StepDeg;
+    Ecology.Transform.LatitudeStepDeg = CoverGrid.StepDeg;
     Ecology.Transform.SampleCenterBounds = {
-        ActualBounds.WestDeg + Ecology.Transform.LongitudeStepDeg * 0.5,
-        ActualBounds.SouthDeg + Ecology.Transform.LatitudeStepDeg * 0.5,
-        ActualBounds.EastDeg - Ecology.Transform.LongitudeStepDeg * 0.5,
-        ActualBounds.NorthDeg - Ecology.Transform.LatitudeStepDeg * 0.5};
+        CoverGrid.OuterBounds.WestDeg + CoverGrid.StepDeg * 0.5,
+        CoverGrid.OuterBounds.SouthDeg + CoverGrid.StepDeg * 0.5,
+        CoverGrid.OuterBounds.EastDeg - CoverGrid.StepDeg * 0.5,
+        CoverGrid.OuterBounds.NorthDeg - CoverGrid.StepDeg * 0.5};
     SkiDomain::ComputeCoverEcologyOuterBounds(CoverWidth, CoverHeight,
         Ecology.Transform.LongitudeStepDeg, Ecology.Transform.LatitudeStepDeg,
         Ecology.Transform.SampleCenterBounds, Ecology.Transform.OuterBounds);
@@ -876,12 +1091,17 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
     SkiDomain::InstalledTerrainReceipt Installation;
     Installation.GeneratorVersion = "mountain-planner-installed-terrain-v1";
     Installation.TerrainCoreId = Output.TerrainCoreManifest.ContentId;
+    Installation.SurroundTerrainCoreId = Output.SurroundTerrainCoreManifest.ContentId;
     Installation.CoverEcologyId = Output.CoverEcologyManifest.ContentId;
+    // NAIP is not requested by the Medium tier; recording it as unavailable would be a false
+    // acquisition claim.
     Installation.OptionalSources = {
-        {"naip", "USDA NAIP RGB+NIR", SkiDomain::OptionalSourceStatus::Unavailable, {},
-            "NO_COMPLETE_COVERAGE_OR_NOT_RETURNED", "USGS public domain", "USDA/USGS"},
+        {"naip", "USDA NAIP RGB+NIR", SkiDomain::OptionalSourceStatus::NotRequested, {},
+            "NOT_REQUESTED_IN_P1_MEDIUM", "USGS public domain", "USDA/USGS"},
         {"overpass", "OpenStreetMap vector context", SkiDomain::OptionalSourceStatus::NotRequested, {},
             "NOT_REQUESTED_IN_P1_MEDIUM", "ODbL 1.0", "OpenStreetMap contributors"}};
+    if (!OperationCurrent(RequestValue, CancellationValue)) { FinishCancelled(); return Output; }
+    Report(State::Activating, 7, TEXT("Activating the composite installation"));
     InstalledTerrainStore InstallationStore(DataRoot);
     if (!InstallationStore.WriteAndActivate(Installation, Output.PackageDirectory,
             Output.InstallationReceipt, Output.Error, RequestValue.Lease,
@@ -894,7 +1114,8 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
         FinishFailure(std::move(Failure));
         return Output;
     }
-    if (!OperationCurrent(RequestValue, CancellationValue)) return Output;
+    if (!OperationCurrent(RequestValue, CancellationValue))
+        Output.Warnings.Add(TEXT("Cancellation arrived after the composite installation was committed; the installation stands."));
     Report(State::Verifying, 7, TEXT("Reopening TerrainCore, CoverEcology, and composite installation"));
     TerrainCorePackageIndex CoreIndex;
     CoverEcologyPackageIndex EcologyIndex;
@@ -912,6 +1133,7 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
     }
     Output.Manifest = MoveTemp(Manifest);
     Output.Heightfield = MoveTemp(Core);
+    Output.SurroundHeightfield = MoveTemp(Surround);
     Output.Cover = MoveTemp(Cover);
     Output.CoverValidity = MoveTemp(CoverValidity);
     Output.HasNativeV2Installation = true;

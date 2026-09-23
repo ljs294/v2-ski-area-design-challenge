@@ -126,10 +126,51 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
     TerrainCore.Source.Attribution = "Mountain Planner deterministic fixture";
     TerrainCore.Source.NativeEastSpacingM = Field.EastSpacingM;
     TerrainCore.Source.NativeNorthSpacingM = Field.NorthSpacingM;
-    SkiDomain::TerrainCoreSource Surrounding = TerrainCore.Source;
-    Surrounding.SourceId = "synthetic-p1-fixture-surrounding";
-    Surrounding.Product = "Deterministic synthetic surrounding elevation";
-    TerrainCore.AdditionalSources.push_back(std::move(Surrounding));
+
+    // Required surround: a coarse synthetic ring 3 km beyond the selection, installed as its
+    // own TerrainCore in the same local frame as the core.
+    constexpr uint32 SurroundDimension = 129U;
+    constexpr double SurroundMarginM = 3000.0;
+    SkiDomain::Heightfield Surround;
+    Surround.Width = SurroundDimension;
+    Surround.Height = SurroundDimension;
+    Surround.WestM = Field.WestM - SurroundMarginM;
+    Surround.NorthM = Field.NorthM + SurroundMarginM;
+    Surround.EastSpacingM = (WidthM + 2.0 * SurroundMarginM) / (SurroundDimension - 1);
+    Surround.NorthSpacingM = (HeightM + 2.0 * SurroundMarginM) / (SurroundDimension - 1);
+    Surround.CurrentRevision = 1;
+    Surround.Samples.resize(static_cast<size_t>(SurroundDimension) * SurroundDimension);
+    for (uint32 Row = 0; Row < SurroundDimension; ++Row)
+    {
+        for (uint32 Column = 0; Column < SurroundDimension; ++Column)
+        {
+            const double East = Surround.WestM + Column * Surround.EastSpacingM;
+            const double North = Surround.NorthM - Row * Surround.NorthSpacingM;
+            const double X = East / (WidthM * 0.5);
+            const double Y = -North / (HeightM * 0.5);
+            Surround.Samples[static_cast<size_t>(Row) * SurroundDimension + Column] = static_cast<float>(
+                1450.0 + 420.0 * (1.0 - FMath::Clamp(Y, -1.8, 1.8)) + 140.0 * std::sin(4.0 * X + 0.7 * Y)
+                + 60.0 * std::cos(7.0 * Y - X));
+        }
+    }
+    SkiDomain::TerrainCoreManifest SurroundCore = TerrainCore;
+    SurroundCore.Width = Surround.Width;
+    SurroundCore.Height = Surround.Height;
+    SurroundCore.DeliveredEastSpacingM = Surround.EastSpacingM;
+    SurroundCore.DeliveredNorthSpacingM = Surround.NorthSpacingM;
+    SurroundCore.SampleCenterBounds = {Surround.WestM,
+        Surround.SampleNorthM(Surround.Height - 1U), Surround.EastM(Surround.Width - 1U), Surround.NorthM};
+    SurroundCore.Source.SourceId = "synthetic-p1-fixture-surround";
+    SurroundCore.Source.Product = "Deterministic synthetic surrounding elevation";
+    SurroundCore.Source.NativeEastSpacingM = Surround.EastSpacingM;
+    SurroundCore.Source.NativeNorthSpacingM = Surround.NorthSpacingM;
+    if (!SkiDomain::ComputeTerrainCoreBounds(SurroundCore.Width, SurroundCore.Height,
+            SurroundCore.DeliveredEastSpacingM, SurroundCore.DeliveredNorthSpacingM,
+            SurroundCore.SampleCenterBounds, SurroundCore.OuterBounds))
+    {
+        Output.Error = TEXT("Fixture surround bounds are invalid.");
+        return Output;
+    }
 
     Report(State::WritingStaging, 2, 6,
         TEXT("Writing fixture TerrainCore and CoverEcology staging"));
@@ -143,6 +184,15 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
     SkiDomain::TerrainCoreManifest InstalledCore;
     if (!CoreStore.WriteAndActivate(TerrainCore, Field, CoreDirectory,
             InstalledCore, Output.Error, RequestValue.Lease,
+            RequestValue.SessionGeneration, RequestValue.OperationGeneration))
+    {
+        if (!OperationCurrent()) Cancel();
+        return Output;
+    }
+    FString SurroundDirectory;
+    SkiDomain::TerrainCoreManifest InstalledSurround;
+    if (!CoreStore.WriteAndActivate(SurroundCore, Surround, SurroundDirectory,
+            InstalledSurround, Output.Error, RequestValue.Lease,
             RequestValue.SessionGeneration, RequestValue.OperationGeneration))
     {
         if (!OperationCurrent()) Cancel();
@@ -164,14 +214,10 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
     Ecology.Transform.Width = Dimension;
     Ecology.Transform.Height = Dimension;
     Ecology.Transform.LongitudeStepDeg =
-        (RequestValue.Bounds.EastDeg - RequestValue.Bounds.WestDeg) / Dimension;
+        (RequestValue.Bounds.EastDeg - RequestValue.Bounds.WestDeg) / (Dimension - 1);
     Ecology.Transform.LatitudeStepDeg =
-        (RequestValue.Bounds.NorthDeg - RequestValue.Bounds.SouthDeg) / Dimension;
-    Ecology.Transform.SampleCenterBounds = {
-        RequestValue.Bounds.WestDeg + Ecology.Transform.LongitudeStepDeg * 0.5,
-        RequestValue.Bounds.SouthDeg + Ecology.Transform.LatitudeStepDeg * 0.5,
-        RequestValue.Bounds.EastDeg - Ecology.Transform.LongitudeStepDeg * 0.5,
-        RequestValue.Bounds.NorthDeg - Ecology.Transform.LatitudeStepDeg * 0.5};
+        (RequestValue.Bounds.NorthDeg - RequestValue.Bounds.SouthDeg) / (Dimension - 1);
+    Ecology.Transform.SampleCenterBounds = RequestValue.Bounds;
     if (!SkiDomain::ComputeCoverEcologyOuterBounds(Dimension, Dimension,
             Ecology.Transform.LongitudeStepDeg, Ecology.Transform.LatitudeStepDeg,
             Ecology.Transform.SampleCenterBounds, Ecology.Transform.OuterBounds))
@@ -202,6 +248,7 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
     SkiDomain::InstalledTerrainReceipt Installation;
     Installation.GeneratorVersion = "mountain-planner-installed-terrain-v1";
     Installation.TerrainCoreId = InstalledCore.ContentId;
+    Installation.SurroundTerrainCoreId = InstalledSurround.ContentId;
     Installation.CoverEcologyId = InstalledEcology.ContentId;
     Installation.OptionalSources = {
         {"naip", "USDA NAIP RGB+NIR", SkiDomain::OptionalSourceStatus::NotRequested, {},
@@ -255,9 +302,9 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
         return Output;
     }
 
-    // Runtime compatibility metadata is never written as a schema-1 package. It
-    // names the independently verified native components so legacy in-memory
-    // consumers can retain their existing bounds/dimension contract.
+    // Runtime compatibility metadata is never written as a schema-1 package. The two entries
+    // are in-memory references to the verified native component IDs (no files are implied);
+    // the legacy in-memory session validator requires them.
     Manifest.ContentId = InstalledReceipt.ContentId;
     Manifest.Assets = {
         {"native/terraincore.ref", "terraincore-v2-content-id", InstalledCore.ContentId,
@@ -272,6 +319,8 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
         Output.Cover = MoveTemp(VerifiedCover);
         Output.CoverValidity = MoveTemp(CoverValidity);
         Output.TerrainCoreManifest = MoveTemp(InstalledCore);
+        Output.SurroundTerrainCoreManifest = MoveTemp(InstalledSurround);
+        Output.SurroundHeightfield = MoveTemp(Surround);
         Output.CoverEcologyManifest = MoveTemp(InstalledEcology);
         Output.InstallationReceipt = MoveTemp(InstalledReceipt);
         Output.HasNativeV2Installation = true;

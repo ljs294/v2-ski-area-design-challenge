@@ -16,10 +16,12 @@
 #include "SkiPreparation/TerrainCorePackageStore.h"
 #include "SkiTerrainRuntime/SkiTerrainActor.h"
 #include "Async/Async.h"
+#include "Camera/CameraActor.h"
 #include "Engine/World.h"
 #include "Engine/GameViewportClient.h"
 #include "HighResScreenshot.h"
 #include "GameFramework/PlayerController.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformMisc.h"
 #include "HAL/PlatformProcess.h"
 #include "Misc/CommandLine.h"
@@ -38,6 +40,35 @@
 
 namespace
 {
+bool IsContentId(const FString& Candidate)
+{
+    if (Candidate.Len() != 64) return false;
+    for (const TCHAR Character : Candidate)
+        if (!FChar::IsHexDigit(Character)) return false;
+    return true;
+}
+
+std::shared_ptr<const std::vector<std::uint8_t>> PackCoverValidity(
+    const TArray<uint8>& Validity, const uint32 Width, const uint32 Height)
+{
+    const uint64 Count = static_cast<uint64>(Width) * Height;
+    if (Count == 0 || Count > static_cast<uint64>(MAX_int32)
+        || Validity.Num() != static_cast<int32>(Count)) return {};
+    auto Packed = std::make_shared<std::vector<std::uint8_t>>((Count + 7ULL) / 8ULL, 0);
+    for (uint64 Index = 0; Index < Count; ++Index)
+    {
+        if (Validity[static_cast<int32>(Index)] != 0)
+            (*Packed)[Index >> 3U] |= static_cast<std::uint8_t>(1U << (Index & 7U));
+    }
+    return Packed;
+}
+
+std::shared_ptr<const std::vector<std::uint8_t>> CopyCoverChannel(const TArray<uint8>& Channel)
+{
+    return std::make_shared<const std::vector<std::uint8_t>>(
+        Channel.GetData(), Channel.GetData() + Channel.Num());
+}
+
 class FPackagedScriptedTransport final : public SkiPreparation::IAcquisitionTransport
 {
 public:
@@ -272,21 +303,60 @@ void ASkiBootstrapGameMode::BeginPlay()
             const bool PathValid = NormalReceipt.StartsWith(RootPrefix)
                 && FPaths::GetCleanFilename(ReceiptPath) == Token + TEXT(".receipt.json");
             const bool ClosedBeforeAcceptance = P1Widget && P1Widget->IsSelectorClosed();
+            bool BridgeUnbound = false, CefClosed = false, WindowReleased = false;
+            double CloseMs = 0.0;
+            const bool ProofAvailable = P1Widget
+                && P1Widget->GetSelectorTeardownProof(BridgeUnbound, CefClosed, WindowReleased, CloseMs);
             const int32 BlockedNavigation = P1Widget ? P1Widget->GetBlockedSelectorNavigationCount() : 0;
             const int32 BlockedPopup = P1Widget ? P1Widget->GetBlockedSelectorPopupCount() : 0;
-            const FString Receipt = FString::Printf(TEXT("{\"token\":\"%s\",\"selector\":true,\"profile\":\"%s\",\"closedBeforeAcceptance\":%s,\"blockedNavigation\":%d,\"blockedPopup\":%d}"),
+            const FString Receipt = FString::Printf(TEXT("{\"token\":\"%s\",\"selector\":true,\"profile\":\"%s\",\"closedBeforeAcceptance\":%s,\"blockedNavigation\":%d,\"blockedPopup\":%d,\"popupDelegateProbeDenied\":%s,\"bridgeUnbound\":%s,\"cefBrowserClosed\":%s,\"windowReleased\":%s,\"closeMs\":%.1f}"),
                 *ParsedToken.ToString(EGuidFormats::DigitsWithHyphensLower),
                 Request.Profile == SkiPreparation::SourceProfile::Medium ? TEXT("medium") : TEXT("legacy-standard"),
-                ClosedBeforeAcceptance ? TEXT("true") : TEXT("false"), BlockedNavigation, BlockedPopup);
+                ClosedBeforeAcceptance ? TEXT("true") : TEXT("false"), BlockedNavigation, BlockedPopup,
+                P1Widget && P1Widget->WasSelectorPopupDelegateProbeDenied() ? TEXT("true") : TEXT("false"),
+                ProofAvailable && BridgeUnbound ? TEXT("true") : TEXT("false"),
+                ProofAvailable && CefClosed ? TEXT("true") : TEXT("false"),
+                ProofAvailable && WindowReleased ? TEXT("true") : TEXT("false"), CloseMs);
             const bool Written = ArgumentsValid && PathValid && FFileHelper::SaveStringToFile(Receipt, *ReceiptPath,
                 FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
             FPlatformMisc::RequestExitWithStatus(false, Written ? 0 : 1);
         });
     }
     else P1Widget->SetSelectionHandler([this](const SkiPreparation::Request& Request) { BeginP1Preparation(Request); });
+    P1Widget->SetOpenInstalledHandler([this] { OpenLatestInstalledTerrain(); });
     P1Widget->AddToViewport();
     Controller->bShowMouseCursor = true;
     Controller->SetInputMode(FInputModeUIOnly());
+    FString SelectorDiagnostic;
+    if (FParse::Value(FCommandLine::Get(), TEXT("SkiP1SelectorDiagnostic="), SelectorDiagnostic))
+    {
+        if (SelectorDiagnostic != TEXT("blank") && SelectorDiagnostic != TEXT("no-tiles")
+            && SelectorDiagnostic != TEXT("full"))
+        {
+            FPlatformMisc::RequestExitWithStatus(false, 1);
+            return;
+        }
+        P1Widget->SetSelectionHandler({});
+        P1Widget->OpenSelector();
+        FTimerHandle DiagnosticTimer;
+        GetWorldTimerManager().SetTimer(DiagnosticTimer,
+            FTimerDelegate::CreateLambda([] { FPlatformMisc::RequestExitWithStatus(false, 0); }),
+            5.0F, false);
+        return;
+    }
+    FString InstalledChoice;
+    if (FParse::Value(FCommandLine::Get(), TEXT("SkiP1OpenInstalled="), InstalledChoice))
+    {
+        if (InstalledChoice.Equals(TEXT("latest"), ESearchCase::IgnoreCase))
+            OpenLatestInstalledTerrain();
+        else if (IsContentId(InstalledChoice)) OpenInstalledTerrain(InstalledChoice);
+        else
+        {
+            P1Widget->OpenSelector();
+            P1Widget->SetSelectorStatus(TEXT("Invalid installed terrain ID. Choose bounds or reopen an installed terrain."));
+        }
+    }
+    else P1Widget->OpenSelector();
 }
 
 bool ASkiBootstrapGameMode::BeginP1UiLayoutSmoke()
@@ -310,6 +380,7 @@ bool ASkiBootstrapGameMode::BeginP1UiLayoutSmoke()
     APlayerController* Controller = GetWorld()->GetFirstPlayerController();
     P1Widget = Controller ? CreateWidget<USkiP1Widget>(Controller, USkiP1Widget::StaticClass()) : nullptr;
     if (!P1Widget || !P1Widget->IsP1Ready()) return false;
+    if (UiLayoutState == TEXT("selecting")) P1Widget->OpenSelector();
     if (UiLayoutState == TEXT("preparing"))
     {
         P1Widget->BeginPreparationUI([]{});
@@ -475,12 +546,15 @@ bool ASkiBootstrapGameMode::BeginP1VisualCapture()
     if (!Repository) return false;
     TerrainCoreSession = MakeShared<SkiApplication::TerrainCoreSession>();
     if (!TerrainCoreSession->Install(Repository, 1)) return false;
-    auto RuntimeCover = std::make_shared<const std::vector<std::uint8_t>>(
-        Result.Cover.GetData(), Result.Cover.GetData() + Result.Cover.Num());
+    auto RuntimeCover = CopyCoverChannel(Result.Cover);
+    auto RuntimeCoverValidity = PackCoverValidity(Result.CoverValidity,
+        Result.CoverEcologyManifest.Transform.Width,
+        Result.CoverEcologyManifest.Transform.Height);
+    if (!RuntimeCoverValidity) return false;
     TerrainActor = GetWorld()->SpawnActor<ASkiTerrainActor>();
     if (!TerrainActor) return false;
-    TerrainActor->SetTerrainCoreCover(RuntimeCover, Result.Manifest.CoverWidth,
-        Result.Manifest.CoverHeight);
+    TerrainActor->SetTerrainCoreCover(RuntimeCover, RuntimeCoverValidity,
+        Result.CoverEcologyManifest.Transform);
     if (!TerrainActor->PresentTerrainCore(TerrainCoreSession,
             static_cast<uint8>(VisualLod))) return false;
     TArray<uint8> ManifestBytes;
@@ -514,7 +588,6 @@ bool ASkiBootstrapGameMode::BeginP1VisualCapture()
     {
         P1Widget->AddToViewport();
         P1Widget->SetTerrainDetails(TEXT("Crystal Mountain synthetic fixture\nVerification capture at 1x vertical scale"), true);
-        P1Widget->CloseSelector();
     }
     GetWorldTimerManager().SetTimerForNextTick(this, &ASkiBootstrapGameMode::RequestP1VisualScreenshot);
     return true;
@@ -623,15 +696,22 @@ bool ASkiBootstrapGameMode::BeginP1PerformanceSmoke()
     if (!TerrainCoreSession->Install(Repository, 1)) return false;
     TerrainActor = GetWorld()->SpawnActor<ASkiTerrainActor>();
     if (!TerrainActor) return false;
-    TerrainActor->SetTerrainCoreCover(
-        std::make_shared<const std::vector<std::uint8_t>>(Cover.GetData(),
-            Cover.GetData() + Cover.Num()), Ecology.Manifest.Transform.Width,
-        Ecology.Manifest.Transform.Height);
+    TerrainActor->SetTerrainCoreCover(CopyCoverChannel(Cover), CopyCoverChannel(Validity),
+        Ecology.Manifest.Transform);
     const double RenderBegan = FPlatformTime::Seconds();
     if (!TerrainActor->PresentTerrainCore(TerrainCoreSession, 2)) return false;
+    ASkiTerrainViewController* Controller = Cast<ASkiTerrainViewController>(
+        GetWorld()->GetFirstPlayerController());
+    FBox TerrainBounds;
+    if (!Controller || !TerrainActor->GetValidWorldBounds(TerrainBounds)) return false;
+    Controller->AttachTerrain(TerrainActor);
+    Controller->FrameAll();
+    bPerformanceCameraFramed = Cast<ACameraActor>(Controller->GetViewTarget()) != nullptr;
+    if (!bPerformanceCameraFramed) return false;
     PerformanceFirstRenderSeconds = FPlatformTime::Seconds() - RenderBegan;
     PerformanceReopenSeconds = FPlatformTime::Seconds() - ReopenBegan;
     PerformanceLowFrameMs.Reset(); PerformanceReferenceFrameMs.Reset();
+    PerformanceLowRenderedTiles = 0; PerformanceReferenceRenderedTiles = 0;
     PerformancePhase = 0; PerformancePhaseFrame = 0;
     GetWorldTimerManager().SetTimerForNextTick(this,
         &ASkiBootstrapGameMode::SampleP1PerformanceFrame);
@@ -652,6 +732,8 @@ void ASkiBootstrapGameMode::SampleP1PerformanceFrame()
     {
         if (PerformancePhase == 0)
         {
+            PerformanceLowRenderedTiles = TerrainActor
+                ? TerrainActor->GetRenderedTerrainCoreTileCount() : 0;
             if (!TerrainActor || !TerrainActor->SetLod(0))
             { FPlatformMisc::RequestExitWithStatus(false, 1); return; }
             PerformancePhase = 1;
@@ -659,6 +741,8 @@ void ASkiBootstrapGameMode::SampleP1PerformanceFrame()
         }
         else
         {
+            PerformanceReferenceRenderedTiles = TerrainActor
+                ? TerrainActor->GetRenderedTerrainCoreTileCount() : 0;
             FinishP1PerformanceSmoke();
             return;
         }
@@ -697,7 +781,9 @@ void ASkiBootstrapGameMode::FinishP1PerformanceSmoke()
         && LowP95 <= 33.3 && LowP99 <= 50.0 && LowMax <= 250.0
         && RefP95 <= 20.0 && RefP99 <= 33.3 && RefMax <= 250.0
         && PerformanceReopenSeconds <= 30.0 && TerrainActor
-        && TerrainActor->IsTerrainCoreRevisionAligned();
+        && TerrainActor->IsTerrainCoreRevisionAligned()
+        && bPerformanceCameraFramed && PerformanceLowRenderedTiles > 0
+        && PerformanceReferenceRenderedTiles > 0;
     const auto ArrayJson = [](const TArray<double>& Values)
     {
         FString Json = TEXT("[");
@@ -716,8 +802,10 @@ void ASkiBootstrapGameMode::FinishP1PerformanceSmoke()
     const FString Cpu = FPlatformMisc::GetCPUBrand().ReplaceCharWithEscapedChar();
     const FString Gpu = FPlatformMisc::GetPrimaryGPUBrand().ReplaceCharWithEscapedChar();
     const FString Receipt = FString::Printf(
-        TEXT("{\"token\":\"%s\",\"scenario\":\"performance-regression\",\"passed\":%s,\"low\":{\"frames\":%d,\"p95Ms\":%.6f,\"p99Ms\":%.6f,\"maxMs\":%.6f,\"over50\":%d,\"over100\":%d,\"over250\":%d},\"reference\":{\"frames\":%d,\"p95Ms\":%.6f,\"p99Ms\":%.6f,\"maxMs\":%.6f,\"over50\":%d,\"over100\":%d,\"over250\":%d},\"preparedReopenSeconds\":%.6f,\"firstRenderSeconds\":%.6f,\"coldWarm\":\"single-process cold reopen; warmed per lane\",\"rhi\":\"%s\",\"resolution\":[%d,%d],\"internalResolutionPercent\":100,\"cpu\":\"%s\",\"gpu\":\"%s\",\"availablePhysicalBytes\":%llu,\"cacheBudgetBytes\":%llu,\"frameSamples\":\"%s\",\"frameSamplesSha256\":\"%s\"}"),
+        TEXT("{\"token\":\"%s\",\"scenario\":\"performance-regression\",\"passed\":%s,\"cameraFramed\":%s,\"lowRenderedTiles\":%d,\"referenceRenderedTiles\":%d,\"low\":{\"frames\":%d,\"p95Ms\":%.6f,\"p99Ms\":%.6f,\"maxMs\":%.6f,\"over50\":%d,\"over100\":%d,\"over250\":%d},\"reference\":{\"frames\":%d,\"p95Ms\":%.6f,\"p99Ms\":%.6f,\"maxMs\":%.6f,\"over50\":%d,\"over100\":%d,\"over250\":%d},\"preparedReopenSeconds\":%.6f,\"firstRenderSeconds\":%.6f,\"coldWarm\":\"single-process cold reopen; warmed per lane\",\"rhi\":\"%s\",\"resolution\":[%d,%d],\"internalResolutionPercent\":100,\"cpu\":\"%s\",\"gpu\":\"%s\",\"availablePhysicalBytes\":%llu,\"cacheBudgetBytes\":%llu,\"frameSamples\":\"%s\",\"frameSamplesSha256\":\"%s\"}"),
         *PerformanceToken, Passed ? TEXT("true") : TEXT("false"),
+        bPerformanceCameraFramed ? TEXT("true") : TEXT("false"),
+        PerformanceLowRenderedTiles, PerformanceReferenceRenderedTiles,
         PerformanceLowFrameMs.Num(), LowP95, LowP99, LowMax,
         CountAbove(PerformanceLowFrameMs,50),CountAbove(PerformanceLowFrameMs,100),CountAbove(PerformanceLowFrameMs,250),
         PerformanceReferenceFrameMs.Num(), RefP95, RefP99, RefMax,
@@ -1045,6 +1133,7 @@ bool ASkiBootstrapGameMode::RunP1Smoke()
             FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
     }
 
+    FString EditSetId;
     SkiPreparation::InstalledTerrainStore InstallationStore(DataRoot);
     SkiPreparation::TerrainCorePackageStore CoreStore(DataRoot);
     SkiPreparation::CoverEcologyStore CoverStore(DataRoot);
@@ -1071,7 +1160,9 @@ bool ASkiBootstrapGameMode::RunP1Smoke()
     }
     else if (Scenario == TEXT("offline-reopen"))
     {
-        if (!FParse::Value(FCommandLine::Get(), TEXT("SkiP1ContentId="), ContentId)) return false;
+        if (!FParse::Value(FCommandLine::Get(), TEXT("SkiP1ContentId="), ContentId)
+            || !FParse::Value(FCommandLine::Get(), TEXT("SkiP1EditSetId="), EditSetId)
+            || !IsContentId(EditSetId)) return false;
     }
     else return false;
 
@@ -1092,14 +1183,30 @@ bool ASkiBootstrapGameMode::RunP1Smoke()
     auto RuntimeStore = std::make_shared<SkiPreparation::TerrainCorePackageStore>(DataRoot);
     auto Repository = OpenRuntimeTerrainCoreRepository(RuntimeStore, CoreIndex, Error);
     if (!Repository) return false;
+    std::shared_ptr<const SkiApplication::ITerrainCoreRepository> PresentedRepository = Repository;
+    SkiDomain::Revision PresentedRevision = 1;
+    bool EditDeltaReconstructed = false;
+    if (Scenario == TEXT("offline-reopen"))
+    {
+        SkiDomain::TerrainEditSet ReopenedEdits;
+        if (!CoreStore.LoadEditSet(UTF8_TO_TCHAR(InstallationIndex.Receipt.TerrainCoreId.c_str()),
+                EditSetId, CoreIndex.Manifest.Width, CoreIndex.Manifest.Height,
+                ReopenedEdits, Error)) return false;
+        std::string EditError;
+        auto Edited = SkiApplication::TerrainCoreEditedRepository::Create(
+            Repository, ReopenedEdits, ReopenedEdits.BaseRevision, EditError);
+        if (!Edited || ReopenedEdits.Deltas.empty()) return false;
+        PresentedRepository = Edited;
+        PresentedRevision = ReopenedEdits.EditRevision;
+        EditDeltaReconstructed = true;
+    }
     TerrainCoreSession = MakeShared<SkiApplication::TerrainCoreSession>();
-    if (!TerrainCoreSession->Install(Repository, 1)) return false;
-    auto RuntimeCover = std::make_shared<const std::vector<std::uint8_t>>(
-        Cover.GetData(), Cover.GetData() + Cover.Num());
+    if (!TerrainCoreSession->Install(PresentedRepository, PresentedRevision)) return false;
+    auto RuntimeCover = CopyCoverChannel(Cover);
     TerrainActor = GetWorld()->SpawnActor<ASkiTerrainActor>();
     if (!TerrainActor) return false;
-    TerrainActor->SetTerrainCoreCover(RuntimeCover, CoverIndex.Manifest.Transform.Width,
-        CoverIndex.Manifest.Transform.Height);
+    TerrainActor->SetTerrainCoreCover(RuntimeCover, CopyCoverChannel(CoverValidity),
+        CoverIndex.Manifest.Transform);
     if (!TerrainActor->PresentTerrainCore(TerrainCoreSession, 0)
         || !TerrainActor->PresentTerrainCore(TerrainCoreSession, 1)
         || !TerrainActor->PresentTerrainCore(TerrainCoreSession, 2)
@@ -1112,6 +1219,8 @@ bool ASkiBootstrapGameMode::RunP1Smoke()
         FVector(ProbeNorth * 100.0, ProbeEast * 100.0, 1000000.0), FVector(0, 0, -1));
     if (!Hit.Hit) return false;
     bool MutationObserved = true;
+    double EditDeltaM = 0.0;
+    double EditedQueryHeightM = Hit.Position.Up;
     if (Scenario == TEXT("import"))
     {
         const double RadiusM = FMath::Max(CoreIndex.Manifest.DeliveredEastSpacingM,
@@ -1121,6 +1230,23 @@ bool ASkiBootstrapGameMode::RunP1Smoke()
         const SkiDomain::RayHit Mutated = TerrainActor->QueryCanonical(
             FVector(ProbeNorth * 100.0, ProbeEast * 100.0, 1000000.0), FVector(0, 0, -1));
         MutationObserved = Mutated.Hit && Mutated.Position.Up > Hit.Position.Up + 0.01;
+        if (!MutationObserved) return false;
+        EditDeltaM = Mutated.Position.Up - Hit.Position.Up;
+        EditedQueryHeightM = Mutated.Position.Up;
+        const SkiApplication::TerrainCoreSnapshot EditedSnapshot = TerrainCoreSession->Snapshot();
+        std::shared_ptr<const SkiApplication::ITerrainCoreRepository> BaseRepository;
+        std::shared_ptr<const SkiDomain::TerrainEditSet> Edits;
+        if (!EditedSnapshot.Repository || !EditedSnapshot.Repository->FlattenEditOverlay(
+                BaseRepository, Edits) || !Edits || !BaseRepository
+            || !CoreStore.WriteEditSetAndActivate(*Edits, CoreIndex.Manifest.Width,
+                CoreIndex.Manifest.Height, EditSetId, Error)) return false;
+        SkiDomain::TerrainEditSet SavedEdits;
+        EditDeltaReconstructed = CoreStore.LoadEditSet(
+            UTF8_TO_TCHAR(InstallationIndex.Receipt.TerrainCoreId.c_str()), EditSetId,
+            CoreIndex.Manifest.Width, CoreIndex.Manifest.Height, SavedEdits, Error)
+            && SavedEdits.EditRevision == Edits->EditRevision
+            && SavedEdits.Deltas.size() == Edits->Deltas.size();
+        if (!EditDeltaReconstructed) return false;
     }
     const SkiApplication::TerrainCoreSnapshot Snapshot = TerrainCoreSession->Snapshot();
     const bool Ready = Snapshot.RenderReady() && Snapshot.QueryReady()
@@ -1141,10 +1267,12 @@ bool ASkiBootstrapGameMode::RunP1Smoke()
     const bool OfflineNoAcquisition = !OfflineGuard
         || (OfflineGuard->IsActive() && OfflineGuard->ObservedTransportCalls() == 0);
     const FString Receipt = FString::Printf(
-        TEXT("{\"token\":\"%s\",\"scenario\":\"%s\",\"qualityTier\":\"medium\",\"schemaVersion\":2,\"contentId\":\"%s\",\"terrainCoreId\":\"%s\",\"coverEcologyId\":\"%s\",\"ready\":%s,\"picked\":true,\"mutationObserved\":%s,\"reopened\":%s,\"offlineReopen\":%s,\"acquisitionPortGuardInstalled\":%s,\"acquisitionTransportCalls\":%llu,\"nativeV2\":true,\"optionalOutcomes\":%d,\"syntheticGuestMarkers\":%d,\"overlaySegments\":%d}"),
+        TEXT("{\"token\":\"%s\",\"scenario\":\"%s\",\"qualityTier\":\"medium\",\"schemaVersion\":2,\"contentId\":\"%s\",\"terrainCoreId\":\"%s\",\"coverEcologyId\":\"%s\",\"editSetId\":\"%s\",\"baseQueryHeightM\":%.6f,\"editedQueryHeightM\":%.6f,\"editDeltaM\":%.6f,\"editDeltaReconstructed\":%s,\"ready\":%s,\"picked\":true,\"mutationObserved\":%s,\"reopened\":%s,\"offlineReopen\":%s,\"acquisitionPortGuardInstalled\":%s,\"acquisitionTransportCalls\":%llu,\"nativeV2\":true,\"optionalOutcomes\":%d,\"syntheticGuestMarkers\":%d,\"overlaySegments\":%d}"),
         *ParsedToken.ToString(EGuidFormats::DigitsWithHyphensLower), *Scenario, *ContentId,
         UTF8_TO_TCHAR(InstallationIndex.Receipt.TerrainCoreId.c_str()),
         UTF8_TO_TCHAR(InstallationIndex.Receipt.CoverEcologyId.c_str()),
+        *EditSetId, Hit.Position.Up, EditedQueryHeightM, EditDeltaM,
+        EditDeltaReconstructed ? TEXT("true") : TEXT("false"),
         Ready ? TEXT("true") : TEXT("false"), MutationObserved ? TEXT("true") : TEXT("false"),
         Reopened ? TEXT("true") : TEXT("false"),
         Scenario == TEXT("offline-reopen") ? TEXT("true") : TEXT("false"),
@@ -1152,7 +1280,8 @@ bool ASkiBootstrapGameMode::RunP1Smoke()
         OfflineGuard ? OfflineGuard->ObservedTransportCalls() : 0ULL,
         static_cast<int32>(InstallationIndex.Receipt.OptionalSources.size()),
         MarkerCount, OverlaySegments);
-    return Ready && Reopened && MutationObserved && OfflineNoAcquisition
+    return Ready && Reopened && MutationObserved && EditDeltaReconstructed
+        && IsContentId(EditSetId) && OfflineNoAcquisition
         && MarkerCount == 3000 && OverlaySegments > 0
         && FFileHelper::SaveStringToFile(Receipt, *ReceiptPath,
         FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
@@ -1243,13 +1372,14 @@ void ASkiBootstrapGameMode::FinishP1Preparation(SkiPreparation::Result Result,
         return;
     }
     Details = FString::Printf(
-        TEXT("Medium terrain | %s\nActual %u x %u samples | delivered %.2f x %.2f m\nNative source spacing: %s | resampled: %s\nRequested %.6f, %.6f - %.6f, %.6f\nReturned %.6f, %.6f - %.6f, %.6f\nDatum %s\nTerrainCore %s\nCoverEcology %s\nInstallation %s"),
+        TEXT("Medium terrain | %s\nActual %u x %u samples | delivered %.2f x %.2f m\nNative source spacing: %s\nGround grid processing: %s\nRequested %.6f, %.6f - %.6f, %.6f\nReturned %.6f, %.6f - %.6f, %.6f\nDatum %s\nTerrainCore %s\nCoverEcology %s\nInstallation %s"),
         UTF8_TO_TCHAR(Result.Manifest.Source.c_str()), Result.Manifest.HeightWidth,
         Result.Manifest.HeightHeight, Result.Manifest.EastSpacingM, Result.Manifest.NorthSpacingM,
         CoreInstalled.Source.NativeSpacingReported
             ? *FString::Printf(TEXT("%.2f x %.2f m"), CoreInstalled.Source.NativeEastSpacingM,
-                CoreInstalled.Source.NativeNorthSpacingM) : TEXT("not reported by source export"),
-        CoreInstalled.Source.NativeSpacingReported ? TEXT("no") : TEXT("yes"),
+                CoreInstalled.Source.NativeNorthSpacingM) : TEXT("not uniformly reported by source export"),
+        CoreInstalled.Source.SourceId == "usgs-3dep-export"
+            ? TEXT("bilinear sampled from source export") : TEXT("see source provenance"),
         Result.Manifest.RequestedBounds.WestDeg, Result.Manifest.RequestedBounds.SouthDeg,
         Result.Manifest.RequestedBounds.EastDeg, Result.Manifest.RequestedBounds.NorthDeg,
         Result.Manifest.ActualBounds.WestDeg, Result.Manifest.ActualBounds.SouthDeg,
@@ -1275,8 +1405,15 @@ void ASkiBootstrapGameMode::FinishP1Preparation(SkiPreparation::Result Result,
             TEXT("Installed TerrainCore could not enter the terrain session."));
         return;
     }
-    auto RuntimeCover = std::make_shared<const std::vector<std::uint8_t>>(
-        Result.Cover.GetData(), Result.Cover.GetData() + Result.Cover.Num());
+    auto RuntimeCover = CopyCoverChannel(Result.Cover);
+    auto RuntimeCoverValidity = PackCoverValidity(Result.CoverValidity,
+        Result.CoverEcologyManifest.Transform.Width,
+        Result.CoverEcologyManifest.Transform.Height);
+    if (!RuntimeCoverValidity)
+    {
+        if (P1Widget) P1Widget->SetTransientStatus(TEXT("Prepared cover validity is malformed."));
+        return;
+    }
     if (TerrainActor)
     {
         TerrainActor->SetTerrainCoreReadyHandler({});
@@ -1289,8 +1426,8 @@ void ASkiBootstrapGameMode::FinishP1Preparation(SkiPreparation::Result Result,
         if (P1Widget) P1Widget->SetTransientStatus(TEXT("TerrainCore actor creation failed."));
         return;
     }
-    TerrainActor->SetTerrainCoreCover(RuntimeCover, Result.Manifest.CoverWidth,
-        Result.Manifest.CoverHeight);
+    TerrainActor->SetTerrainCoreCover(RuntimeCover, RuntimeCoverValidity,
+        Result.CoverEcologyManifest.Transform);
     bTerrainCoreInitialFramePending = true;
     TerrainActor->SetTerrainCoreReadyHandler(
         [WeakThis = TWeakObjectPtr<ASkiBootstrapGameMode>(this),
@@ -1379,6 +1516,212 @@ void ASkiBootstrapGameMode::FinishP1Preparation(SkiPreparation::Result Result,
         const FString WarningText = Warnings.IsEmpty() ? FString() : TEXT(" Warnings: ") + FString::Join(Warnings, TEXT(" "));
         P1Widget->SetTransientStatus(TEXT("Installed TerrainCore verified; streaming the overview.") + WarningText);
     }
+}
+
+void ASkiBootstrapGameMode::OpenLatestInstalledTerrain()
+{
+    const FString Root = FPaths::ProjectSavedDir();
+    const FString Installations = FPaths::Combine(Root, TEXT("InstalledTerrain"));
+    TArray<FString> Names;
+    IFileManager::Get().FindFiles(Names, *FPaths::Combine(Installations, TEXT("*")),
+        false, true);
+    TArray<TPair<FDateTime, FString>> Candidates;
+    for (const FString& Name : Names)
+    {
+        if (IsContentId(Name))
+            Candidates.Emplace(IFileManager::Get().GetTimeStamp(
+                *FPaths::Combine(Installations, Name)), Name);
+    }
+    // Directory time is only a chooser. Open validates the receipt and all required stores.
+    Candidates.Sort([](const TPair<FDateTime, FString>& A,
+        const TPair<FDateTime, FString>& B)
+    {
+        return A.Key == B.Key ? A.Value < B.Value : A.Key > B.Key;
+    });
+    SkiPreparation::InstalledTerrainStore Store(Root);
+    for (const auto& Candidate : Candidates)
+    {
+        SkiPreparation::InstalledTerrainIndex Index;
+        FString Error;
+        if (Store.Open(Candidate.Value, Index, Error))
+        {
+            OpenInstalledTerrain(Candidate.Value);
+            return;
+        }
+    }
+    if (P1Widget)
+    {
+        P1Widget->OpenSelector();
+        P1Widget->SetSelectorStatus(TEXT("No verified installed terrain was found. Choose bounds to prepare one."));
+    }
+}
+
+bool ASkiBootstrapGameMode::OpenInstalledTerrain(const FString& ContentId)
+{
+    const auto Fail = [this](const FString& Message)
+    {
+        if (P1Widget)
+        {
+            P1Widget->OpenSelector();
+            P1Widget->SetSelectorStatus(Message);
+        }
+        return false;
+    };
+    if (!IsContentId(ContentId)) return Fail(TEXT("Installed terrain ID is invalid."));
+    SkiPreparation::ScopedAcquisitionPortDeny OfflineGuard;
+    if (!OfflineGuard.IsActive())
+        return Fail(TEXT("Offline terrain reopen could not disable acquisition."));
+    const FString Root = FPaths::ProjectSavedDir();
+    SkiPreparation::InstalledTerrainStore InstallationStore(Root);
+    auto CoreStore = std::make_shared<SkiPreparation::TerrainCorePackageStore>(Root);
+    SkiPreparation::CoverEcologyStore CoverStore(Root);
+    SkiPreparation::InstalledTerrainIndex Installation;
+    SkiPreparation::TerrainCorePackageIndex Core;
+    SkiPreparation::CoverEcologyPackageIndex Ecology;
+    TArray<uint8> Cover;
+    TArray<uint8> Validity;
+    FString Error;
+    if (!InstallationStore.Open(ContentId, Installation, Error)
+        || !CoreStore->Open(UTF8_TO_TCHAR(Installation.Receipt.TerrainCoreId.c_str()),
+            Core, Error)
+        || !CoverStore.Open(UTF8_TO_TCHAR(Installation.Receipt.CoverEcologyId.c_str()),
+            Ecology, Error)
+        || !CoverStore.ReadChannels(Ecology, Cover, Validity, Error))
+    {
+        return Fail(TEXT("Installed terrain could not be verified: ") + Error);
+    }
+    auto Repository = OpenRuntimeTerrainCoreRepository(CoreStore, Core, Error);
+    if (!Repository) return Fail(TEXT("Installed terrain repository could not open: ") + Error);
+    std::shared_ptr<const SkiApplication::ITerrainCoreRepository> PresentedRepository = Repository;
+    SkiDomain::Revision Revision = 1;
+    FString EditSetId;
+    if (FParse::Value(FCommandLine::Get(), TEXT("SkiP1EditSetId="), EditSetId))
+    {
+        SkiDomain::TerrainEditSet Edits;
+        if (!IsContentId(EditSetId)
+            || !CoreStore->LoadEditSet(UTF8_TO_TCHAR(Installation.Receipt.TerrainCoreId.c_str()),
+                EditSetId, Core.Manifest.Width, Core.Manifest.Height, Edits, Error))
+            return Fail(TEXT("Installed terrain edit sidecar could not open: ") + Error);
+        std::string EditError;
+        auto Edited = SkiApplication::TerrainCoreEditedRepository::Create(
+            Repository, Edits, Edits.BaseRevision, EditError);
+        if (!Edited)
+            return Fail(FString(TEXT("Installed terrain edit sidecar is invalid: "))
+                + UTF8_TO_TCHAR(EditError.c_str()));
+        PresentedRepository = Edited;
+        Revision = Edits.EditRevision;
+    }
+    if (OfflineGuard.ObservedTransportCalls() != 0)
+        return Fail(TEXT("Offline reopen attempted network acquisition."));
+    if (PreparationCancellation) PreparationCancellation->Cancel();
+    if (PreparationLease) PreparationLease->Invalidate();
+    ++ActiveOperationGeneration;
+    LastRequest.Reset();
+    if (P1Widget) P1Widget->BeginPreparationUI([this] { ChangeSelection(); });
+    if (TerrainActor)
+    {
+        TerrainActor->SetTerrainCoreReadyHandler({});
+        TerrainActor->Destroy();
+        TerrainActor = nullptr;
+    }
+    TerrainSession.Reset();
+    TerrainCoreSession = MakeShared<SkiApplication::TerrainCoreSession>();
+    if (!TerrainCoreSession->Install(PresentedRepository, Revision))
+        return Fail(TEXT("Installed terrain session could not open."));
+    TerrainActor = GetWorld()->SpawnActor<ASkiTerrainActor>();
+    if (!TerrainActor) return Fail(TEXT("Installed terrain actor creation failed."));
+    TerrainActor->SetTerrainCoreCover(CopyCoverChannel(Cover), CopyCoverChannel(Validity),
+        Ecology.Manifest.Transform);
+    bTerrainCoreInitialFramePending = true;
+    TerrainActor->SetTerrainCoreReadyHandler(
+        [WeakThis = TWeakObjectPtr<ASkiBootstrapGameMode>(this),
+            WeakWidget = TWeakObjectPtr<USkiP1Widget>(P1Widget), ContentId](const bool bReady)
+        {
+            if (WeakWidget.IsValid())
+                WeakWidget->SetTransientStatus(bReady
+                    ? TEXT("Installed terrain reopened offline; render and query are ready.")
+                    : TEXT("Installed terrain streaming failed to align render and query revisions."));
+            if (WeakThis.IsValid() && bReady && WeakThis->bTerrainCoreInitialFramePending)
+            {
+                WeakThis->bTerrainCoreInitialFramePending = false;
+                if (ASkiTerrainViewController* Controller = Cast<ASkiTerrainViewController>(
+                        WeakThis->GetWorld()->GetFirstPlayerController())) Controller->FrameAll();
+            }
+        });
+    if (!TerrainActor->BeginTerrainCoreStreaming(TerrainCoreSession, 4))
+    {
+        TerrainActor->SetTerrainCoreReadyHandler({});
+        TerrainActor->Destroy();
+        TerrainActor = nullptr;
+        return Fail(TEXT("Installed terrain renderer rejected the overview."));
+    }
+    TerrainActor->SetLightingPreset(TEXT("Midday"));
+    if (ASkiTerrainViewController* Controller = Cast<ASkiTerrainViewController>(
+            GetWorld()->GetFirstPlayerController()))
+    {
+        Controller->AttachTerrain(TerrainActor);
+        Controller->SetStatusHandler([WeakWidget = TWeakObjectPtr<USkiP1Widget>(P1Widget)](
+            const FString& Status) { if (WeakWidget.IsValid()) WeakWidget->SetProbeStatus(Status); });
+        Controller->SetUiGeometryHandlers(
+            [WeakWidget = TWeakObjectPtr<USkiP1Widget>(P1Widget)]()
+            { return WeakWidget.IsValid() ? WeakWidget->GetRightPanelInsetPixels() : 0.0; },
+            [WeakWidget = TWeakObjectPtr<USkiP1Widget>(P1Widget)]()
+            { return WeakWidget.IsValid() && WeakWidget->IsPointerOverStatusPanel(); },
+            [WeakWidget = TWeakObjectPtr<USkiP1Widget>(P1Widget)]()
+            { return WeakWidget.IsValid() && WeakWidget->DoesUiOwnKeyboardInput(); });
+        Controller->bShowMouseCursor = true;
+        FInputModeGameAndUI InputMode;
+        InputMode.SetHideCursorDuringCapture(false);
+        InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+        Controller->SetInputMode(InputMode);
+    }
+    if (P1Widget)
+    {
+        P1Widget->SetTerrainDetails(FString::Printf(
+            TEXT("Medium terrain | reopened offline\n%s\nActual %u x %u samples | delivered %.2f x %.2f m\nNative source spacing: %s\nGround grid processing: %s\nDatum %s\nTerrainCore %s\nCoverEcology %s\nInstallation %s%s"),
+            UTF8_TO_TCHAR(Core.Manifest.Source.Product.c_str()), Core.Manifest.Width,
+            Core.Manifest.Height, Core.Manifest.DeliveredEastSpacingM,
+            Core.Manifest.DeliveredNorthSpacingM,
+            Core.Manifest.Source.NativeSpacingReported
+                ? *FString::Printf(TEXT("%.2f x %.2f m"),
+                    Core.Manifest.Source.NativeEastSpacingM,
+                    Core.Manifest.Source.NativeNorthSpacingM)
+                : TEXT("not uniformly reported by source export"),
+            Core.Manifest.Source.SourceId == "usgs-3dep-export"
+                ? TEXT("bilinear sampled from source export") : TEXT("see source provenance"),
+            UTF8_TO_TCHAR(Core.Manifest.Source.VerticalDatum.c_str()),
+            UTF8_TO_TCHAR(Core.Manifest.ContentId.c_str()),
+            UTF8_TO_TCHAR(Ecology.Manifest.ContentId.c_str()), *ContentId,
+            EditSetId.IsEmpty() ? TEXT("") : *FString::Printf(TEXT("\nEdit sidecar %s"), *EditSetId)),
+            Core.Manifest.Source.SourceId.find("fixture") != std::string::npos);
+        P1Widget->SetNodeStatus(FString::Printf(
+            TEXT("Runtime node view\nInstalled TerrainCore: %s\nCanonical/render/query: %llu/%llu/%llu"),
+            UTF8_TO_TCHAR(Core.Manifest.ContentId.c_str()),
+            static_cast<uint64>(TerrainCoreSession->Snapshot().Revisions.Canonical),
+            static_cast<uint64>(TerrainCoreSession->Snapshot().Revisions.Render),
+            static_cast<uint64>(TerrainCoreSession->Snapshot().Revisions.Query)));
+        P1Widget->SetViewCommandHandler([WeakTerrain = TWeakObjectPtr<ASkiTerrainActor>(TerrainActor)](
+            const FName Command)
+        {
+            if (!WeakTerrain.IsValid()) return;
+            if (Command == TEXT("Elevation")) WeakTerrain->SetViewMode(ESkiTerrainViewMode::Elevation);
+            else if (Command == TEXT("Slope")) WeakTerrain->SetViewMode(ESkiTerrainViewMode::Slope);
+            else if (Command == TEXT("Cover")) WeakTerrain->SetViewMode(ESkiTerrainViewMode::Cover);
+            else if (Command == TEXT("Lod")) WeakTerrain->SetViewMode(ESkiTerrainViewMode::TileLod);
+            else if (Command == TEXT("LodAuto")) WeakTerrain->SetLodAuto();
+            else if (Command == TEXT("Lod0")) WeakTerrain->SetLod(0);
+            else if (Command == TEXT("Lod1")) WeakTerrain->SetLod(1);
+            else if (Command == TEXT("Lod2")) WeakTerrain->SetLod(2);
+            else if (Command == TEXT("Vertical1")) WeakTerrain->SetVerticalExaggeration(1.0F);
+            else if (Command == TEXT("Vertical2")) WeakTerrain->SetVerticalExaggeration(2.0F);
+            else if (Command == TEXT("Vertical4")) WeakTerrain->SetVerticalExaggeration(4.0F);
+            else if (Command == TEXT("Midday") || Command == TEXT("LowAngle")
+                || Command == TEXT("Overcast")) WeakTerrain->SetLightingPreset(Command);
+            else WeakTerrain->SetViewMode(ESkiTerrainViewMode::Presentation);
+        });
+        P1Widget->SetTransientStatus(TEXT("Verified installed terrain; streaming offline overview."));
+    }
+    return true;
 }
 
 void ASkiBootstrapGameMode::RetryPreparation()

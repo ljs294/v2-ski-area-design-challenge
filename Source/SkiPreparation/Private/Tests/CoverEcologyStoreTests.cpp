@@ -36,7 +36,8 @@ SkiDomain::CoverEcologyManifest CoverManifest()
     return Manifest;
 }
 
-bool ActivateCore(const FString& Root, SkiDomain::TerrainCoreManifest& Out, FString& Error)
+bool ActivateCore(const FString& Root, SkiDomain::TerrainCoreManifest& Out, FString& Error,
+    const char* SourceId = "fixture-ground")
 {
     SkiDomain::Heightfield Field;
     Field.Width = 4;
@@ -51,7 +52,7 @@ bool ActivateCore(const FString& Root, SkiDomain::TerrainCoreManifest& Out, FStr
     SkiDomain::TerrainCoreManifest Manifest;
     Manifest.GeneratorVersion = "cover-composite-test-v1";
     Manifest.ProcessingVersions = {"terraincore-derivation-v1"};
-    Manifest.Source.SourceId = "fixture-ground";
+    Manifest.Source.SourceId = SourceId;
     Manifest.Source.Product = "synthetic bare earth";
     Manifest.Source.AcquisitionEpoch = "2026-09-22";
     Manifest.Source.HorizontalCrs = "LOCAL_ENU";
@@ -172,6 +173,9 @@ bool FCoverEcologyCompositeActivationTest::RunTest(const FString& Parameters)
         IFileManager::Get().DeleteDirectory(*Root, false, true);
         return false;
     }
+    SkiDomain::TerrainCoreManifest Surround;
+    TestTrue(*FString::Printf(TEXT("Surround TerrainCore prerequisite activates: %s"), *Error),
+        ActivateCore(Root, Surround, Error, "fixture-surround"));
     const TArray<uint8> Classes{10, 10, 20, 20, 30, 30, 40, 40, 50, 50, 60, 60};
     const TArray<uint8> Validity{0xff, 0x0f};
     SkiDomain::CoverEcologyManifest Cover;
@@ -183,6 +187,7 @@ bool FCoverEcologyCompositeActivationTest::RunTest(const FString& Parameters)
     SkiDomain::InstalledTerrainReceipt Input;
     Input.GeneratorVersion = "composite-test-v1";
     Input.TerrainCoreId = Core.ContentId;
+    Input.SurroundTerrainCoreId = Surround.ContentId;
     Input.CoverEcologyId = Cover.ContentId;
     Input.OptionalSources = {
         {"naip", "USDA NAIP RGBN", SkiDomain::OptionalSourceStatus::Unavailable,
@@ -203,9 +208,19 @@ bool FCoverEcologyCompositeActivationTest::RunTest(const FString& Parameters)
         Reopened.Receipt.TerrainCoreId, Core.ContentId);
     TestEqual(TEXT("Composite references independent cover"),
         Reopened.Receipt.CoverEcologyId, Cover.ContentId);
+    TestEqual(TEXT("Composite references the separate surround TerrainCore"),
+        Reopened.Receipt.SurroundTerrainCoreId, Surround.ContentId);
     TestTrue(TEXT("Unavailable optional source has no placeholder artifact"),
         Reopened.Receipt.OptionalSources[0].ArtifactId.empty());
 
+    SkiDomain::InstalledTerrainReceipt MissingSurround = Input;
+    MissingSurround.SurroundTerrainCoreId = std::string(64, 'b');
+    {
+        FString Directory = TEXT("sentinel");
+        SkiDomain::InstalledTerrainReceipt Output = Written;
+        TestFalse(TEXT("Composite cannot activate with a missing surround component"),
+            Store.WriteAndActivate(MissingSurround, Directory, Output, Error));
+    }
     SkiDomain::InstalledTerrainReceipt Missing = Input;
     Missing.CoverEcologyId = std::string(64, 'a');
     FString RejectedDirectory = TEXT("sentinel");

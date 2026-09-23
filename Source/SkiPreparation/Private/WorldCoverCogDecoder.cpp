@@ -11,7 +11,7 @@ namespace
 constexpr uint32 ModelPixelScaleTag = 33550;
 constexpr uint32 ModelTiepointTag = 33922;
 constexpr uint32 GeoKeyDirectoryTag = 34735;
-constexpr uint64 MaxCoverCells = 16ULL * 1024ULL * 1024ULL;
+constexpr uint64 MaxCoverCells = 16000000ULL; // matches SkiDomain CoverEcologyMaxCells
 constexpr uint64 MaxCogBytes = 512ULL * 1024ULL * 1024ULL;
 constexpr uint64 MaxDecodedTileBytes = 64ULL * 1024ULL * 1024ULL;
 
@@ -89,15 +89,19 @@ bool HasEpsg4326(TIFF* Image)
         || Keys[3] > (Count - 4) / 4) return false;
     bool Geographic = false;
     bool Epsg4326 = false;
+    bool PixelIsPoint = false;
     for (uint32 Index = 0; Index < Keys[3]; ++Index)
     {
         const uint16* Key = Keys + 4 + Index * 4;
         if (Key[1] != 0 || Key[2] != 1) continue;
         if (Key[0] == 1024) Geographic = Key[3] == 2;
         if (Key[0] == 2048) Epsg4326 = Key[3] == 4326;
+        // GTRasterTypeGeoKey: WorldCover is pixel-is-area; a point-registered raster would
+        // shift every class by half a pixel under this reader's transform.
+        if (Key[0] == 1025) PixelIsPoint = Key[3] == 2;
         if (Key[0] == 3072) return false;
     }
-    return Geographic && Epsg4326;
+    return Geographic && Epsg4326 && !PixelIsPoint;
 }
 }
 
@@ -161,6 +165,32 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
         Fail(OutFailure, TEXT("WORLDCOVER_COG_ENCODING_UNSUPPORTED"),
             TEXT("WorldCover must be a north-up tiled one-band uint8 class COG."));
         return false;
+    }
+    if (Compression != COMPRESSION_NONE && Compression != COMPRESSION_LZW
+        && Compression != COMPRESSION_ADOBE_DEFLATE && Compression != COMPRESSION_DEFLATE)
+    {
+        Fail(OutFailure, TEXT("WORLDCOVER_COG_CODEC_UNSUPPORTED"),
+            TEXT("WorldCover COG uses a compression codec outside NONE/LZW/DEFLATE."));
+        return false;
+    }
+    {
+        // GDAL_NODATA is authoritative when present; a nodata pixel is never a class even if
+        // its value would otherwise decode as one.
+        uint32 NoDataCount = 0;
+        char* NoDataText = nullptr;
+        if (TIFFGetField(Image.get(), TIFFTAG_GDAL_NODATA, &NoDataCount, &NoDataText) && NoDataText)
+        {
+            const FString Text = FString(UTF8_TO_TCHAR(NoDataText)).TrimStartAndEnd();
+            const int32 Parsed = FCString::Atoi(*Text);
+            if (Text.IsEmpty() || !Text.IsNumeric() || Parsed < 0 || Parsed > 255)
+            {
+                Fail(OutFailure, TEXT("WORLDCOVER_COG_NODATA_INVALID"),
+                    TEXT("WorldCover GDAL_NODATA is not a uint8 value."));
+                return false;
+            }
+            OutWindow.NoDataValue = static_cast<uint8>(Parsed);
+            OutWindow.bHasNoData = true;
+        }
     }
     const uint64 DecodedTileBytes = static_cast<uint64>(TileWidth) * TileHeight;
     if (DecodedTileBytes == 0 || DecodedTileBytes > MaxDecodedTileBytes)
@@ -270,7 +300,7 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
                     const uint8 Value = TileBuffer[(Row - SourceRow0) * TileWidth + Column - SourceColumn0];
                     const uint32 OutputIndex = (Row - static_cast<uint32>(MinRow)) * OutWindow.Width
                         + Column - static_cast<uint32>(MinColumn);
-                    if (IsWorldCoverClass(Value))
+                    if (IsWorldCoverClass(Value) && !(OutWindow.bHasNoData && Value == OutWindow.NoDataValue))
                     {
                         OutWindow.Classes[OutputIndex] = Value;
                         OutWindow.Validity[OutputIndex] = 1;
