@@ -92,6 +92,7 @@ struct TerrainCoreSource
     std::string Attribution;
     double NativeEastSpacingM = 0.0;
     double NativeNorthSpacingM = 0.0;
+    bool NativeSpacingReported = true;
     double HorizontalAccuracyM = 0.0;
     double VerticalAccuracyM = 0.0;
     bool HasHorizontalAccuracy = false;

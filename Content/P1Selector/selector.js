@@ -66,7 +66,14 @@
       attempts += 1;
       if (window.ue && window.ue.skiselector && typeof window.ue.skiselector.submit === 'function') {
         clearInterval(waitForBridge);
-        submitSelection();
+        const popupProbe = document.createElement('a');
+        popupProbe.href = 'https://example.com/blocked-popup';
+        popupProbe.target = '_blank';
+        document.body.appendChild(popupProbe);
+        popupProbe.click();
+        popupProbe.remove();
+        location.assign('https://example.com/blocked-navigation');
+        setTimeout(submitSelection, 100);
       } else if (attempts >= 50) {
         clearInterval(waitForBridge);
         status.textContent = 'Native selector bridge unavailable.';

@@ -49,6 +49,12 @@ struct SKIPREPARATION_API RetryPolicy
     uint64 MaximumResponseBytes = 16ULL * 1024ULL * 1024ULL;
 };
 
+struct SKIPREPARATION_API HttpByteRange
+{
+    uint64 Offset = 0;
+    uint64 Length = 0;
+};
+
 class SKIPREPARATION_API AcquisitionResourceLease
 {
 public:
@@ -65,6 +71,8 @@ struct SKIPREPARATION_API HttpAcquisitionRequest
     float TotalTimeoutSeconds = 180.0F;
     double AbsoluteOperationDeadlineSeconds = 0.0;
     uint64 MaximumResponseBytes = 16ULL * 1024ULL * 1024ULL;
+    /** Typed single byte range. Arbitrary caller-supplied headers are intentionally unsupported. */
+    TOptional<HttpByteRange> ByteRange;
     TSharedPtr<AcquisitionResourceLease, ESPMode::ThreadSafe> BackendLifetime;
 };
 
@@ -75,6 +83,7 @@ struct SKIPREPARATION_API HttpAcquisitionResult
     FString RequestStatus;
     FString ContentType;
     FString RetryAfter;
+    FString ContentRange;
     int32 HttpStatus = 0;
     uint64 BytesReceived = 0;
     double TimeToFirstByteSeconds = -1.0;
@@ -134,6 +143,9 @@ SKIPREPARATION_API bool ExecuteBoundedDecodeJob(
     const TFunction<bool()>& IsCurrent,
     TFunctionRef<bool()> Job);
 SKIPREPARATION_API const TCHAR* TransportFailureReasonName(TransportFailureReason Value) noexcept;
+/** Strictly validates bytes START-END/TOTAL for an exact typed request range. */
+SKIPREPARATION_API bool ValidateContentRange(const FString& Header, const HttpByteRange& Requested,
+    uint64 ReceivedBytes, uint64& OutTotalBytes) noexcept;
 SKIPREPARATION_API bool StitchElevationTiles(const AcquisitionPlan& Plan,
     const TArray<DecodedElevationRaster>& Tiles, DecodedElevationRaster& OutRaster, FString& OutError);
 }

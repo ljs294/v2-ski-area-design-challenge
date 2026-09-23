@@ -3,6 +3,8 @@
 #include "CoreMinimal.h"
 #include "Misc/ScopeLock.h"
 #include "SkiDomain/Heightfield.h"
+#include "SkiDomain/CoverEcology.h"
+#include "SkiDomain/TerrainCore.h"
 #include "SkiDomain/TerrainPackage.h"
 
 #include <atomic>
@@ -26,7 +28,11 @@ enum class State : uint8
 
 enum class SourceProfile : uint8
 {
+    /** Legacy schema-1 fixture/import compatibility only. */
     Standard,
+    /** Broad-coverage P1 route, capped at 2,000 samples on the longest axis. */
+    Medium,
+    /** Reserved for P1A catalog-verified one-metre lidar. */
     High,
 };
 
@@ -138,7 +144,7 @@ struct SKIPREPARATION_API Request
 {
     FString Name;
     SkiDomain::GeographicBounds Bounds;
-    SourceProfile Profile = SourceProfile::Standard;
+    SourceProfile Profile = SourceProfile::Medium;
     uint64 SessionGeneration = 0;
     uint64 OperationGeneration = 0;
     TSharedPtr<PreparationOperationLease, ESPMode::ThreadSafe> Lease;
@@ -168,6 +174,11 @@ struct SKIPREPARATION_API Result
     SkiDomain::TerrainManifest Manifest;
     SkiDomain::Heightfield Heightfield;
     TArray<uint8> Cover;
+    TArray<uint8> CoverValidity;
+    bool HasNativeV2Installation = false;
+    SkiDomain::TerrainCoreManifest TerrainCoreManifest;
+    SkiDomain::CoverEcologyManifest CoverEcologyManifest;
+    SkiDomain::InstalledTerrainReceipt InstallationReceipt;
 };
 
 class SKIPREPARATION_API Cancellation

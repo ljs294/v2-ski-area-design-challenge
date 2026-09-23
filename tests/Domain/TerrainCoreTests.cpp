@@ -107,6 +107,22 @@ int main()
 
     SkiDomain::TerrainCoreManifest Core = Manifest();
     Require(SkiDomain::ValidateTerrainCore(Core).Ok(), "valid TerrainCore rejected");
+    Core.Source.NativeSpacingReported = false;
+    Core.Source.NativeEastSpacingM = 0.0;
+    Core.Source.NativeNorthSpacingM = 0.0;
+    Require(SkiDomain::ValidateTerrainCore(Core).Ok(),
+        "explicitly unreported native spacing rejected");
+    Core.Source.NativeEastSpacingM = 1.0;
+    Require(SkiDomain::ValidateTerrainCore(Core).Error
+        == SkiDomain::TerrainCoreError::InvalidSpacing,
+        "unreported native spacing accepted a fabricated value");
+    Core = Manifest();
+    Core.Source.NativeSpacingReported = true;
+    Core.Source.NativeEastSpacingM = 0.0;
+    Require(SkiDomain::ValidateTerrainCore(Core).Error
+        == SkiDomain::TerrainCoreError::InvalidSpacing,
+        "reported native spacing accepted zero");
+    Core = Manifest();
     Core.Shards[0].Path = "../escape.f32z";
     Require(SkiDomain::ValidateTerrainCore(Core).Error
         == SkiDomain::TerrainCoreError::InvalidAssetPath, "traversal path accepted");

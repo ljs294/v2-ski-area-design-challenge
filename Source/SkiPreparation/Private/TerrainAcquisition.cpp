@@ -178,6 +178,20 @@ SkiPreparation::HttpAcquisitionResult SkiPreparation::UnrealHttpAcquisitionTrans
     Http->SetURL(Request.Url);
     Http->SetVerb(TEXT("GET"));
     Http->SetHeader(TEXT("User-Agent"), TEXT("MountainPlanner-Unreal-P1/1"));
+    if (Request.ByteRange.IsSet())
+    {
+        const HttpByteRange Range = Request.ByteRange.GetValue();
+        if (Range.Length == 0 || Range.Offset > MAX_uint64 - (Range.Length - 1))
+        {
+            HttpAcquisitionResult Invalid;
+            Invalid.FailureReason = TransportFailureReason::Other;
+            Invalid.RequestStatus = TEXT("InvalidByteRange");
+            Invalid.Attempt = Request.Attempt;
+            return Invalid;
+        }
+        Http->SetHeader(TEXT("Range"), FString::Printf(TEXT("bytes=%llu-%llu"),
+            Range.Offset, Range.Offset + Range.Length - 1));
+    }
     Http->SetActivityTimeout(Request.ActivityTimeoutSeconds);
     Http->SetTimeout(Request.TotalTimeoutSeconds);
     Http->OnHeaderReceived().BindLambda([State, Maximum = Request.MaximumResponseBytes](FHttpRequestPtr Active,
@@ -212,6 +226,7 @@ SkiPreparation::HttpAcquisitionResult SkiPreparation::UnrealHttpAcquisitionTrans
         State->Result.HttpStatus = Response ? Response->GetResponseCode() : 0;
         State->Result.ContentType = Response ? Response->GetContentType().Left(128) : FString();
         State->Result.RetryAfter = Response ? Response->GetHeader(TEXT("Retry-After")).Left(64) : FString();
+        State->Result.ContentRange = Response ? Response->GetHeader(TEXT("Content-Range")).Left(128) : FString();
         const int64 ContentLength = Response ? Response->GetContentLength() : 0;
         if (State->TooLarge.load() || ContentLength < 0 || static_cast<uint64>(ContentLength) > Maximum)
             State->Result.FailureReason = SkiPreparation::TransportFailureReason::ResponseTooLarge;
@@ -260,13 +275,53 @@ SkiPreparation::HttpAcquisitionResult SkiPreparation::UnrealHttpAcquisitionTrans
         State->Event->Wait(25);
     }
     FScopeLock Lock(&State->ResultMutex);
-    return State->Result;
+    HttpAcquisitionResult Result = State->Result;
+    if (Request.ByteRange.IsSet() && Result.FailureReason == TransportFailureReason::None)
+    {
+        uint64 TotalBytes = 0;
+        if (Result.HttpStatus != 206 || !ValidateContentRange(Result.ContentRange,
+                Request.ByteRange.GetValue(), Result.Bytes.Num(), TotalBytes))
+        {
+            Result.Bytes.Reset();
+            Result.FailureReason = TransportFailureReason::Other;
+            Result.RequestStatus = TEXT("InvalidContentRange");
+        }
+    }
+    return Result;
+}
+
+bool SkiPreparation::ValidateContentRange(const FString& Header, const HttpByteRange& Requested,
+    const uint64 ReceivedBytes, uint64& OutTotalBytes) noexcept
+{
+    OutTotalBytes = 0;
+    if (Requested.Length == 0 || Requested.Offset > MAX_uint64 - (Requested.Length - 1)) return false;
+    FString Value = Header.TrimStartAndEnd();
+    if (!Value.StartsWith(TEXT("bytes "), ESearchCase::IgnoreCase)) return false;
+    Value.RightChopInline(6, EAllowShrinking::No);
+    FString Span, Total;
+    if (!Value.Split(TEXT("/"), &Span, &Total) || Total.IsEmpty() || Total == TEXT("*")) return false;
+    FString StartText, EndText;
+    if (!Span.Split(TEXT("-"), &StartText, &EndText)) return false;
+    const auto DigitsOnly = [](const FString& Text)
+    {
+        if (Text.IsEmpty()) return false;
+        for (const TCHAR Character : Text) if (!FChar::IsDigit(Character)) return false;
+        return true;
+    };
+    if (!DigitsOnly(StartText) || !DigitsOnly(EndText) || !DigitsOnly(Total)) return false;
+    uint64 Start = 0, End = 0;
+    if (!LexTryParseString(Start, *StartText) || !LexTryParseString(End, *EndText)
+        || !LexTryParseString(OutTotalBytes, *Total)) return false;
+    const uint64 ExpectedEnd = Requested.Offset + Requested.Length - 1;
+    return Start == Requested.Offset && End == ExpectedEnd && End < OutTotalBytes
+        && ReceivedBytes == Requested.Length;
 }
 
 SkiPreparation::AcquisitionPlan SkiPreparation::BuildElevationAcquisitionPlan(
     const SkiDomain::GeographicBounds& Bounds, const SourceProfile Profile, const uint32 MaximumTileAxis)
 {
     AcquisitionPlan Plan;
+    if (Profile == SourceProfile::High) return Plan;
     const SkiDomain::GeodeticPoint Origin{(Bounds.SouthDeg + Bounds.NorthDeg) * 0.5,
         (Bounds.WestDeg + Bounds.EastDeg) * 0.5, 0.0};
     SkiDomain::LocalFrame Frame;
@@ -278,7 +333,7 @@ SkiPreparation::AcquisitionPlan SkiPreparation::BuildElevationAcquisitionPlan(
     Plan.WidthM = FMath::Abs(East.EastM - West.EastM);
     Plan.HeightM = FMath::Abs(North.NorthM - South.NorthM);
     if (!FMath::IsFinite(Plan.WidthM) || !FMath::IsFinite(Plan.HeightM) || Plan.WidthM <= 0.0 || Plan.HeightM <= 0.0) return {};
-    const uint32 MaximumAxis = Profile == SourceProfile::High ? 2000U : 1000U;
+    const uint32 MaximumAxis = Profile == SourceProfile::Medium ? 2000U : 1000U;
     if (Plan.WidthM >= Plan.HeightM)
     {
         Plan.Width = MaximumAxis;

@@ -46,11 +46,10 @@ bool SkiPreparation::ValidateSelectorMessage(const FString& Json, const FString&
         OutError = TEXT("Selector token, generation, or request fields are invalid.");
         return false;
     }
-    if (Profile == TEXT("standard")) Candidate.Profile = SourceProfile::Standard;
-    else if (Profile == TEXT("high")) Candidate.Profile = SourceProfile::High;
+    if (Profile == TEXT("medium")) Candidate.Profile = SourceProfile::Medium;
     else
     {
-        OutError = TEXT("Selector profile must be standard or high.");
+        OutError = TEXT("Selector profile must be medium. Verified lidar High is offered only after P1A coverage preflight.");
         return false;
     }
     Candidate.SessionGeneration = ExpectedGeneration;

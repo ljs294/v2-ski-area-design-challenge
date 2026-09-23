@@ -209,7 +209,12 @@ SkiDomain::TerrainCoreValidation SkiDomain::ValidateTerrainCore(
         || Manifest.DeliveredEastSpacingM <= 0.0 || Manifest.DeliveredNorthSpacingM <= 0.0
         || !std::isfinite(Manifest.Source.NativeEastSpacingM)
         || !std::isfinite(Manifest.Source.NativeNorthSpacingM)
-        || Manifest.Source.NativeEastSpacingM <= 0.0 || Manifest.Source.NativeNorthSpacingM <= 0.0)
+        || (Manifest.Source.NativeSpacingReported
+            && (Manifest.Source.NativeEastSpacingM <= 0.0
+                || Manifest.Source.NativeNorthSpacingM <= 0.0))
+        || (!Manifest.Source.NativeSpacingReported
+            && (Manifest.Source.NativeEastSpacingM != 0.0
+                || Manifest.Source.NativeNorthSpacingM != 0.0)))
     {
         return {TerrainCoreError::InvalidSpacing, 0};
     }
@@ -235,7 +240,10 @@ SkiDomain::TerrainCoreValidation SkiDomain::ValidateTerrainCore(
             && !Candidate.License.empty() && !Candidate.Attribution.empty()
             && std::isfinite(Candidate.NativeEastSpacingM)
             && std::isfinite(Candidate.NativeNorthSpacingM)
-            && Candidate.NativeEastSpacingM > 0.0 && Candidate.NativeNorthSpacingM > 0.0
+            && ((!Candidate.NativeSpacingReported
+                    && Candidate.NativeEastSpacingM == 0.0 && Candidate.NativeNorthSpacingM == 0.0)
+                || (Candidate.NativeSpacingReported
+                    && Candidate.NativeEastSpacingM > 0.0 && Candidate.NativeNorthSpacingM > 0.0))
             && (!Candidate.HasHorizontalAccuracy
                 || (std::isfinite(Candidate.HorizontalAccuracyM)
                     && Candidate.HorizontalAccuracyM >= 0.0))

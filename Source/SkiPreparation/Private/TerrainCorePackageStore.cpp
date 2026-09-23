@@ -620,6 +620,8 @@ TSharedRef<FJsonObject> SourceObject(const SkiDomain::TerrainCoreSource& Source)
     Object->SetStringField(TEXT("attribution"), UTF8_TO_TCHAR(Source.Attribution.c_str()));
     Object->SetNumberField(TEXT("nativeEastSpacingM"), Source.NativeEastSpacingM);
     Object->SetNumberField(TEXT("nativeNorthSpacingM"), Source.NativeNorthSpacingM);
+    if (!Source.NativeSpacingReported)
+        Object->SetBoolField(TEXT("nativeSpacingReported"), false);
     Object->SetNumberField(TEXT("horizontalAccuracyM"), Source.HorizontalAccuracyM);
     Object->SetNumberField(TEXT("verticalAccuracyM"), Source.VerticalAccuracyM);
     Object->SetBoolField(TEXT("hasHorizontalAccuracy"), Source.HasHorizontalAccuracy);
@@ -629,7 +631,7 @@ TSharedRef<FJsonObject> SourceObject(const SkiDomain::TerrainCoreSource& Source)
 
 bool ReadSource(const TSharedPtr<FJsonObject>& Object, SkiDomain::TerrainCoreSource& Source)
 {
-    return ReadString(Object, TEXT("sourceId"), Source.SourceId)
+    const bool Required = ReadString(Object, TEXT("sourceId"), Source.SourceId)
         && ReadString(Object, TEXT("product"), Source.Product)
         && ReadString(Object, TEXT("acquisitionEpoch"), Source.AcquisitionEpoch)
         && ReadString(Object, TEXT("horizontalCrs"), Source.HorizontalCrs)
@@ -643,6 +645,12 @@ bool ReadSource(const TSharedPtr<FJsonObject>& Object, SkiDomain::TerrainCoreSou
         && Object->TryGetNumberField(TEXT("verticalAccuracyM"), Source.VerticalAccuracyM)
         && Object->TryGetBoolField(TEXT("hasHorizontalAccuracy"), Source.HasHorizontalAccuracy)
         && Object->TryGetBoolField(TEXT("hasVerticalAccuracy"), Source.HasVerticalAccuracy);
+    if (!Required) return false;
+    bool Reported = true;
+    if (Object->HasField(TEXT("nativeSpacingReported"))
+        && !Object->TryGetBoolField(TEXT("nativeSpacingReported"), Reported)) return false;
+    Source.NativeSpacingReported = Reported;
+    return true;
 }
 
 bool ReadBounds(const TSharedPtr<FJsonObject>& Object, SkiDomain::MetricBounds& Out)

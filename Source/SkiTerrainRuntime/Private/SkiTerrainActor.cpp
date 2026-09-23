@@ -25,6 +25,8 @@
 #include "Algo/AllOf.h"
 #include "Algo/AnyOf.h"
 
+#include <limits>
+
 namespace
 {
 FVector3f CoverColor(const uint8 Code)
@@ -482,6 +484,7 @@ bool ASkiTerrainActor::PresentTerrainCoreLod(const uint8 Lod,
         FailTerrainCorePresentation();
         return false;
     }
+    RebuildTerrainCoreOverviewDiagnostics();
     SetLightingPreset(CurrentLightingPreset);
     const bool bReady = IsTerrainCoreRevisionAligned();
     bCoreReadyNotified = bReady;
@@ -684,7 +687,7 @@ bool ASkiTerrainActor::PublishTerrainCoreMesh(const uint64 ExpectedSerial,
         {Stats.ResidentBytes, Stats.ResidentTiles, Stats.PendingTiles});
     CoreSession->AcknowledgeRender(ExpectedGeneration, ExpectedRevision);
     CoreSession->AcknowledgeQuery(ExpectedGeneration, ExpectedRevision);
-    SteepestLocalBounds = ValidLocalBounds;
+    RebuildTerrainCoreOverviewDiagnostics();
     SetLightingPreset(CurrentLightingPreset);
     const bool bReady = IsTerrainCoreRevisionAligned();
     if (!bCoreReadyNotified)
@@ -1037,6 +1040,58 @@ bool ASkiTerrainActor::GetSteepestQuadrantWorldBounds(FBox& OutBounds) const
 
 void ASkiTerrainActor::ShowTopologyPatch(const SkiDomain::RayHit& Hit)
 {
+    if (CoreSession && CoreCache)
+    {
+        const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+        if (!Snapshot.Metadata || !Snapshot.CanonicalReady()) return;
+        OverlayLines->Flush();
+        const auto& Metadata = *Snapshot.Metadata;
+        const uint32 MinRow = Hit.Row > 4 ? Hit.Row - 4 : 0;
+        const uint32 MinColumn = Hit.Column > 4 ? Hit.Column - 4 : 0;
+        const uint32 MaxRow = FMath::Min(Metadata.Height - 1, Hit.Row + 5);
+        const uint32 MaxColumn = FMath::Min(Metadata.Width - 1, Hit.Column + 5);
+        TArray<FBatchedLine> Lines;
+        auto Point = [&](const uint32 Row, const uint32 Column, FVector& Out)
+        {
+            double Height = 0.0;
+            bool Valid = false;
+            const SkiTerrainRuntime::TerrainCoreQueryStatus Status = CoreCache->QueryCanonicalCell(
+                FMath::Min(Column, Metadata.Width - 2), FMath::Min(Row, Metadata.Height - 2),
+                Column == Metadata.Width - 1 ? 1.0 : 0.0,
+                Row == Metadata.Height - 1 ? 1.0 : 0.0, Height, Valid);
+            if (Status != SkiTerrainRuntime::TerrainCoreQueryStatus::Ready || !Valid) return false;
+            const double East = Metadata.SampleCenterBounds.WestM
+                + Column * Metadata.DeliveredEastSpacingM;
+            const double North = Metadata.SampleCenterBounds.NorthM
+                - Row * Metadata.DeliveredNorthSpacingM;
+            Out = FVector(North * 100.0, East * 100.0,
+                (Height - PresentedOriginHeightM) * 100.0 + 30.0);
+            return true;
+        };
+        // Prime all cells in the bounded patch; the cache retains only the finest
+        // tiles needed by the canonical query path.
+        for (uint32 Row = MinRow; Row <= MaxRow; ++Row)
+            for (uint32 Column = MinColumn; Column <= MaxColumn; ++Column)
+            {
+                double Height = 0.0; bool Valid = false;
+                CoreCache->QueryCanonicalCell(FMath::Min(Column, Metadata.Width - 2),
+                    FMath::Min(Row, Metadata.Height - 2), 0.0, 0.0, Height, Valid);
+            }
+        CoreCache->WaitForWorkers(2.0);
+        CoreCache->PumpPublications();
+        for (uint32 Row = MinRow; Row < MaxRow; ++Row)
+            for (uint32 Column = MinColumn; Column < MaxColumn; ++Column)
+            {
+                FVector A, B, C, D;
+                if (!Point(Row, Column, A) || !Point(Row, Column + 1, B)
+                    || !Point(Row + 1, Column, C) || !Point(Row + 1, Column + 1, D)) continue;
+                Lines.Emplace(A, B, FLinearColor(0, 1, 1, 1), 0, 2.0F, 1);
+                Lines.Emplace(A, C, FLinearColor(0, 1, 1, 1), 0, 2.0F, 1);
+                Lines.Emplace(A, D, FLinearColor::Yellow, 0, 2.5F, 1);
+            }
+        OverlayLines->DrawLines(Lines);
+        return;
+    }
     if (!Session) return;
     const SkiApplication::TerrainSnapshot Snapshot = Session->Snapshot();
     if (!Snapshot.Heightfield) return;
@@ -1120,16 +1175,123 @@ void ASkiTerrainActor::RebuildDots(const SkiDomain::Heightfield& Field, const do
     GuestDots->ClearInstances();
     if (!GuestDots->GetStaticMesh()) return;
     FRandomStream Random(0x51A1);
-    for (int32 Index = 0; Index < 3000; ++Index)
+    TArray<FVector> ValidLocations;
+    ValidLocations.Reserve(FMath::Min<uint64>(8192, static_cast<uint64>(Field.Width) * Field.Height));
+    for (uint32 Row = 0; Row < Field.Height && ValidLocations.Num() < 8192; ++Row)
     {
-        const uint32 Column = Random.RandRange(0, static_cast<int32>(Field.Width - 1));
-        const uint32 Row = Random.RandRange(0, static_cast<int32>(Field.Height - 1));
-        const float Height = Field.Samples[static_cast<size_t>(Row) * Field.Width + Column];
-        if (!FMath::IsFinite(Height) || static_cast<double>(Height) == Field.NoDataValue) continue;
-        const FVector Location(Field.SampleNorthM(Row) * 100.0, Field.EastM(Column) * 100.0,
-            (static_cast<double>(Height) - OriginHeightM) * 100.0 + 100.0);
-        GuestDots->AddInstance(FTransform(FQuat::Identity, Location, FVector(0.04)));
+        for (uint32 Column = 0; Column < Field.Width && ValidLocations.Num() < 8192; ++Column)
+        {
+            const float Height = Field.Samples[static_cast<size_t>(Row) * Field.Width + Column];
+            if (!FMath::IsFinite(Height) || static_cast<double>(Height) == Field.NoDataValue) continue;
+            ValidLocations.Add(FVector(Field.SampleNorthM(Row) * 100.0, Field.EastM(Column) * 100.0,
+                (static_cast<double>(Height) - OriginHeightM) * 100.0 + 100.0));
+        }
     }
+    for (int32 Index = 0; Index < 3000 && !ValidLocations.IsEmpty(); ++Index)
+        GuestDots->AddInstance(FTransform(FQuat::Identity,
+            ValidLocations[Random.RandRange(0, ValidLocations.Num() - 1)], FVector(0.04)));
+}
+
+void ASkiTerrainActor::RebuildTerrainCoreOverviewDiagnostics()
+{
+    if (!CoreSession || !CoreCache) return;
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    if (!Snapshot.Metadata) return;
+    const SkiDomain::TerrainCoreManifest& Metadata = *Snapshot.Metadata;
+    OverlayLines->Flush();
+    GuestDots->ClearInstances();
+    TArray<FVector> ValidLocations;
+    ValidLocations.Reserve(8192);
+    TArray<double> QuadrantSlopes[4];
+    TArray<FBatchedLine> Lines;
+    Lines.Reserve(20000);
+    for (const SkiApplication::TerrainCoreTileKey& Key : CoreDesiredKeys)
+    {
+        const std::shared_ptr<const SkiApplication::TerrainCoreTilePayload> Payload =
+            CoreCache->FindResident(Key);
+        if (!Payload) continue;
+        const uint32 StoredWidth = Payload->Descriptor.CoreWidth
+            + Payload->Descriptor.HaloWest + Payload->Descriptor.HaloEast;
+        const auto Sample = [&](const uint32 Row, const uint32 Column, float& Out)
+        {
+            const uint64 Index = static_cast<uint64>(Row + Payload->Descriptor.HaloNorth)
+                * StoredWidth + Column + Payload->Descriptor.HaloWest;
+            if (Index >= Payload->Heights.size() || Index >= Payload->Validity.size()
+                || Payload->Validity[Index] == 0 || !FMath::IsFinite(Payload->Heights[Index])) return false;
+            Out = Payload->Heights[Index];
+            return true;
+        };
+        for (uint32 Row = 0; Row < Payload->Descriptor.CoreHeight; ++Row)
+        {
+            for (uint32 Column = 0; Column < Payload->Descriptor.CoreWidth; ++Column)
+            {
+                float Height = 0.0F;
+                if (!Sample(Row, Column, Height)) continue;
+                const uint64 FineColumn = static_cast<uint64>(Payload->Descriptor.StartColumn + Column)
+                    * Payload->Descriptor.LodFactor;
+                const uint64 FineRow = static_cast<uint64>(Payload->Descriptor.StartRow + Row)
+                    * Payload->Descriptor.LodFactor;
+                const double East = Metadata.SampleCenterBounds.WestM
+                    + FineColumn * Metadata.DeliveredEastSpacingM;
+                const double North = Metadata.SampleCenterBounds.NorthM
+                    - FineRow * Metadata.DeliveredNorthSpacingM;
+                if (ValidLocations.Num() < 8192) ValidLocations.Add(FVector(North * 100.0, East * 100.0,
+                    (Height - PresentedOriginHeightM) * 100.0 + 100.0));
+                if (Row + 1 >= Payload->Descriptor.CoreHeight
+                    || Column + 1 >= Payload->Descriptor.CoreWidth) continue;
+                float EastHeight = 0.0F, SouthHeight = 0.0F;
+                if (!Sample(Row, Column + 1, EastHeight) || !Sample(Row + 1, Column, SouthHeight)) continue;
+                const double EastRun = Metadata.DeliveredEastSpacingM * Payload->Descriptor.LodFactor;
+                const double NorthRun = Metadata.DeliveredNorthSpacingM * Payload->Descriptor.LodFactor;
+                const double Gradient = FMath::Sqrt(FMath::Square((EastHeight - Height) / EastRun)
+                    + FMath::Square((SouthHeight - Height) / NorthRun));
+                const int32 Quadrant = (FineColumn >= Metadata.Width / 2 ? 1 : 0)
+                    + (FineRow >= Metadata.Height / 2 ? 2 : 0);
+                QuadrantSlopes[Quadrant].Add(FMath::RadiansToDegrees(FMath::Atan(Gradient)));
+                if (Lines.Num() < 20000)
+                {
+                    const FVector A(North * 100.0, East * 100.0,
+                        (Height - PresentedOriginHeightM) * 100.0 + 12.0);
+                    const FVector B(North * 100.0, (East + EastRun) * 100.0,
+                        (EastHeight - PresentedOriginHeightM) * 100.0 + 12.0);
+                    if (FMath::FloorToInt(Height / 50.0) != FMath::FloorToInt(EastHeight / 50.0))
+                        Lines.Emplace(A, B, FLinearColor(1.0F, 0.54F, 0.10F, 0.72F), 0.0F, 1.25F, 0);
+                }
+            }
+        }
+    }
+    FRandomStream Random(0x51A1);
+    if (GuestDots->GetStaticMesh())
+        for (int32 Index = 0; Index < 3000 && !ValidLocations.IsEmpty(); ++Index)
+            GuestDots->AddInstance(FTransform(FQuat::Identity,
+                ValidLocations[Random.RandRange(0, ValidLocations.Num() - 1)], FVector(0.04)));
+    OverlayLines->DrawLines(Lines);
+    int32 Steepest = 0;
+    double P95Maximum = -1.0;
+    for (int32 Index = 0; Index < 4; ++Index)
+    {
+        QuadrantSlopes[Index].Sort();
+        if (QuadrantSlopes[Index].IsEmpty()) continue;
+        const double P95 = QuadrantSlopes[Index][FMath::Min(QuadrantSlopes[Index].Num() - 1,
+            FMath::FloorToInt(QuadrantSlopes[Index].Num() * 0.95))];
+        if (P95 > P95Maximum) { P95Maximum = P95; Steepest = Index; }
+    }
+    const FVector Center = ValidLocalBounds.GetCenter();
+    const FVector Extent = ValidLocalBounds.GetExtent();
+    const FVector QuadrantCenter(Center.X + ((Steepest & 2) ? -0.5 : 0.5) * Extent.X,
+        Center.Y + ((Steepest & 1) ? 0.5 : -0.5) * Extent.Y, Center.Z);
+    SteepestLocalBounds = FBox(QuadrantCenter - FVector(Extent.X * 0.55, Extent.Y * 0.55, Extent.Z),
+        QuadrantCenter + FVector(Extent.X * 0.55, Extent.Y * 0.55, Extent.Z));
+}
+
+int32 ASkiTerrainActor::GetSyntheticGuestMarkerCount() const noexcept
+{
+    return GuestDots ? GuestDots->GetInstanceCount() : 0;
+}
+
+int32 ASkiTerrainActor::GetOverlaySegmentCount() const noexcept
+{
+    return OverlayLines ? OverlayLines->BatchedLines.Num() : 0;
 }
 
 bool ASkiTerrainActor::ApplyScratchMutation(const FVector2D& CenterEastNorthM,
@@ -1533,6 +1695,71 @@ SkiDomain::RayHit ASkiTerrainActor::QueryTerrainCore(const FVector& WorldOriginC
         if (Distance >= Exit) break;
     }
     return Miss;
+}
+
+FString ASkiTerrainActor::DescribeProbe(const SkiDomain::RayHit& Hit) const
+{
+    if (!Hit.Hit) return TEXT("No canonical terrain hit.");
+    double SlopeDegrees = std::numeric_limits<double>::quiet_NaN();
+    uint8 CoverClass = 0;
+    if (CoreSession && CoreCache)
+    {
+        const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+        if (Snapshot.Metadata && Hit.Column + 1 < Snapshot.Metadata->Width
+            && Hit.Row + 1 < Snapshot.Metadata->Height)
+        {
+            double H00 = 0.0, H10 = 0.0, H01 = 0.0;
+            bool V00 = false, V10 = false, V01 = false;
+            const auto Query = [&](const double EastFraction, const double SouthFraction,
+                double& Height, bool& Valid)
+            {
+                return CoreCache->QueryCanonicalCell(Hit.Column, Hit.Row, EastFraction,
+                    SouthFraction, Height, Valid)
+                    == SkiTerrainRuntime::TerrainCoreQueryStatus::Ready && Valid;
+            };
+            if (Query(0.0, 0.0, H00, V00) && Query(1.0, 0.0, H10, V10)
+                && Query(0.0, 1.0, H01, V01))
+            {
+                const double Gradient = FMath::Sqrt(FMath::Square((H10 - H00)
+                    / Snapshot.Metadata->DeliveredEastSpacingM) + FMath::Square((H01 - H00)
+                    / Snapshot.Metadata->DeliveredNorthSpacingM));
+                SlopeDegrees = FMath::RadiansToDegrees(FMath::Atan(Gradient));
+            }
+            if (PresentedCover && PresentedCoverWidth && PresentedCoverHeight)
+            {
+                const uint32 Column = FMath::Min(PresentedCoverWidth - 1,
+                    static_cast<uint32>((static_cast<uint64>(Hit.Column) * PresentedCoverWidth)
+                        / Snapshot.Metadata->Width));
+                const uint32 Row = FMath::Min(PresentedCoverHeight - 1,
+                    static_cast<uint32>((static_cast<uint64>(Hit.Row) * PresentedCoverHeight)
+                        / Snapshot.Metadata->Height));
+                CoverClass = (*PresentedCover)[static_cast<size_t>(Row) * PresentedCoverWidth + Column];
+            }
+        }
+    }
+    else if (Session)
+    {
+        const SkiApplication::TerrainSnapshot Snapshot = Session->Snapshot();
+        if (Snapshot.Heightfield && Hit.Column + 1 < Snapshot.Heightfield->Width
+            && Hit.Row + 1 < Snapshot.Heightfield->Height)
+        {
+            const auto& Field = *Snapshot.Heightfield;
+            const float H00 = Field.Samples[static_cast<size_t>(Hit.Row) * Field.Width + Hit.Column];
+            const float H10 = Field.Samples[static_cast<size_t>(Hit.Row) * Field.Width + Hit.Column + 1];
+            const float H01 = Field.Samples[static_cast<size_t>(Hit.Row + 1) * Field.Width + Hit.Column];
+            if (FMath::IsFinite(H00) && FMath::IsFinite(H10) && FMath::IsFinite(H01))
+            {
+                const double Gradient = FMath::Sqrt(FMath::Square((H10 - H00) / Field.EastSpacingM)
+                    + FMath::Square((H01 - H00) / Field.NorthSpacingM));
+                SlopeDegrees = FMath::RadiansToDegrees(FMath::Atan(Gradient));
+            }
+        }
+    }
+    const FString Slope = FMath::IsFinite(SlopeDegrees)
+        ? FString::Printf(TEXT("%.1f°"), SlopeDegrees) : TEXT("unavailable");
+    return FString::Printf(TEXT("Probe r%u c%u | %.2f m | slope %s | cover %u | revision %llu"),
+        Hit.Row, Hit.Column, Hit.Position.Up, *Slope, CoverClass,
+        static_cast<uint64>(Hit.SourceRevision));
 }
 
 void ASkiTerrainActor::SetLightingPreset(const FName Preset)

@@ -58,7 +58,7 @@ void GeoTagExtender(TIFF* Image)
     }
 }
 
-void EnsureGeoTagsRegistered()
+void EnsureGeoTagsRegisteredInternal()
 {
     std::call_once(TagExtenderOnce, [] { PreviousTagExtender = TIFFSetTagExtender(GeoTagExtender); });
 }
@@ -258,6 +258,11 @@ bool ValidateGeoKeys(TIFF* Image, FString& OutStatus, SkiPreparation::ProviderFa
 }
 }
 
+void SkiPreparation::EnsureGeoTiffTagsRegistered()
+{
+    EnsureGeoTagsRegisteredInternal();
+}
+
 bool SkiPreparation::DecodeElevationGeoTiff(const TArray<uint8>& Bytes,
     const SkiDomain::GeographicBounds& RequestedBounds, const ProviderProduct Product,
     DecodedElevationRaster& OutRaster, ProviderFailure& OutFailure,
@@ -291,7 +296,7 @@ bool SkiPreparation::DecodeElevationGeoTiff(const TArray<uint8>& Bytes,
         return false;
     }
 
-    EnsureGeoTagsRegistered();
+    EnsureGeoTiffTagsRegistered();
     MemoryTiff Source{Bytes.GetData(), static_cast<uint64>(Bytes.Num()), 0};
     std::unique_ptr<TIFF, decltype(&TIFFClose)> Image(
         TIFFClientOpen("MountainPlannerElevation", "r", &Source, ReadMemory, RejectWrite, SeekMemory,

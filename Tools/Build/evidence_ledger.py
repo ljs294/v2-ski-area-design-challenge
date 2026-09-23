@@ -14,7 +14,8 @@ import xml.etree.ElementTree as ET
 INVOCATION = re.compile(r"^[0-9]{8}T[0-9]{6}\.[0-9]{6}Z-[0-9a-f]{8}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 TERRAINCORE_CTESTS = (
-    "SkiDomain.Revision", "SkiDomain.Terrain", "SkiDomain.TerrainCore")
+    "SkiDomain.CoverEcology", "SkiDomain.Revision", "SkiDomain.Terrain",
+    "SkiDomain.TerrainCore")
 FORBIDDEN_SHIPPING_PLUGINS = {
     "modelcontextprotocol", "editortoolset", "automationtesttoolset",
     "slateinspectortoolset", "umgtoolset"}
@@ -116,7 +117,7 @@ def _validate_exact_ctest(run: Path, receipt: dict, label: str) -> dict[str, obj
             or not isinstance(native, list) or len(native) != len(TERRAINCORE_CTESTS):
         raise EvidenceError(f"CTest receipt bindings are missing: {label}")
     log = log_path.read_text(encoding="utf-8", errors="replace")
-    if "100% tests passed, 0 tests failed out of 3" not in log \
+    if "100% tests passed, 0 tests failed out of 4" not in log \
             or any(name not in log for name in TERRAINCORE_CTESTS):
         raise EvidenceError(f"CTest run log does not prove the exact passing set: {label}")
     bound = {item.get("name"): item for item in native if isinstance(item, dict)}

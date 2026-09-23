@@ -9,12 +9,15 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "SkiApplication/TerrainSession.h"
+#include "SkiPreparation/CoverEcologyStore.h"
 #include "SkiPreparation/FixtureTerrainProvider.h"
 #include "SkiPreparation/GeoTiffDecoder.h"
 #include "SkiPreparation/NativeTerrainProvider.h"
 #include "SkiPreparation/SelectorProtocol.h"
 #include "SkiPreparation/TerrainAcquisition.h"
+#include "SkiPreparation/TerrainCorePackageStore.h"
 #include "SkiPreparation/TerrainPackageStore.h"
+#include "SkiPreparation/WorldCoverCogDecoder.h"
 #include "Misc/FileHelper.h"
 #include "tiffio.h"
 
@@ -41,6 +44,28 @@ public:
         if (bCancelOnFirstGet && Observed.Num() == 1) Cancellation->Cancel();
         return Script.IsValidIndex(Observed.Num() - 1) ? Script[Observed.Num() - 1] : Script.Last();
     }
+};
+
+class FMemoryCogSource final : public SkiPreparation::ICogByteSource
+{
+public:
+    explicit FMemoryCogSource(TArray<uint8> InBytes) : Bytes(MoveTemp(InBytes)) {}
+    uint64 Size() const noexcept override { return Bytes.Num(); }
+    bool Read(const uint64 Offset, const uint64 Length, TArray<uint8>& OutBytes,
+        FString& OutError) override
+    {
+        OutBytes.Reset();
+        if (Offset > static_cast<uint64>(Bytes.Num())
+            || Length > static_cast<uint64>(Bytes.Num()) - Offset || Length > MAX_int32)
+        {
+            OutError = TEXT("range invalid");
+            return false;
+        }
+        OutBytes.Append(Bytes.GetData() + Offset, static_cast<int32>(Length));
+        return true;
+    }
+private:
+    TArray<uint8> Bytes;
 };
 
 class FConcurrentAcquisitionTransport final : public SkiPreparation::IAcquisitionTransport
@@ -195,7 +220,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FP1PreparationContractTest,
 bool FP1PreparationContractTest::RunTest(const FString&)
 {
     const FString Token = TEXT("13a15f75-5ba7-4ac0-bd1c-fbe114a6843a");
-    const FString Valid = FString::Printf(TEXT("{\"token\":\"%s\",\"generation\":7,\"name\":\"Crystal\",\"profile\":\"standard\",\"west\":-121.49,\"south\":46.92,\"east\":-121.46,\"north\":46.95}"), *Token);
+    const FString Valid = FString::Printf(TEXT("{\"token\":\"%s\",\"generation\":7,\"name\":\"Crystal\",\"profile\":\"medium\",\"west\":-121.49,\"south\":46.92,\"east\":-121.46,\"north\":46.95}"), *Token);
     SkiPreparation::Request Request;
     FString Error;
     TestTrue(TEXT("Tokened selector request validates"),
@@ -208,7 +233,7 @@ bool FP1PreparationContractTest::RunTest(const FString&)
     Request = {};
     Request.Name = TEXT("Crystal synthetic");
     Request.Bounds = {-121.49, 46.92, -121.46, 46.95};
-    Request.Profile = SkiPreparation::SourceProfile::Standard;
+    Request.Profile = SkiPreparation::SourceProfile::Medium;
     Request.SessionGeneration = 1;
     Request.OperationGeneration = 1;
     Request.Lease = MakeShared<SkiPreparation::PreparationOperationLease, ESPMode::ThreadSafe>(1, 1);
@@ -219,10 +244,51 @@ bool FP1PreparationContractTest::RunTest(const FString&)
     SkiPreparation::FixtureTerrainProvider Provider(Root);
     SkiPreparation::Result Result = Provider.Prepare(Request, Cancellation, {});
     TestTrue(TEXT("Fixture writes, verifies, and activates"), Result.Ok);
-    TestEqual(TEXT("Fixture manifest includes required and explicit optional assets"),
-        static_cast<int32>(Result.Manifest.Assets.size()), 7);
+    TestTrue(TEXT("Fixture publishes native TerrainCore, cover, and composite identities"),
+        Result.HasNativeV2Installation
+        && SkiDomain::IsTerrainCoreSha256(Result.TerrainCoreManifest.ContentId)
+        && SkiDomain::IsTerrainCoreSha256(Result.CoverEcologyManifest.ContentId)
+        && SkiDomain::IsTerrainCoreSha256(Result.InstallationReceipt.ContentId));
+    TestEqual(TEXT("Composite references the verified TerrainCore"),
+        Result.InstallationReceipt.TerrainCoreId, Result.TerrainCoreManifest.ContentId);
+    TestEqual(TEXT("Composite references the verified CoverEcology"),
+        Result.InstallationReceipt.CoverEcologyId, Result.CoverEcologyManifest.ContentId);
+    TestEqual(TEXT("Legacy runtime metadata contains only native component references"),
+        static_cast<int32>(Result.Manifest.Assets.size()), 2);
+    bool HasZeroByteOptionalAsset = false;
+    for (const SkiDomain::TerrainAsset& Asset : Result.Manifest.Assets)
+        HasZeroByteOptionalAsset |= !Asset.Required || Asset.Length == 0;
+    TestFalse(TEXT("Fixture creates no zero-byte optional placeholder assets"),
+        HasZeroByteOptionalAsset);
+    TestFalse(TEXT("Fixture does not activate a schema-1 TerrainPackages tree"),
+        IFileManager::Get().DirectoryExists(*FPaths::Combine(Root, TEXT("TerrainPackages"))));
     TestEqual(TEXT("Verified cover grid is returned for runtime presentation"),
         Result.Cover.Num(), static_cast<int32>(Result.Manifest.CoverWidth * Result.Manifest.CoverHeight));
+    TestEqual(TEXT("Unpacked cover validity aligns with the runtime cover"),
+        Result.CoverValidity.Num(), Result.Cover.Num());
+    TestFalse(TEXT("Synthetic analytical cover has no invalid cells"),
+        Result.CoverValidity.Contains(0));
+    SkiPreparation::TerrainCorePackageIndex CoreIndex;
+    SkiPreparation::CoverEcologyPackageIndex EcologyIndex;
+    SkiPreparation::InstalledTerrainIndex InstallationIndex;
+    TestTrue(TEXT("Fixture TerrainCore independently reopens"),
+        SkiPreparation::TerrainCorePackageStore(Root).Open(
+            UTF8_TO_TCHAR(Result.TerrainCoreManifest.ContentId.c_str()), CoreIndex, Error));
+    TestTrue(TEXT("Fixture CoverEcology independently reopens"),
+        SkiPreparation::CoverEcologyStore(Root).Open(
+            UTF8_TO_TCHAR(Result.CoverEcologyManifest.ContentId.c_str()), EcologyIndex, Error));
+    TestTrue(TEXT("Fixture composite receipt reopens and re-verifies both components"),
+        SkiPreparation::InstalledTerrainStore(Root).Open(
+            UTF8_TO_TCHAR(Result.InstallationReceipt.ContentId.c_str()),
+            InstallationIndex, Error));
+    TestEqual(TEXT("Optional-source absence is metadata, not a placeholder artifact"),
+        static_cast<int32>(Result.InstallationReceipt.OptionalSources.size()), 2);
+    for (const SkiDomain::OptionalSourceOutcome& Optional : Result.InstallationReceipt.OptionalSources)
+        TestTrue(TEXT("Absent optional source has a safe reason and no artifact"),
+            Optional.ArtifactId.empty() && !Optional.ReasonCode.empty());
+    const std::string ExpectedCoreId = Result.TerrainCoreManifest.ContentId;
+    const std::string ExpectedCoverId = Result.CoverEcologyManifest.ContentId;
+    const std::string ExpectedInstallationId = Result.InstallationReceipt.ContentId;
     TestTrue(TEXT("Reloaded package remains centered on its declared local origin"),
         FMath::IsNearlyZero(Result.Heightfield.WestM
             + Result.Heightfield.EastM(Result.Heightfield.Width - 1), 1.0e-6)
@@ -246,11 +312,44 @@ bool FP1PreparationContractTest::RunTest(const FString&)
     TestTrue(TEXT("Query acknowledges edited revision"), Session.AcknowledgeQuery(After.Readiness.Canonical));
     TestTrue(TEXT("Edited terrain becomes ready"), Session.Snapshot().Readiness.IsReady());
 
+    const FString RepeatRoot = FPaths::Combine(FPaths::ProjectIntermediateDir(), TEXT("P1Tests"),
+        FGuid::NewGuid().ToString(EGuidFormats::Digits));
+    SkiPreparation::Result RepeatResult = SkiPreparation::FixtureTerrainProvider(RepeatRoot).Prepare(
+        Request, MakeShared<SkiPreparation::Cancellation>(), {});
+    TestTrue(TEXT("Repeat-clean fixture preparation succeeds"), RepeatResult.Ok);
+    TestEqual(TEXT("Fixture TerrainCore identity is deterministic"),
+        RepeatResult.TerrainCoreManifest.ContentId, ExpectedCoreId);
+    TestEqual(TEXT("Fixture cover identity is deterministic"),
+        RepeatResult.CoverEcologyManifest.ContentId, ExpectedCoverId);
+    TestEqual(TEXT("Fixture composite identity is deterministic"),
+        RepeatResult.InstallationReceipt.ContentId, ExpectedInstallationId);
+
+    SkiPreparation::Request StaleRequest = Request;
+    StaleRequest.OperationGeneration = 2;
+    StaleRequest.Lease = MakeShared<SkiPreparation::PreparationOperationLease,
+        ESPMode::ThreadSafe>(1, 2);
+    StaleRequest.Lease->Invalidate();
+    const FString StaleRoot = FPaths::Combine(FPaths::ProjectIntermediateDir(), TEXT("P1Tests"),
+        FGuid::NewGuid().ToString(EGuidFormats::Digits));
+    SkiPreparation::Result StaleResult = SkiPreparation::FixtureTerrainProvider(StaleRoot).Prepare(
+        StaleRequest, MakeShared<SkiPreparation::Cancellation>(), {});
+    TestFalse(TEXT("Stale fixture operation cannot publish a composite"), StaleResult.Ok);
+    TestEqual(TEXT("Stale fixture operation reports cancellation"),
+        StaleResult.FinalState, SkiPreparation::State::Cancelled);
+    TestFalse(TEXT("Stale fixture operation creates no InstalledTerrain tree"),
+        IFileManager::Get().DirectoryExists(*FPaths::Combine(StaleRoot, TEXT("InstalledTerrain"))));
+
     const FString Resolved = FPaths::ConvertRelativePathToFull(Root);
     if (Resolved.StartsWith(FPaths::ConvertRelativePathToFull(FPaths::ProjectIntermediateDir())))
     {
         IFileManager::Get().DeleteDirectory(*Resolved, false, true);
     }
+    const FString ResolvedStale = FPaths::ConvertRelativePathToFull(StaleRoot);
+    if (ResolvedStale.StartsWith(FPaths::ConvertRelativePathToFull(FPaths::ProjectIntermediateDir())))
+        IFileManager::Get().DeleteDirectory(*ResolvedStale, false, true);
+    const FString ResolvedRepeat = FPaths::ConvertRelativePathToFull(RepeatRoot);
+    if (ResolvedRepeat.StartsWith(FPaths::ConvertRelativePathToFull(FPaths::ProjectIntermediateDir())))
+        IFileManager::Get().DeleteDirectory(*ResolvedRepeat, false, true);
     return true;
 }
 
@@ -335,6 +434,42 @@ bool FP1GeoTiffLiveNoDataRegressionTest::RunTest(const FString&)
     TestEqual(TEXT("Cancelled decode has stable code"), Failure.Code,
         FString(TEXT("PREPARATION_CANCELLED")));
     TestEqual(TEXT("Cancelled decode exposes no partial heightfield"), Raster.SourceWidth, 0U);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FP1WorldCoverCogTest,
+    "MountainPlanner.P1.Product.WorldCoverCog.AnalyticalClasses",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FP1WorldCoverCogTest::RunTest(const FString&)
+{
+    FString Encoded;
+    const FString Fixture = FPaths::Combine(FPaths::ProjectContentDir(),
+        TEXT("P1Fixtures/worldcover-class-cog-synthetic.tif.base64"));
+    TestTrue(TEXT("Immutable WorldCover class fixture loads"),
+        FFileHelper::LoadFileToString(Encoded, *Fixture));
+    TArray<uint8> Bytes;
+    TestTrue(TEXT("WorldCover class fixture base64 decodes"),
+        FBase64::Decode(Encoded.TrimStartAndEnd(), Bytes));
+    TestEqual(TEXT("WorldCover class fixture SHA-256 is immutable"), SkiPreparation::Sha256(Bytes),
+        FString(TEXT("deeb0dcdd224e1332e15da3ada72a31e54a80757c4ca7cc7c16287a7e6905386")));
+    FMemoryCogSource Source(MoveTemp(Bytes));
+    SkiPreparation::DecodedCoverWindow Window;
+    SkiPreparation::ProviderFailure Failure;
+    const SkiDomain::GeographicBounds Requested{-121.5, 46.9995, -121.4995, 47.0};
+    TestTrue(TEXT("Tiled uint8 analytical class window decodes"),
+        SkiPreparation::DecodeWorldCoverCogWindow(Source, Requested, Window, Failure));
+    TestTrue(TEXT("Partial-edge class window is bounded"), Window.Width > 0 && Window.Width <= 19
+        && Window.Height > 0 && Window.Height <= 18);
+    TestEqual(TEXT("Class and validity sizes align"), Window.Classes.Num(), Window.Validity.Num());
+    TestFalse(TEXT("Requested fixture window has no nodata"), Window.Validity.Contains(0));
+    for (const uint8 Value : Window.Classes)
+    {
+        TestTrue(TEXT("Class value is preserved, never inferred from display RGB"),
+            Value == 10 || Value == 20 || Value == 30 || Value == 40 || Value == 50
+            || Value == 60 || Value == 70 || Value == 80 || Value == 90 || Value == 95
+            || Value == 100);
+    }
     return true;
 }
 
@@ -425,15 +560,59 @@ bool FP1AcquisitionPlanTest::RunTest(const FString&)
     const SkiPreparation::AcquisitionPlan Standard = SkiPreparation::BuildElevationAcquisitionPlan(
         MountWashington, SkiPreparation::SourceProfile::Standard);
     const SkiPreparation::AcquisitionPlan High = SkiPreparation::BuildElevationAcquisitionPlan(
+        MountWashington, SkiPreparation::SourceProfile::Medium);
+    const SkiPreparation::AcquisitionPlan ReservedHigh = SkiPreparation::BuildElevationAcquisitionPlan(
         MountWashington, SkiPreparation::SourceProfile::High);
     TestEqual(TEXT("Standard longest axis is 1000"), FMath::Max(Standard.Width, Standard.Height), 1000U);
     TestEqual(TEXT("Standard is one bounded request"), Standard.Tiles.Num(), 1);
-    TestEqual(TEXT("High longest axis is 2000"), FMath::Max(High.Width, High.Height), 2000U);
-    TestEqual(TEXT("Mount Washington High is a 2x2 request plan"), High.Tiles.Num(), 4);
-    TestTrue(TEXT("High retains near-square physical sample spacing"),
+    TestEqual(TEXT("Medium longest axis is 2000"), FMath::Max(High.Width, High.Height), 2000U);
+    TestEqual(TEXT("Mount Washington Medium is a 2x2 request plan"), High.Tiles.Num(), 4);
+    TestTrue(TEXT("Medium retains near-square physical sample spacing"),
         FMath::Abs(High.WidthM / High.Width - High.HeightM / High.Height) < 0.02);
-    TestTrue(TEXT("High remains within the package sample envelope"),
+    TestTrue(TEXT("Medium remains within the package sample envelope"),
         static_cast<uint64>(High.Width) * High.Height <= SkiDomain::MaxHeightSamples);
+    TestEqual(TEXT("Verified-lidar High is not planned by the Medium provider"),
+        ReservedHigh.Tiles.Num(), 0);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FP1MediumProfileContractTest,
+    "MountainPlanner.P1.Product.Medium.ProfileContract",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FP1MediumProfileContractTest::RunTest(const FString&)
+{
+    SkiPreparation::Request Request;
+    Request.Name = TEXT("Mount Washington Medium");
+    Request.Bounds = {-71.365, 44.225, -71.241, 44.315};
+    Request.Profile = SkiPreparation::SourceProfile::Medium;
+    Request.SessionGeneration = 1;
+    Request.OperationGeneration = 1;
+    FString Error;
+    TestTrue(TEXT("Medium is the valid broad-coverage route"),
+        SkiPreparation::ValidateRequest(Request, Error));
+
+    Request.Profile = SkiPreparation::SourceProfile::High;
+    Error.Reset();
+    TestFalse(TEXT("High remains unavailable without verified-lidar preflight"),
+        SkiPreparation::ValidateRequest(Request, Error));
+    TestTrue(TEXT("High failure explains the verified-lidar contract"),
+        Error.Contains(TEXT("verified"), ESearchCase::IgnoreCase));
+
+    const FString Token = TEXT("1234567890abcdef1234567890abcdef");
+    const FString MediumJson = FString::Printf(
+        TEXT("{\"token\":\"%s\",\"generation\":4,\"name\":\"Mount Washington\",\"profile\":\"medium\",\"west\":-71.365,\"south\":44.225,\"east\":-71.241,\"north\":44.315}"),
+        *Token);
+    TestTrue(TEXT("Selector accepts Medium"),
+        SkiPreparation::ValidateSelectorMessage(MediumJson, Token, 4, Request, Error));
+    TestFalse(TEXT("Selector rejects legacy Standard"),
+        SkiPreparation::ValidateSelectorMessage(
+            MediumJson.Replace(TEXT("\"medium\""), TEXT("\"standard\"")),
+            Token, 4, Request, Error));
+    TestFalse(TEXT("Selector rejects unverified High"),
+        SkiPreparation::ValidateSelectorMessage(
+            MediumJson.Replace(TEXT("\"medium\""), TEXT("\"high\"")),
+            Token, 4, Request, Error));
     return true;
 }
 
@@ -443,6 +622,16 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FP1AcquisitionRetryPolicyTest,
 
 bool FP1AcquisitionRetryPolicyTest::RunTest(const FString&)
 {
+    uint64 TotalBytes = 0;
+    TestTrue(TEXT("Exact 206 Content-Range is accepted"), SkiPreparation::ValidateContentRange(
+        TEXT("bytes 1024-2047/8192"), {1024, 1024}, 1024, TotalBytes));
+    TestEqual(TEXT("Content-Range total parsed"), TotalBytes, 8192ULL);
+    TestFalse(TEXT("Mismatched range start is rejected"), SkiPreparation::ValidateContentRange(
+        TEXT("bytes 1025-2048/8192"), {1024, 1024}, 1024, TotalBytes));
+    TestFalse(TEXT("Truncated range payload is rejected"), SkiPreparation::ValidateContentRange(
+        TEXT("bytes 1024-2047/8192"), {1024, 1024}, 1023, TotalBytes));
+    TestFalse(TEXT("Wildcard total is rejected"), SkiPreparation::ValidateContentRange(
+        TEXT("bytes 1024-2047/*"), {1024, 1024}, 1024, TotalBytes));
     SkiPreparation::HttpAcquisitionResult Result;
     Result.FailureReason = SkiPreparation::TransportFailureReason::TimedOut;
     TestTrue(TEXT("Timeout is retryable"), SkiPreparation::IsRetryableTransportFailure(Result));

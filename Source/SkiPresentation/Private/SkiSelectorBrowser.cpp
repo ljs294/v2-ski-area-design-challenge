@@ -12,6 +12,8 @@ void USkiSelectorBrowser::Configure(FString InInitialUrl, FString InToken, const
     ExpectedGeneration = InGeneration;
     Accepted = std::move(InAccepted);
     Rejected = std::move(InRejected);
+    BlockedNavigationCount = 0;
+    BlockedPopupCount = 0;
 }
 
 TSharedRef<SWidget> USkiSelectorBrowser::RebuildWidget()
@@ -42,11 +44,14 @@ void USkiSelectorBrowser::HandleLoadCompleted()
 
 bool USkiSelectorBrowser::BeforeNavigation(const FString& Url, const FWebNavigationRequest&) const
 {
-    return Url != TEXT("about:blank") && Url != InitialUrl;
+    const bool Blocked = Url != TEXT("about:blank") && Url != InitialUrl;
+    if (Blocked) ++BlockedNavigationCount;
+    return Blocked;
 }
 
 bool USkiSelectorBrowser::BeforePopup(FString, FString) const
 {
+    ++BlockedPopupCount;
     return true;
 }
 
@@ -59,8 +64,11 @@ void USkiSelectorBrowser::Submit(const FString& Json)
         if (Rejected) Rejected(Error);
         return;
     }
-    if (Accepted) Accepted(Request);
+    // Tear down the bridge and browser before entering preparation/gameplay.  The
+    // accepted callback may synchronously begin work or even request process exit.
+    TFunction<void(const SkiPreparation::Request&)> AcceptedCallback = MoveTemp(Accepted);
     Close();
+    if (AcceptedCallback) AcceptedCallback(Request);
 }
 
 void USkiSelectorBrowser::Close()

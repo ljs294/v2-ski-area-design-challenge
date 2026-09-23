@@ -1,6 +1,7 @@
 {
   "sources": [
     "Source/SkiDomain/Private/Core/Coordinates.cpp",
+    "Source/SkiDomain/Private/Core/CoverEcology.cpp",
     "Source/SkiDomain/Private/Core/Heightfield.cpp",
     "Source/SkiDomain/Private/Core/Revision.cpp",
     "Source/SkiDomain/Private/Core/TerrainCore.cpp",
@@ -9,6 +10,7 @@
   ],
   "headers": [
     "Source/SkiDomain/Public/SkiDomain/Coordinates.h",
+    "Source/SkiDomain/Public/SkiDomain/CoverEcology.h",
     "Source/SkiDomain/Public/SkiDomain/Export.h",
     "Source/SkiDomain/Public/SkiDomain/Heightfield.h",
     "Source/SkiDomain/Public/SkiDomain/Revision.h",

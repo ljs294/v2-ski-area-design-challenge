@@ -12,11 +12,16 @@ $tiffEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\tiff.json'
 $acquisitionEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\acquisition.json'
 $uiEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\ui.json'
 $terrainCoreEditorReceiptPath = Join-Path $repoRoot 'test-results\p1\terraincore.json'
+$p1EditorReceiptPath = Join-Path $repoRoot 'test-results\p1\p1.json'
 $automationReceiptPath = Join-Path $repoRoot 'test-results\p1\automation.json'
 $tiffReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-geotiff-regression.json'
 $acquisitionReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-acquisition-regression.json'
 $uiReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-ui-layout.json'
 $terrainCoreReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-terraincore-regression.json'
+$selectorReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-selector.json'
+$mediumReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-medium-regression.json'
+$performanceReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-performance-regression.json'
+$visualReceiptPath = Join-Path $repoRoot 'test-results\p1\visual-Shipping.json'
 
 if (-not (Test-Path -LiteralPath $freezePath -PathType Leaf)) {
     throw "Release source freeze is missing: $freezePath"
@@ -87,8 +92,9 @@ $tiffEditorReceipt = Assert-EditorGateReceipt -Path $tiffEditorReceiptPath -Comm
 $acquisitionEditorReceipt = Assert-EditorGateReceipt -Path $acquisitionEditorReceiptPath -Command 'acquisition'
 $uiEditorReceipt = Assert-EditorGateReceipt -Path $uiEditorReceiptPath -Command 'ui'
 $terrainCoreEditorReceipt = Assert-EditorGateReceipt -Path $terrainCoreEditorReceiptPath -Command 'terraincore'
+$p1EditorReceipt = Assert-EditorGateReceipt -Path $p1EditorReceiptPath -Command 'p1'
 $automationReceipt = Assert-EditorGateReceipt -Path $automationReceiptPath -Command 'automation'
-$expectedNativeTerrainCoreTests = @('SkiDomain.Revision', 'SkiDomain.Terrain', 'SkiDomain.TerrainCore')
+$expectedNativeTerrainCoreTests = @('SkiDomain.CoverEcology', 'SkiDomain.Revision', 'SkiDomain.Terrain', 'SkiDomain.TerrainCore')
 $recordedNativeTests = @($terrainCoreEditorReceipt.result.native_receipts | ForEach-Object { [string]$_.name } | Sort-Object)
 if (($recordedNativeTests -join '|') -ne (($expectedNativeTerrainCoreTests | Sort-Object) -join '|') -or
     @($terrainCoreEditorReceipt.result.native_receipts | Where-Object {
@@ -131,6 +137,58 @@ function Assert-ShippingRegressionReceipt {
 $acquisitionReceipt = Assert-ShippingRegressionReceipt -Path $acquisitionReceiptPath -Scenario 'acquisition-regression' -Label 'acquisition-policy'
 $uiReceipt = Assert-ShippingRegressionReceipt -Path $uiReceiptPath -Scenario 'ui-layout' -Label 'UI-layout'
 $terrainCoreReceipt = Assert-ShippingRegressionReceipt -Path $terrainCoreReceiptPath -Scenario 'terraincore-regression' -Label 'TerrainCore'
+$selectorReceipt = Assert-ShippingRegressionReceipt -Path $selectorReceiptPath -Scenario 'selector' -Label 'selector'
+$mediumReceipt = Assert-ShippingRegressionReceipt -Path $mediumReceiptPath -Scenario 'medium-regression' -Label 'Medium composite'
+$performanceReceipt = Assert-ShippingRegressionReceipt -Path $performanceReceiptPath -Scenario 'performance-regression' -Label 'performance'
+if (-not (Test-Path -LiteralPath $visualReceiptPath -PathType Leaf)) {
+    throw "Shipping visual receipt is missing: $visualReceiptPath"
+}
+$visualReceipt = ConvertFrom-Json (Get-Content -LiteralPath $visualReceiptPath -Raw)
+if ($visualReceipt.command -ne 'visual' -or $visualReceipt.result.status -ne 'PASS' -or
+    $visualReceipt.configuration -ne 'Shipping' -or
+    $visualReceipt.source_before -ne $receipt.source_before -or
+    $visualReceipt.result.package_invocation -ne $receipt.invocation -or
+    @($visualReceipt.result.captures).Count -ne 14) {
+    throw 'The Shipping visual evidence is absent, stale, incomplete, or belongs to another package.'
+}
+$selectorProof = $selectorReceipt.result.receipt
+if (-not $selectorProof.selector -or $selectorProof.profile -ne 'medium' -or
+    -not $selectorProof.closedBeforeAcceptance -or $selectorProof.blockedNavigation -lt 1 -or
+    $selectorProof.blockedPopup -lt 1) {
+    throw 'The Shipping selector did not prove its Medium-only, closed, allow-listed workflow.'
+}
+$mediumProof = $mediumReceipt.result.receipt
+if ($mediumProof.schemaVersion -ne 2 -or $mediumProof.qualityTier -ne 'medium' -or
+    -not $mediumProof.nativeV2 -or -not $mediumProof.offlineReopen -or
+    -not $mediumProof.mutationObserved -or -not $mediumProof.deterministicTrees -or
+    -not $mediumProof.acquisitionPortGuardInstalled -or
+    $mediumProof.acquisitionTransportCalls -ne 0 -or
+    [string]$mediumProof.terrainCoreId -notmatch '^[0-9a-f]{64}$' -or
+    [string]$mediumProof.coverEcologyId -notmatch '^[0-9a-f]{64}$' -or
+    [string]$mediumProof.contentId -notmatch '^[0-9a-f]{64}$') {
+    throw 'The Shipping Medium composite proof is incomplete.'
+}
+$performanceProof = $performanceReceipt.result.receipt
+if (-not $performanceProof.passed -or $performanceProof.low.p95Ms -gt 33.3 -or
+    $performanceProof.low.p99Ms -gt 50 -or $performanceProof.low.maxMs -gt 250 -or
+    $performanceProof.reference.p95Ms -gt 20 -or
+    $performanceProof.reference.p99Ms -gt 33.3 -or
+    $performanceProof.reference.maxMs -gt 250 -or
+    $performanceProof.preparedReopenSeconds -gt 30 -or
+    [string]$performanceProof.frameSamplesSha256 -notmatch '^[0-9a-f]{64}$') {
+    throw 'The Shipping performance proof does not meet the P1 envelope.'
+}
+foreach ($capture in @($visualReceipt.result.captures)) {
+    if ($capture.representation -ne 'terraincore-v2' -or -not $capture.revisionAligned -or
+        $capture.verticalScale -ne 1 -or $capture.internalResolutionPercent -ne 100 -or
+        $capture.syntheticGuestMarkers -ne 3000 -or $capture.overlaySegments -le 0 -or
+        [string]$capture.terrainCoreId -notmatch '^[0-9a-f]{64}$' -or
+        [string]$capture.coverEcologyId -notmatch '^[0-9a-f]{64}$' -or
+        [string]$capture.installationId -notmatch '^[0-9a-f]{64}$' -or
+        [string]$capture.screenshotSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw 'A Shipping visual capture lacks TerrainCore/composite identity or required state.'
+    }
+}
 $uiProcessAudit = $uiReceipt.result.process_network_audit
 if ($uiProcessAudit.method -ne 'GetExtendedTcpTable process-attributed polling' -or
     $uiProcessAudit.snapshots -lt 1 -or @($uiProcessAudit.listen_ports).Count -ne 0) {
@@ -195,12 +253,17 @@ $requiredEvidenceReceipts = [ordered]@{
     'editor-acquisition' = @{ Path = $acquisitionEditorReceiptPath; Receipt = $acquisitionEditorReceipt }
     'editor-ui' = @{ Path = $uiEditorReceiptPath; Receipt = $uiEditorReceipt }
     'editor-terraincore' = @{ Path = $terrainCoreEditorReceiptPath; Receipt = $terrainCoreEditorReceipt }
+    'editor-p1' = @{ Path = $p1EditorReceiptPath; Receipt = $p1EditorReceipt }
     'editor-automation' = @{ Path = $automationReceiptPath; Receipt = $automationReceipt }
     'shipping-package' = @{ Path = $receiptPath; Receipt = $receipt }
     'shipping-geotiff' = @{ Path = $tiffReceiptPath; Receipt = $tiffReceipt }
     'shipping-acquisition' = @{ Path = $acquisitionReceiptPath; Receipt = $acquisitionReceipt }
     'shipping-ui' = @{ Path = $uiReceiptPath; Receipt = $uiReceipt }
     'shipping-terraincore' = @{ Path = $terrainCoreReceiptPath; Receipt = $terrainCoreReceipt }
+    'shipping-selector' = @{ Path = $selectorReceiptPath; Receipt = $selectorReceipt }
+    'shipping-medium' = @{ Path = $mediumReceiptPath; Receipt = $mediumReceipt }
+    'shipping-performance' = @{ Path = $performanceReceiptPath; Receipt = $performanceReceipt }
+    'shipping-visual' = @{ Path = $visualReceiptPath; Receipt = $visualReceipt }
 }
 $runsRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot 'test-results\p1\runs'))
 

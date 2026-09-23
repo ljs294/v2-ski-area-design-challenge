@@ -48,16 +48,23 @@ TERRAINCORE_TESTS = (
     "MountainPlanner.P1.TerrainCore.EditPersistence",
 )
 TERRAINCORE_NATIVE_TESTS = (
+    "SkiDomain.CoverEcology",
     "SkiDomain.Revision",
     "SkiDomain.Terrain",
     "SkiDomain.TerrainCore",
+)
+P1_PRODUCT_TESTS = (
+    "MountainPlanner.P1.Product.CoverEcology.CompositeActivation",
+    "MountainPlanner.P1.Product.CoverEcology.ContractAndStore",
+    "MountainPlanner.P1.Product.Medium.ProfileContract",
+    "MountainPlanner.P1.Product.WorldCoverCog.AnalyticalClasses",
 )
 DEFAULT_TERRAINCORE_CACHE_BYTES = 512 * 1024 * 1024
 FORBIDDEN_SHIPPING_PLUGINS = (
     "ModelContextProtocol", "EditorToolset", "AutomationTestToolset",
     "SlateInspectorToolset", "UMGToolSet",
 )
-P1_TESTS = tuple(sorted(TIFF_TESTS + ACQUISITION_TESTS + UI_TESTS + TERRAINCORE_TESTS + (
+P1_TESTS = tuple(sorted(TIFF_TESTS + ACQUISITION_TESTS + UI_TESTS + TERRAINCORE_TESTS + P1_PRODUCT_TESTS + (
     "MountainPlanner.P1.Preparation.PackageAndProtocol",
     "MountainPlanner.P1.Preparation.ProviderDiagnostics",
 )))
@@ -76,6 +83,8 @@ def required_inputs() -> dict:
         "Source/SkiPreparation/Public/SkiPreparation/TerrainPackageStore.h",
         "Source/SkiPreparation/Public/SkiPreparation/TerrainCorePackageStore.h",
         "Source/SkiPreparation/Public/SkiPreparation/TerrainCoreDerivation.h",
+        "Source/SkiPreparation/Public/SkiPreparation/CoverEcologyStore.h",
+        "Source/SkiPreparation/Public/SkiPreparation/WorldCoverCogDecoder.h",
         "Source/SkiPreparation/Public/SkiPreparation/TerrainAcquisition.h",
         "Source/SkiPreparation/Public/SkiPreparation/SelectorProtocol.h",
         "Source/SkiTerrainRuntime/Public/SkiTerrainRuntime/SkiTerrainActor.h",
@@ -86,12 +95,15 @@ def required_inputs() -> dict:
         "Source/SkiApplication/Public/SkiApplication/TerrainCoreEditedRepository.h",
         "Source/SkiApplication/Public/SkiApplication/TerrainCoreSession.h",
         "Source/SkiDomain/Public/SkiDomain/TerrainCore.h",
+        "Source/SkiDomain/Public/SkiDomain/CoverEcology.h",
         "Content/P1Selector/index.html",
         "Content/P1Selector/maplibre-gl.js",
         "Content/P1Selector/maplibre-gl.css",
         "Content/P1Selector/MAPLIBRE-LICENSE.txt",
         "Content/P1Fixtures/usgs-tiled-nodata-synthetic.tif.base64",
+        "Content/P1Fixtures/worldcover-class-cog-synthetic.tif.base64",
         "Tools/Preparation/generate_tiff_fixture.py",
+        "Tools/Preparation/generate_worldcover_cog_fixture.py",
         "docs/UnrealRebuild/P1-runbook.md",
         "docs/UnrealRebuild/P1-requirement-matrix.md",
         ".codex/config.toml",
@@ -272,6 +284,11 @@ def terraincore_contract_trees(data_root: Path) -> dict:
             for name in ("TerrainCore", "TerrainEdits")}
 
 
+def installed_medium_contract_trees(data_root: Path) -> dict:
+    return {name: exact_tree_manifest(data_root / name)
+            for name in ("TerrainCore", "CoverEcology", "InstalledTerrain")}
+
+
 def require_terraincore_renderer(receipt: dict, label: str) -> None:
     rendered = receipt.get("renderedTileCount")
     if receipt.get("rendererPath") is not True \
@@ -279,7 +296,10 @@ def require_terraincore_renderer(receipt: dict, label: str) -> None:
             or receipt.get("revisionAligned") is not True \
             or receipt.get("actorPicked") is not True \
             or receipt.get("actorMutationObserved") is not True \
-            or receipt.get("actorStaleMeshRejected") is not True:
+            or receipt.get("actorStaleMeshRejected") is not True \
+            or receipt.get("syntheticGuestMarkers") != 3000 \
+            or type(receipt.get("overlaySegments")) is not int \
+            or receipt.get("overlaySegments") <= 0:
         raise p0.Failed(f"{label} did not prove the production TerrainCore renderer path")
 
 
@@ -540,6 +560,20 @@ def terraincore(environment: dict, run_output: Path) -> dict:
             "domain": domain, "build": engine_build}
 
 
+def p1_product(environment: dict, run_output: Path) -> dict:
+    build = p0.native_build(environment, "Editor", "Development")
+    engine = p0.engine_path(environment)
+    output = p0.checked([
+        str(engine / "Engine/Binaries/Win64/UnrealEditor-Cmd.exe"), str(PROJECT),
+        "-ExecCmds=Automation RunTests MountainPlanner.P1.Product;Quit",
+        "-TestExit=Automation Test Queue Empty", "-unattended", "-nop4", "-NullRHI",
+        "-stdout", "-FullStdOutLogOutput",
+    ], timeout=300, log="p1-product-automation.log")
+    require_exact_automation(output, P1_PRODUCT_TESTS, "MountainPlanner.P1.Product")
+    return {"status": "PASS", "kind": "focused_p1_product",
+            "tests": list(P1_PRODUCT_TESTS), "build": build}
+
+
 def create_assets(environment: dict, before: dict) -> dict:
     engine = p0.engine_path(environment)
     command = [str(engine / "Engine/Binaries/Win64/UnrealEditor-Cmd.exe"), str(PROJECT),
@@ -591,14 +625,18 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
           run_output: Path) -> dict:
     package_report, launcher = verify_package_report(configuration, source_digest)
     token = str(uuid.uuid4())
-    data_root = ((run_output / "isolated-data") if scenario == "terraincore-regression"
+    data_root = ((run_output / "isolated-data") if scenario in
+                 ("terraincore-regression", "medium-regression", "ui-layout",
+                  "performance-regression")
                  else (OUTPUT / "isolated-data" / configuration)).resolve()
     data_root.mkdir(parents=True, exist_ok=True)
     unreal_user_dir = data_root / "unreal-user" / token
     unreal_user_dir.mkdir(parents=True, exist_ok=True)
     receipt = data_root / f"{token}.receipt.json"
     smoke_flag = ("-SkiP1SelectorSmoke" if scenario == "selector" else
-                  "-SkiP1UiLayoutSmoke" if scenario == "ui-layout" else "-SkiP1Smoke")
+                  "-SkiP1UiLayoutSmoke" if scenario == "ui-layout" else
+                  "-SkiP1PerformanceSmoke" if scenario == "performance-regression"
+                  else "-SkiP1Smoke")
     command = [str(launcher), smoke_flag, f"-SkiP1Token={token}",
                f"-SkiP1Receipt={receipt}", f"-SkiP1DataRoot={data_root}",
                f"-SkiP1Scenario={scenario}", f"-UserDir={unreal_user_dir}",
@@ -756,6 +794,146 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
             "children": [imported, repeated, reopened],
             "childNetworkAudits": [import_audit, repeat_audit, reopen_audit],
         }
+    elif scenario == "ui-layout":
+        layouts = []
+        audits = []
+        resolutions = ((1280, 720), (1920, 1080), (2560, 1080),
+                       (2560, 1440), (576, 1024))
+        states = ("selecting", "preparing", "failed", "ready")
+        for width, height in resolutions:
+            for state in states:
+                child_token = str(uuid.uuid4())
+                child_receipt = data_root / f"{child_token}.receipt.json"
+                child_user_dir = data_root / "unreal-user" / child_token
+                child_user_dir.mkdir(parents=True, exist_ok=True)
+                child_command = [str(launcher), "-SkiP1UiLayoutSmoke",
+                                 f"-SkiP1Token={child_token}",
+                                 f"-SkiP1Receipt={child_receipt}",
+                                 f"-SkiP1DataRoot={data_root}",
+                                 f"-SkiP1UiState={state}", f"-UserDir={child_user_dir}",
+                                 "-windowed", f"-ResX={width}", f"-ResY={height}",
+                                 "-unattended", "-nosplash"]
+                if (width, height, state) == (1280, 720, "failed"):
+                    child_command.append("-SkiP1UiInputIsolation")
+                try:
+                    audit = checked_with_tcp_audit(
+                        child_command, timeout=120,
+                        log=f"p1-ui-layout-{width}x{height}-{state}-{child_token}.log")
+                    validate_tcp_audit(audit, require_no_connections=True)
+                except p0.Failed as error:
+                    context = collect_failure_context(
+                        f"ui-layout {width}x{height} {state}: {error}")
+                    raise p0.Failed(f"{error}; packaged failure context: {context}") from error
+                if not child_receipt.is_file():
+                    raise p0.Failed(
+                        f"UI layout {width}x{height} {state} omitted its receipt")
+                child = json.loads(child_receipt.read_text(encoding="utf-8-sig"))
+                expected_input = True
+                if child.get("token") != child_token or child.get("uiState") != state \
+                        or child.get("resolution") != [width, height] \
+                        or not child.get("layoutValid") \
+                        or not child.get("recoveryActionsReachable") \
+                        or child.get("inputIsolation") is not expected_input:
+                    raise p0.Failed(
+                        f"UI layout {width}x{height} {state} receipt is invalid")
+                rect_name = "selectorRect" if state == "selecting" else "panelRect"
+                rect = child.get(rect_name, [])
+                if len(rect) != 4 or rect[2] <= 0 or rect[3] <= 0 \
+                        or rect[0] < -1 or rect[1] < -1 \
+                        or rect[0] + rect[2] > width + 1 \
+                        or rect[1] + rect[3] > height + 1:
+                    raise p0.Failed(
+                        f"UI layout {width}x{height} {state} leaves the viewport")
+                layouts.append(child)
+                audits.append(audit)
+        observed = {"token": token, "scenario": scenario, "layoutValid": True,
+                    "inputIsolation": True, "recoveryActionsReachable": True,
+                    "layouts": layouts, "processNetworkAudit": audits[-1],
+                    "childNetworkAudits": audits}
+    elif scenario == "medium-regression":
+        def run_medium_child(child_scenario: str, child_token: str,
+                             child_receipt: Path, child_data_root: Path,
+                             extra: list[str]) -> tuple[dict, dict]:
+            child_user_dir = child_data_root / "unreal-user" / child_token
+            child_user_dir.mkdir(parents=True, exist_ok=True)
+            child_command = [str(launcher), "-SkiP1Smoke", f"-SkiP1Token={child_token}",
+                             f"-SkiP1Receipt={child_receipt}",
+                             f"-SkiP1DataRoot={child_data_root}",
+                             f"-SkiP1Scenario={child_scenario}", f"-UserDir={child_user_dir}",
+                             "-windowed", "-ResX=1280", "-ResY=720",
+                             "-unattended", "-nosplash"]
+            child_command.extend(extra)
+            try:
+                audit = checked_with_tcp_audit(
+                    child_command, timeout=180,
+                    log=f"p1-medium-{child_scenario}-{child_token}.log")
+                validate_tcp_audit(audit, require_no_connections=True)
+            except p0.Failed as error:
+                context = collect_failure_context(f"{child_scenario}: {error}")
+                raise p0.Failed(f"{error}; packaged failure context: {context}") from error
+            if not child_receipt.is_file():
+                raise p0.Failed(f"Medium {child_scenario} omitted its tokened receipt")
+            return json.loads(child_receipt.read_text(encoding="utf-8-sig")), audit
+
+        import_token = str(uuid.uuid4())
+        imported, import_audit = run_medium_child(
+            "import", import_token, data_root / f"{import_token}.receipt.json", data_root, [])
+        content_id = imported.get("contentId", "")
+        component_ids = (imported.get("terrainCoreId", ""),
+                         imported.get("coverEcologyId", ""))
+        if imported.get("token") != import_token or imported.get("qualityTier") != "medium" \
+                or imported.get("schemaVersion") != 2 or not imported.get("nativeV2") \
+                or not imported.get("ready") or not imported.get("picked") \
+                or not imported.get("mutationObserved") or not imported.get("reopened") \
+                or imported.get("optionalOutcomes") != 2 \
+                or imported.get("syntheticGuestMarkers") != 3000 \
+                or imported.get("overlaySegments", 0) <= 0 \
+                or not all(re.fullmatch(r"[0-9a-f]{64}", value or "")
+                           for value in (content_id,) + component_ids):
+            raise p0.Failed("Packaged Medium import/edit receipt is invalid")
+        first_trees = installed_medium_contract_trees(data_root)
+
+        repeat_root = (run_output / "isolated-data-repeat-medium").resolve()
+        repeat_root.mkdir(parents=True, exist_ok=False)
+        repeat_token = str(uuid.uuid4())
+        repeated, repeat_audit = run_medium_child(
+            "import", repeat_token, repeat_root / f"{repeat_token}.receipt.json",
+            repeat_root, [])
+        if repeated.get("contentId") != content_id \
+                or repeated.get("terrainCoreId") != component_ids[0] \
+                or repeated.get("coverEcologyId") != component_ids[1] \
+                or installed_medium_contract_trees(repeat_root) != first_trees:
+            raise p0.Failed("Repeat-clean packaged Medium installation is not deterministic")
+
+        reopen_token = str(uuid.uuid4())
+        reopened, reopen_audit = run_medium_child(
+            "offline-reopen", reopen_token, data_root / f"{reopen_token}.receipt.json",
+            data_root, [f"-SkiP1ContentId={content_id}"])
+        if reopened.get("token") != reopen_token or reopened.get("contentId") != content_id \
+                or reopened.get("terrainCoreId") != component_ids[0] \
+                or reopened.get("coverEcologyId") != component_ids[1] \
+                or not reopened.get("offlineReopen") or not reopened.get("ready") \
+                or not reopened.get("picked") or not reopened.get("reopened"):
+            raise p0.Failed("Packaged Medium offline-reopen receipt is invalid")
+        require_acquisition_port_guard(reopened)
+        if installed_medium_contract_trees(data_root) != first_trees:
+            raise p0.Failed("Offline Medium reopen changed immutable component trees")
+        observed = {
+            "token": token, "scenario": scenario, "schemaVersion": 2,
+            "qualityTier": "medium", "contentId": content_id,
+            "terrainCoreId": component_ids[0], "coverEcologyId": component_ids[1],
+            "nativeV2": True, "ready": True, "picked": True,
+            "mutationObserved": True, "offlineReopen": True,
+            "reopened": True, "deterministicIds": True, "deterministicTrees": True,
+            "syntheticGuestMarkers": imported["syntheticGuestMarkers"],
+            "overlaySegments": imported["overlaySegments"],
+            "acquisitionPortGuardInstalled": reopened["acquisitionPortGuardInstalled"],
+            "acquisitionTransportCalls": reopened["acquisitionTransportCalls"],
+            "contractTrees": first_trees,
+            "processNetworkAudit": reopen_audit,
+            "children": [imported, repeated, reopened],
+            "childNetworkAudits": [import_audit, repeat_audit, reopen_audit],
+        }
     else:
         observed = None
 
@@ -772,7 +950,11 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
             raise p0.Failed(f"Packaged player exited without its tokened P1 receipt; context: {context}")
         observed = json.loads(receipt.read_text(encoding="utf-8-sig"))
     if scenario == "selector":
-        if observed != {"token": token, "selector": True, "profile": "standard"}:
+        if observed.get("token") != token or observed.get("selector") is not True \
+                or observed.get("profile") != "medium" \
+                or observed.get("closedBeforeAcceptance") is not True \
+                or observed.get("blockedNavigation", 0) < 1 \
+                or observed.get("blockedPopup", 0) < 1:
             raise p0.Failed("Packaged selector receipt is stale or CEF/WebGL/bridge validation failed")
     elif scenario == "geotiff-regression":
         if observed.get("token") != token or observed.get("scenario") != scenario \
@@ -794,10 +976,20 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                 or observed.get("totalTimeoutSeconds") != 180:
             raise p0.Failed("Packaged acquisition-policy regression receipt is invalid")
     elif scenario == "ui-layout":
+        layouts = observed.get("layouts", [])
+        expected_pairs = {(width, height, state)
+                          for width, height in ((1280, 720), (1920, 1080),
+                                                (2560, 1080), (2560, 1440),
+                                                (576, 1024))
+                          for state in ("selecting", "preparing", "failed", "ready")}
+        actual_pairs = {(entry.get("resolution", [None, None])[0],
+                         entry.get("resolution", [None, None])[1], entry.get("uiState"))
+                        for entry in layouts if len(entry.get("resolution", [])) == 2}
         if observed.get("token") != token or observed.get("scenario") != scenario \
+                or not observed.get("layoutValid") \
                 or not observed.get("recoveryActionsReachable") \
-                or not observed.get("inputIsolation") \
-                or observed.get("resolution") != [1280, 720] or observed.get("rightInset", 0) <= 0:
+                or not observed.get("inputIsolation") or actual_pairs != expected_pairs \
+                or len(layouts) != len(expected_pairs):
             raise p0.Failed("Packaged UI-layout regression receipt is invalid")
     elif scenario == "terraincore-regression":
         content_id = observed.get("contentId", "")
@@ -821,6 +1013,35 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
             raise p0.Failed("Packaged TerrainCore regression receipt is invalid")
         require_acquisition_port_guard(observed)
         require_terraincore_renderer(observed, "Packaged TerrainCore regression")
+    elif scenario == "performance-regression":
+        low = observed.get("low", {})
+        reference = observed.get("reference", {})
+        frames_name = observed.get("frameSamples", "")
+        frames_path = data_root / frames_name
+        if observed.get("token") != token or observed.get("scenario") != scenario \
+                or not observed.get("passed") or low.get("frames") != 240 \
+                or reference.get("frames") != 240 or low.get("p95Ms", 1e9) > 33.3 \
+                or low.get("p99Ms", 1e9) > 50 or low.get("maxMs", 1e9) > 250 \
+                or reference.get("p95Ms", 1e9) > 20 \
+                or reference.get("p99Ms", 1e9) > 33.3 \
+                or reference.get("maxMs", 1e9) > 250 \
+                or observed.get("preparedReopenSeconds", 1e9) > 30 \
+                or observed.get("internalResolutionPercent") != 100 \
+                or not frames_path.is_file() \
+                or observed.get("frameSamplesSha256") != p0.sha(frames_path) \
+                or observed.get("cacheBudgetBytes") != DEFAULT_TERRAINCORE_CACHE_BYTES:
+            raise p0.Failed("Packaged performance-regression receipt is invalid")
+    elif scenario == "medium-regression":
+        if observed.get("token") != token or observed.get("scenario") != scenario \
+                or observed.get("qualityTier") != "medium" \
+                or observed.get("schemaVersion") != 2 or not observed.get("nativeV2") \
+                or not observed.get("ready") or not observed.get("picked") \
+                or not observed.get("mutationObserved") or not observed.get("offlineReopen") \
+                or not observed.get("deterministicIds") or not observed.get("deterministicTrees") \
+                or observed.get("syntheticGuestMarkers") != 3000 \
+                or observed.get("overlaySegments", 0) <= 0:
+            raise p0.Failed("Packaged Medium composite regression receipt is invalid")
+        require_acquisition_port_guard(observed)
     elif observed.get("token") != token or observed.get("scenario") != scenario \
             or not observed.get("ready") or not observed.get("picked") or not observed.get("reopened"):
         raise p0.Failed("Packaged P1 receipt is stale or qualification steps failed")
@@ -828,11 +1049,13 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
     return {"status": "PASS", "kind": "packaged_p1", "scenario": scenario,
             "receipt": observed, "package_invocation": package_report["invocation"],
             "process_network_audit": (observed.get("processNetworkAudit")
-                                      if scenario == "terraincore-regression"
+                                      if scenario in ("terraincore-regression", "medium-regression",
+                                                      "ui-layout")
                                       else process_audit),
             "network_policy": ("production acquisition port denied; process-attributed TCP "
                                "observation found no listeners or remote endpoints"
-                               if scenario in ("offline-reopen", "terraincore-regression")
+                               if scenario in ("offline-reopen", "terraincore-regression",
+                                               "medium-regression")
                                else "fixture-only")}
 
 
@@ -855,7 +1078,8 @@ def visual(configuration: str, source_digest: str) -> dict:
         ("presentation", "Midday", "full", 0, 2560, 1080),
     ])
     receipts = []
-    content_id = None
+    package_identity = None
+    screenshot_hashes = set()
     for index, (mode, lighting, view, lod, width, height) in enumerate(specifications):
         token = str(uuid.uuid4())
         receipt = data_root / f"{token}.receipt.json"
@@ -869,24 +1093,42 @@ def visual(configuration: str, source_digest: str) -> dict:
                    f"-SkiP1CaptureLod={lod}", f"-SkiP1CaptureWidth={width}",
                    f"-SkiP1CaptureHeight={height}", f"-UserDir={user_dir}", "-windowed",
                    f"-ResX={width}", f"-ResY={height}", "-unattended", "-nosplash"]
-        if content_id:
-            command.append(f"-SkiP1ContentId={content_id}")
         p0.checked(command, timeout=90, log=f"p1-visual-{index:02d}-{token}.log")
         if not receipt.is_file() or not screenshot.is_file():
             raise p0.Failed(f"Visual capture {index} did not create its tokened files")
         observed = json.loads(receipt.read_text(encoding="utf-8-sig"))
         png = screenshot.read_bytes()
         actual_size = struct.unpack(">II", png[16:24]) if png.startswith(b"\x89PNG\r\n\x1a\n") else None
+        identity = (observed.get("terrainCoreId"), observed.get("coverEcologyId"),
+                    observed.get("installationId"), observed.get("packageHash"))
+        revisions = observed.get("revisions", [])
         if observed.get("token") != token or observed.get("screenshotSha256") != p0.sha(screenshot) \
                 or actual_size != (width, height) \
-                or observed.get("resolution") != [width, height]:
+                or observed.get("resolution") != [width, height] \
+                or observed.get("representation") != "terraincore-v2" \
+                or observed.get("diagnosticMode") != mode \
+                or observed.get("lighting") != lighting or observed.get("view") != view \
+                or observed.get("lod") != lod or observed.get("verticalScale") != 1 \
+                or observed.get("internalResolutionPercent") != 100 \
+                or not observed.get("revisionAligned") or len(revisions) != 3 \
+                or len(set(revisions)) != 1 or not revisions[0] \
+                or observed.get("syntheticGuestMarkers") != 3000 \
+                or observed.get("overlaySegments", 0) <= 0 \
+                or not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                           for value in identity) \
+                or screenshot.stat().st_size < 64 * 1024:
             raise p0.Failed(f"Visual capture {index} receipt or screenshot hash is invalid")
         observed["screenshot"] = str(screenshot)
-        if content_id is None:
-            content_id = observed.get("contentId")
-        elif observed.get("contentId") != content_id:
-            raise p0.Failed(f"Visual capture {index} did not reuse the recorded immutable package")
+        if observed.get("contentId") != observed.get("terrainCoreId"):
+            raise p0.Failed(f"Visual capture {index} has an ambiguous content identity")
+        if package_identity is None:
+            package_identity = identity
+        elif identity != package_identity:
+            raise p0.Failed(f"Visual capture {index} did not reproduce the immutable composite package")
+        screenshot_hashes.add(observed["screenshotSha256"])
         receipts.append(observed)
+    if len(screenshot_hashes) != len(specifications):
+        raise p0.Failed("Visual capture matrix contains duplicate images and cannot prove its modes")
     verify_package_report(configuration, source_digest)
     return {"status": "PASS", "kind": "packaged_visual_capture", "captures": receipts,
             "fixture": "synthetic", "package_invocation": package_report["invocation"]}
@@ -894,11 +1136,11 @@ def visual(configuration: str, source_digest: str) -> dict:
 
 def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["freeze", "freeze-check", "doctor", "check", "domain", "build", "automation", "tiff", "acquisition", "ui", "terraincore", "assets", "package", "smoke", "visual"])
+    parser.add_argument("command", choices=["freeze", "freeze-check", "doctor", "check", "domain", "build", "automation", "tiff", "acquisition", "ui", "terraincore", "p1", "assets", "package", "smoke", "visual"])
     parser.add_argument("--engine-root")
     parser.add_argument("--configuration", choices=["Development", "Shipping"], default="Development")
     parser.add_argument("--target", choices=["Editor", "Game"], default="Editor")
-    parser.add_argument("--scenario", choices=["selector", "import", "offline-reopen", "geotiff-regression", "acquisition-regression", "ui-layout", "terraincore-regression"], default="import")
+    parser.add_argument("--scenario", choices=["selector", "import", "offline-reopen", "geotiff-regression", "acquisition-regression", "ui-layout", "terraincore-regression", "medium-regression", "performance-regression"], default="import")
     parser.add_argument("--content-id")
     args = parser.parse_args()
     OUTPUT.mkdir(parents=True, exist_ok=True)
@@ -954,6 +1196,8 @@ def _main() -> int:
             result = ui(environment, run_output)
         elif args.command == "terraincore":
             result = terraincore(environment, run_output)
+        elif args.command == "p1":
+            result = p1_product(environment, run_output)
         elif args.command == "assets":
             result = create_assets(environment, before)
         elif args.command == "package":

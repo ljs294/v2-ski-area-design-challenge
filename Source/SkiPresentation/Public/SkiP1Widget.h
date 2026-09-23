@@ -15,12 +15,16 @@ public:
     void SetTransientStatus(const FString& Status);
     void SetProbeStatus(const FString& Status);
     void SetTerrainDetails(const FString& Details, bool bSynthetic);
+    void SetNodeStatus(const FString& Status);
     void BeginPreparationUI(TFunction<void()> ChangeSelection);
     void ShowPreparationFailure(const TOptional<SkiPreparation::ProviderFailure>& Failure, const FString& Fallback,
         TFunction<void()> Retry, TFunction<void()> ChangeSelection);
     void ResetSelector();
     void SetViewCommandHandler(TFunction<void(FName)> Handler);
     void CloseSelector();
+    bool IsSelectorClosed() const;
+    int32 GetBlockedSelectorNavigationCount() const;
+    int32 GetBlockedSelectorPopupCount() const;
     bool IsP1Ready() const;
     bool IsPointerOverStatusPanel() const;
     bool DoesUiOwnKeyboardInput() const;
@@ -29,7 +33,15 @@ public:
     FVector2D GetUnobstructedCenterAbsolute() const;
     void FocusRecoveryAction();
     bool ValidateRecoveryLayout(FIntPoint ViewportSize, FString& OutError) const;
+    bool ValidateShellLayout(FIntPoint ViewportSize, EP1ShellState ExpectedState,
+        FString& OutError) const;
+    FVector4 GetStatusPanelRectAbsolute() const;
+    FVector4 GetSelectorPanelRectAbsolute() const;
+    FVector4 GetStatusScrollRectAbsolute() const;
+    FVector4 GetRetryRectAbsolute() const;
+    FVector4 GetChangeSelectionRectAbsolute() const;
     static double CalculateStatusPanelWidth(double ViewportWidth) noexcept;
+    static FVector2D CalculateSelectorPanelSize(FIntPoint ViewportSize) noexcept;
 protected:
     virtual void NativeOnInitialized() override;
     virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
@@ -58,6 +70,7 @@ private:
     UPROPERTY() TObjectPtr<UTextBlock> StatusText;
     UPROPERTY() TObjectPtr<UTextBlock> DetailsText;
     UPROPERTY() TObjectPtr<UTextBlock> ProbeText;
+    UPROPERTY() TObjectPtr<UTextBlock> NodeText;
     UPROPERTY() TObjectPtr<UButton> RetryButton;
     UPROPERTY() TObjectPtr<UButton> ChangeSelectionButton;
     TFunction<void(const SkiPreparation::Request&)> SelectionHandler;

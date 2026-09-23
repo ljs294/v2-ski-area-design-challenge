@@ -55,6 +55,7 @@ public:
     void ApplyScratchMutationAsync(const FVector2D& CenterEastNorthM, double RadiusM, double DeltaM,
         TFunction<void(bool)> Completion);
     SkiDomain::RayHit QueryCanonical(const FVector& WorldOriginCm, const FVector& WorldDirection) const;
+    FString DescribeProbe(const SkiDomain::RayHit& Hit) const;
     void SetTerrainSession(TSharedPtr<SkiApplication::TerrainSession> InSession);
     void SetLightingPreset(FName Preset);
     bool SetLod(uint8 Lod);
@@ -75,6 +76,8 @@ public:
     { return CoreCache ? CoreCache->Stats() : SkiTerrainRuntime::TerrainCoreCacheStats{}; }
     bool IsTerrainCoreRevisionAligned() const;
     uint64 GetRejectedTerrainCoreMeshBuilds() const noexcept { return RejectedCoreMeshBuilds; }
+    int32 GetSyntheticGuestMarkerCount() const noexcept;
+    int32 GetOverlaySegmentCount() const noexcept;
     /** Uses the same publication fence as asynchronous mesh builds. Packaged regression only. */
     bool RunStaleTerrainCoreMeshPublicationProbe();
 
@@ -100,6 +103,7 @@ private:
         const SkiDomain::TerrainTileMesh& Mesh, bool bBuilt);
     void RebuildDots(const SkiDomain::Heightfield& Field, double OriginHeightM);
     void RebuildContourOverlay(const SkiDomain::Heightfield& Field, double OriginHeightM);
+    void RebuildTerrainCoreOverviewDiagnostics();
 
     UPROPERTY()
     TObjectPtr<USceneComponent> SceneRoot;

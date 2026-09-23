@@ -51,6 +51,11 @@ bool SkiPreparation::ValidateRequest(const Request& RequestValue, FString& OutEr
         OutError = TEXT("Session and operation generations must be nonzero.");
         return false;
     }
+    if (RequestValue.Profile == SourceProfile::High)
+    {
+        OutError = TEXT("Verified 1 m lidar High is unavailable until catalog preflight proves complete supported coverage. Choose Medium.");
+        return false;
+    }
     return true;
 }
 

@@ -314,8 +314,7 @@ bool ASkiTerrainViewController::TryProbe()
     const SkiDomain::RayHit Hit = Terrain->QueryCanonical(Origin, Direction);
     if (!Hit.Hit) return false;
     LastProbe = Hit; Terrain->ShowTopologyPatch(Hit);
-    if (StatusHandler) StatusHandler(FString::Printf(TEXT("Probe r%u c%u | %.2f m | revision %llu"),
-        Hit.Row, Hit.Column, Hit.Position.Up, static_cast<uint64>(Hit.SourceRevision)));
+    if (StatusHandler) StatusHandler(Terrain->DescribeProbe(Hit));
     return true;
 }
 void ASkiTerrainViewController::FocusProbe() { if(TryProbe())FrameLastProbe(); }

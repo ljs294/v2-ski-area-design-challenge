@@ -7,6 +7,9 @@
 
 namespace SkiPreparation
 {
+/** Installs the process-wide chained GeoTIFF custom-tag extender before TIFFClientOpen. */
+SKIPREPARATION_API void EnsureGeoTiffTagsRegistered();
+
 enum class TiffStorageOrganization : uint8
 {
     Stripped,

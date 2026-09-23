@@ -17,6 +17,9 @@ public:
         TFunction<void(const SkiPreparation::Request&)> InAccepted,
         TFunction<void(const FString&)> InRejected);
     void Close();
+    bool IsClosed() const noexcept { return !Browser.IsValid() && !BridgeBound; }
+    int32 GetBlockedNavigationCount() const noexcept { return BlockedNavigationCount; }
+    int32 GetBlockedPopupCount() const noexcept { return BlockedPopupCount; }
 
     UFUNCTION()
     void Submit(const FString& Json);
@@ -38,4 +41,6 @@ private:
     TFunction<void(const FString&)> Rejected;
     TSharedPtr<SWebBrowser> Browser;
     bool BridgeBound = false;
+    mutable int32 BlockedNavigationCount = 0;
+    mutable int32 BlockedPopupCount = 0;
 };

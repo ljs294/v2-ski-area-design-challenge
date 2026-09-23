@@ -6,3 +6,8 @@ input, select, button { box-sizing: border-box; min-height: 34px; border: 1px so
 button { background: #cf613f; border-color: #e37d5c; cursor: pointer; font-weight: 650; }
 #status { grid-column: 1 / 4; color: #cbd8cf; }
 .selection-box { width: 120px; height: 120px; border: 3px solid #ef7d4f; background: #ef7d4f1f; box-sizing: border-box; pointer-events: none; }
+@media (max-width: 680px), (max-height: 680px) {
+  #map { inset: 0 0 248px 0; }
+  #selection { grid-template-columns: 1fr; max-height: 248px; overflow-y: auto; gap: 6px; padding: 8px 10px; }
+  #status { grid-column: 1; }
+}

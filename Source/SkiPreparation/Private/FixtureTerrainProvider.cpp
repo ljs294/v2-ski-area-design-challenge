@@ -1,7 +1,7 @@
 #include "SkiPreparation/FixtureTerrainProvider.h"
 
-#include "SkiPreparation/TerrainPackageStore.h"
-#include "Misc/DateTime.h"
+#include "SkiPreparation/CoverEcologyStore.h"
+#include "SkiPreparation/TerrainCorePackageStore.h"
 
 #include <cmath>
 
@@ -15,20 +15,32 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
 {
     Result Output;
     const double Began = FPlatformTime::Seconds();
+    const auto OperationCurrent = [&]()
+    {
+        return !CancellationValue->IsCancelled()
+            && (!RequestValue.Lease || RequestValue.Lease->IsCurrent(
+                RequestValue.SessionGeneration, RequestValue.OperationGeneration));
+    };
     auto Report = [&](const State Phase, const uint64 Completed, const uint64 Total, const TCHAR* Detail)
     {
-        if (OnProgress) OnProgress({Phase, Completed, Total, FPlatformTime::Seconds() - Began, Detail});
+        if (OnProgress && OperationCurrent())
+            OnProgress({Phase, Completed, Total, FPlatformTime::Seconds() - Began, Detail});
     };
-    Report(State::Validating, 0, 5, TEXT("Validating fixture request"));
-    if (!ValidateRequest(RequestValue, Output.Error)) return Output;
-    if (CancellationValue->IsCancelled())
+    const auto Cancel = [&]()
     {
+        Output = {};
         Output.FinalState = State::Cancelled;
-        Output.Error = TEXT("Fixture preparation cancelled.");
+        Output.Error = TEXT("Fixture preparation cancelled or superseded.");
+    };
+    Report(State::Validating, 0, 6, TEXT("Validating fixture request"));
+    if (!ValidateRequest(RequestValue, Output.Error)) return Output;
+    if (!OperationCurrent())
+    {
+        Cancel();
         return Output;
     }
-    Report(State::Deriving, 1, 5, TEXT("Generating deterministic asymmetric terrain"));
-    const uint32 Dimension = RequestValue.Profile == SourceProfile::High ? 513U : 257U;
+    Report(State::Deriving, 1, 6, TEXT("Generating deterministic asymmetric terrain and cover"));
+    const uint32 Dimension = RequestValue.Profile == SourceProfile::Medium ? 513U : 257U;
     const double CenterLatitude = (RequestValue.Bounds.SouthDeg + RequestValue.Bounds.NorthDeg) / 2.0;
     const double CenterLongitude = (RequestValue.Bounds.WestDeg + RequestValue.Bounds.EastDeg) / 2.0;
     constexpr double MetersPerDegree = 111320.0;
@@ -46,10 +58,9 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
     Field.Samples.resize(static_cast<size_t>(Dimension) * Dimension);
     for (uint32 Row = 0; Row < Dimension; ++Row)
     {
-        if (CancellationValue->IsCancelled())
+        if (!OperationCurrent())
         {
-            Output.FinalState = State::Cancelled;
-            Output.Error = TEXT("Fixture preparation cancelled.");
+            Cancel();
             return Output;
         }
         for (uint32 Column = 0; Column < Dimension; ++Column)
@@ -64,7 +75,7 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
     SkiDomain::TerrainManifest Manifest;
     Manifest.Name = TCHAR_TO_UTF8(*RequestValue.Name);
     Manifest.Source = "synthetic-p1-fixture";
-    Manifest.RequestedAtUtc = TCHAR_TO_UTF8(*FDateTime::UtcNow().ToIso8601());
+    Manifest.RequestedAtUtc = "2026-09-22T00:00:00Z";
     Manifest.RequestedBounds = RequestValue.Bounds;
     Manifest.ActualBounds = RequestValue.Bounds;
     Manifest.LocalOrigin = {CenterLatitude, CenterLongitude, Field.Samples[(Dimension / 2) * Dimension + Dimension / 2]};
@@ -74,54 +85,211 @@ SkiPreparation::Result SkiPreparation::FixtureTerrainProvider::Prepare(const Req
     Manifest.CoverHeight = Dimension;
     Manifest.EastSpacingM = Field.EastSpacingM;
     Manifest.NorthSpacingM = Field.NorthSpacingM;
-    TArray<PackageAssetBytes> Assets;
-    PackageAssetBytes Cover{TEXT("cover.u8"), TEXT("worldcover-byte-grid"), {}, true, {},
-        TEXT("deterministic-p1-fixture"), TEXT("repository test fixture")};
-    Cover.Bytes.SetNumUninitialized(static_cast<int32>(Field.Samples.size()));
-    for (int32 Index = 0; Index < Cover.Bytes.Num(); ++Index)
+    Manifest.VerticalDatum = "synthetic-local";
+
+    TArray<uint8> Cover;
+    TArray<uint8> CoverValidity;
+    Cover.SetNumUninitialized(static_cast<int32>(Field.Samples.size()));
+    CoverValidity.Init(1, Cover.Num());
+    for (int32 Index = 0; Index < Cover.Num(); ++Index)
     {
         const float Height = Field.Samples[static_cast<size_t>(Index)];
-        Cover.Bytes[Index] = Height > 1850.0F ? 3 : Height > 1650.0F ? 2 : 1;
+        Cover[Index] = Height > 1850.0F ? 70 : Height > 1650.0F ? 30 : 10;
     }
-    Assets.Add(std::move(Cover));
-    PackageAssetBytes Surround{TEXT("surround.f32le"), TEXT("heightfield-surround-f32le"), {}, true, {},
-        TEXT("deterministic-p1-fixture"), TEXT("repository test fixture")};
-    Surround.Bytes.Append(reinterpret_cast<const uint8*>(Field.Samples.data()),
-        static_cast<int32>(Field.Samples.size() * sizeof(float)));
-    Assets.Add(std::move(Surround));
-    PackageAssetBytes Contours{TEXT("contours.f32le"), TEXT("contour-segments-f32le"), {}, true, {},
-        TEXT("derived from fixture elevation"), TEXT("repository test fixture")};
-    for (uint32 Row = 0; Row < Dimension; Row += 32)
+
+    SkiDomain::TerrainCoreManifest TerrainCore;
+    TerrainCore.GeneratorVersion = "mountain-planner-terraincore-v2";
+    TerrainCore.ProcessingVersions = {
+        "deterministic-p1-fixture-v2", "terraincore-derivation-v1"};
+    TerrainCore.LocalOrigin = Manifest.LocalOrigin;
+    TerrainCore.Width = Field.Width;
+    TerrainCore.Height = Field.Height;
+    TerrainCore.DeliveredEastSpacingM = Field.EastSpacingM;
+    TerrainCore.DeliveredNorthSpacingM = Field.NorthSpacingM;
+    TerrainCore.Registration = SkiDomain::PixelRegistration::SampleCenter;
+    TerrainCore.SampleCenterBounds = {Field.WestM,
+        Field.SampleNorthM(Field.Height - 1U), Field.EastM(Field.Width - 1U), Field.NorthM};
+    if (!SkiDomain::ComputeTerrainCoreBounds(TerrainCore.Width, TerrainCore.Height,
+            TerrainCore.DeliveredEastSpacingM, TerrainCore.DeliveredNorthSpacingM,
+            TerrainCore.SampleCenterBounds, TerrainCore.OuterBounds))
     {
-        const float Segment[4]{static_cast<float>(Field.WestM), static_cast<float>(Field.SampleNorthM(Row)),
-            static_cast<float>(Field.EastM(Dimension - 1)), static_cast<float>(Field.SampleNorthM(Row))};
-        Contours.Bytes.Append(reinterpret_cast<const uint8*>(Segment), sizeof(Segment));
+        Output.Error = TEXT("Fixture TerrainCore bounds are invalid.");
+        return Output;
     }
-    Assets.Add(std::move(Contours));
-    PackageAssetBytes CoverDisplay{TEXT("cover-display.u8"), TEXT("cover-display-compact"), {}, true, {},
-        TEXT("derived from fixture cover"), TEXT("repository test fixture")};
-    CoverDisplay.Bytes = Assets[0].Bytes;
-    Assets.Add(std::move(CoverDisplay));
-    Assets.Add({TEXT("imagery.jpg"), TEXT("image/jpeg"), {}, false,
-        TEXT("Synthetic fixture intentionally has no NAIP acquisition."), TEXT("none"), TEXT("not applicable")});
-    Assets.Add({TEXT("vectors.json"), TEXT("overpass-json"), {}, false,
-        TEXT("Synthetic fixture intentionally has no Overpass response."), TEXT("none"), TEXT("not applicable")});
-    Report(State::WritingStaging, 2, 5, TEXT("Writing fixture package staging"));
-    PackageStore Store(DataRoot);
-    if (!Store.WriteAndActivate(std::move(Manifest), Field, Output.PackageDirectory,
-            Output.Manifest, Output.Error, Assets, RequestValue.Lease,
+    TerrainCore.Source.SourceId = "synthetic-p1-fixture-ground";
+    TerrainCore.Source.Product = "Deterministic synthetic bare-earth fixture";
+    TerrainCore.Source.AcquisitionEpoch = Manifest.RequestedAtUtc;
+    TerrainCore.Source.HorizontalCrs = "WGS84/local-ENU";
+    TerrainCore.Source.HorizontalDatum = "WGS84";
+    TerrainCore.Source.VerticalDatum = Manifest.VerticalDatum;
+    TerrainCore.Source.License = "repository test fixture";
+    TerrainCore.Source.Attribution = "Mountain Planner deterministic fixture";
+    TerrainCore.Source.NativeEastSpacingM = Field.EastSpacingM;
+    TerrainCore.Source.NativeNorthSpacingM = Field.NorthSpacingM;
+    SkiDomain::TerrainCoreSource Surrounding = TerrainCore.Source;
+    Surrounding.SourceId = "synthetic-p1-fixture-surrounding";
+    Surrounding.Product = "Deterministic synthetic surrounding elevation";
+    TerrainCore.AdditionalSources.push_back(std::move(Surrounding));
+
+    Report(State::WritingStaging, 2, 6,
+        TEXT("Writing fixture TerrainCore and CoverEcology staging"));
+    if (!OperationCurrent())
+    {
+        Cancel();
+        return Output;
+    }
+    TerrainCorePackageStore CoreStore(DataRoot);
+    FString CoreDirectory;
+    SkiDomain::TerrainCoreManifest InstalledCore;
+    if (!CoreStore.WriteAndActivate(TerrainCore, Field, CoreDirectory,
+            InstalledCore, Output.Error, RequestValue.Lease,
             RequestValue.SessionGeneration, RequestValue.OperationGeneration))
     {
+        if (!OperationCurrent()) Cancel();
         return Output;
     }
-    Report(State::Verifying, 3, 5, TEXT("Reloading activated fixture"));
-    if (!Store.Load(UTF8_TO_TCHAR(Output.Manifest.ContentId.c_str()), Output.Manifest,
-            Output.Heightfield, Output.Error, &Output.Cover))
+    if (!OperationCurrent())
     {
+        Cancel();
         return Output;
     }
-    Report(State::Installed, 5, 5, TEXT("Fixture package installed"));
-    Output.Ok = true;
-    Output.FinalState = State::Installed;
+
+    SkiDomain::CoverEcologyManifest Ecology;
+    Ecology.GeneratorVersion = "mountain-planner-cover-ecology-v1";
+    Ecology.CoverRevision = 1;
+    Ecology.Source = {"synthetic-p1-fixture-cover",
+        "Deterministic synthetic analytical cover", "2026-09-22",
+        "repository-generated-class-values", "repository test fixture",
+        "Mountain Planner deterministic fixture"};
+    Ecology.Transform.Width = Dimension;
+    Ecology.Transform.Height = Dimension;
+    Ecology.Transform.LongitudeStepDeg =
+        (RequestValue.Bounds.EastDeg - RequestValue.Bounds.WestDeg) / Dimension;
+    Ecology.Transform.LatitudeStepDeg =
+        (RequestValue.Bounds.NorthDeg - RequestValue.Bounds.SouthDeg) / Dimension;
+    Ecology.Transform.SampleCenterBounds = {
+        RequestValue.Bounds.WestDeg + Ecology.Transform.LongitudeStepDeg * 0.5,
+        RequestValue.Bounds.SouthDeg + Ecology.Transform.LatitudeStepDeg * 0.5,
+        RequestValue.Bounds.EastDeg - Ecology.Transform.LongitudeStepDeg * 0.5,
+        RequestValue.Bounds.NorthDeg - Ecology.Transform.LatitudeStepDeg * 0.5};
+    if (!SkiDomain::ComputeCoverEcologyOuterBounds(Dimension, Dimension,
+            Ecology.Transform.LongitudeStepDeg, Ecology.Transform.LatitudeStepDeg,
+            Ecology.Transform.SampleCenterBounds, Ecology.Transform.OuterBounds))
+    {
+        Output.Error = TEXT("Fixture CoverEcology transform is invalid.");
+        return Output;
+    }
+    TArray<uint8> PackedValidity;
+    PackedValidity.Init(0, FMath::DivideAndRoundUp(CoverValidity.Num(), 8));
+    for (int32 Index = 0; Index < CoverValidity.Num(); ++Index)
+        PackedValidity[Index / 8] |= static_cast<uint8>(1U << (Index % 8));
+    CoverEcologyStore EcologyStore(DataRoot);
+    FString EcologyDirectory;
+    SkiDomain::CoverEcologyManifest InstalledEcology;
+    if (!EcologyStore.WriteAndActivate(Ecology, Cover, PackedValidity, EcologyDirectory,
+            InstalledEcology, Output.Error, RequestValue.Lease,
+            RequestValue.SessionGeneration, RequestValue.OperationGeneration))
+    {
+        if (!OperationCurrent()) Cancel();
+        return Output;
+    }
+    if (!OperationCurrent())
+    {
+        Cancel();
+        return Output;
+    }
+
+    SkiDomain::InstalledTerrainReceipt Installation;
+    Installation.GeneratorVersion = "mountain-planner-installed-terrain-v1";
+    Installation.TerrainCoreId = InstalledCore.ContentId;
+    Installation.CoverEcologyId = InstalledEcology.ContentId;
+    Installation.OptionalSources = {
+        {"naip", "USDA NAIP RGB+NIR", SkiDomain::OptionalSourceStatus::NotRequested, {},
+            "SYNTHETIC_FIXTURE_NOT_REQUESTED", "USGS public domain", "USDA/USGS"},
+        {"overpass", "OpenStreetMap vector context",
+            SkiDomain::OptionalSourceStatus::NotRequested, {},
+            "SYNTHETIC_FIXTURE_NOT_REQUESTED", "ODbL 1.0",
+            "OpenStreetMap contributors"}};
+    InstalledTerrainStore InstallationStore(DataRoot);
+    FString InstallationDirectory;
+    SkiDomain::InstalledTerrainReceipt InstalledReceipt;
+    if (!InstallationStore.WriteAndActivate(Installation, InstallationDirectory,
+            InstalledReceipt, Output.Error, RequestValue.Lease,
+            RequestValue.SessionGeneration, RequestValue.OperationGeneration))
+    {
+        if (!OperationCurrent()) Cancel();
+        return Output;
+    }
+    if (!OperationCurrent())
+    {
+        Cancel();
+        return Output;
+    }
+
+    Report(State::Verifying, 5, 6,
+        TEXT("Reopening fixture TerrainCore, CoverEcology, and composite installation"));
+    TerrainCorePackageIndex CoreIndex;
+    CoverEcologyPackageIndex EcologyIndex;
+    InstalledTerrainIndex InstallationIndex;
+    TArray<uint8> VerifiedCover;
+    TArray<uint8> VerifiedPackedValidity;
+    if (!CoreStore.Open(UTF8_TO_TCHAR(InstalledCore.ContentId.c_str()), CoreIndex, Output.Error)
+        || !CoreStore.Verify(CoreIndex, Output.Error)
+        || !EcologyStore.Open(UTF8_TO_TCHAR(InstalledEcology.ContentId.c_str()),
+            EcologyIndex, Output.Error)
+        || !EcologyStore.Verify(EcologyIndex, Output.Error)
+        || !EcologyStore.ReadChannels(EcologyIndex, VerifiedCover,
+            VerifiedPackedValidity, Output.Error)
+        || !InstallationStore.Open(UTF8_TO_TCHAR(InstalledReceipt.ContentId.c_str()),
+            InstallationIndex, Output.Error)
+        || VerifiedCover != Cover || VerifiedPackedValidity != PackedValidity)
+    {
+        if (Output.Error.IsEmpty())
+            Output.Error = TEXT("Reopened fixture channels differ from staged analytical cover.");
+        if (!OperationCurrent()) Cancel();
+        return Output;
+    }
+    if (!OperationCurrent())
+    {
+        Cancel();
+        return Output;
+    }
+
+    // Runtime compatibility metadata is never written as a schema-1 package. It
+    // names the independently verified native components so legacy in-memory
+    // consumers can retain their existing bounds/dimension contract.
+    Manifest.ContentId = InstalledReceipt.ContentId;
+    Manifest.Assets = {
+        {"native/terraincore.ref", "terraincore-v2-content-id", InstalledCore.ContentId,
+            64, true, {}, "deterministic-p1-fixture", "repository test fixture"},
+        {"native/coverecology.ref", "cover-ecology-v1-content-id", InstalledEcology.ContentId,
+            64, true, {}, "deterministic-p1-fixture", "repository test fixture"}};
+    const auto Publish = [&]()
+    {
+        Output.PackageDirectory = MoveTemp(InstallationDirectory);
+        Output.Manifest = MoveTemp(Manifest);
+        Output.Heightfield = MoveTemp(Field);
+        Output.Cover = MoveTemp(VerifiedCover);
+        Output.CoverValidity = MoveTemp(CoverValidity);
+        Output.TerrainCoreManifest = MoveTemp(InstalledCore);
+        Output.CoverEcologyManifest = MoveTemp(InstalledEcology);
+        Output.InstallationReceipt = MoveTemp(InstalledReceipt);
+        Output.HasNativeV2Installation = true;
+        Output.Warnings.Add(TEXT("Synthetic fixture intentionally did not request optional NAIP imagery."));
+        Output.Warnings.Add(TEXT("Synthetic fixture intentionally did not request optional vector context."));
+        Output.Ok = true;
+        Output.FinalState = State::Installed;
+    };
+    const bool Published = !CancellationValue->IsCancelled()
+        && (RequestValue.Lease
+            ? RequestValue.Lease->RunIfCurrent(RequestValue.SessionGeneration,
+                RequestValue.OperationGeneration, Publish)
+            : (Publish(), true));
+    if (!Published)
+    {
+        Cancel();
+        return Output;
+    }
+    Report(State::Installed, 6, 6, TEXT("Native fixture installation activated"));
     return Output;
 }

@@ -1,22 +1,22 @@
 #include "SkiPreparation/NativeTerrainProvider.h"
 
 #include "SkiPreparation/GeoTiffDecoder.h"
+#include "SkiPreparation/CoverEcologyStore.h"
 #include "SkiPreparation/TerrainAcquisition.h"
+#include "SkiPreparation/TerrainCorePackageStore.h"
 #include "SkiPreparation/TerrainPackageStore.h"
+#include "SkiPreparation/WorldCoverCogDecoder.h"
 #include "Dom/JsonObject.h"
 #include "HAL/CriticalSection.h"
 #include "HAL/Event.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
-#include "IImageWrapper.h"
-#include "IImageWrapperModule.h"
 #include "Misc/DateTime.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #include "Misc/ScopeExit.h"
-#include "Modules/ModuleManager.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
@@ -25,7 +25,6 @@
 
 namespace
 {
-constexpr int32 WorldCoverZoom = 14;
 constexpr int64 MaxPreparationLogBytes = 1024 * 1024;
 
 FCriticalSection DiagnosticsMutex;
@@ -240,8 +239,8 @@ FString WriteFailureDiagnostic(const FString& DataRoot, const SkiPreparation::Re
     Root->SetNumberField(TEXT("activityTimeoutSeconds"), Failure.ActivityTimeoutSeconds);
     Root->SetNumberField(TEXT("totalTimeoutSeconds"), Failure.TotalTimeoutSeconds);
     Root->SetStringField(TEXT("retryOutcome"), Failure.RetryOutcome.Left(128));
-    Root->SetStringField(TEXT("profile"), Request.Profile == SkiPreparation::SourceProfile::High
-        ? TEXT("high") : TEXT("standard"));
+    Root->SetStringField(TEXT("profile"), Request.Profile == SkiPreparation::SourceProfile::Medium
+        ? TEXT("medium") : TEXT("legacy-standard"));
     Root->SetNumberField(TEXT("requestedWest"), Request.Bounds.WestDeg);
     Root->SetNumberField(TEXT("requestedSouth"), Request.Bounds.SouthDeg);
     Root->SetNumberField(TEXT("requestedEast"), Request.Bounds.EastDeg);
@@ -420,118 +419,177 @@ SkiDomain::GeographicBounds Expand(const SkiDomain::GeographicBounds& Bounds, co
     return {Bounds.WestDeg - Lon, Bounds.SouthDeg - Lat, Bounds.EastDeg + Lon, Bounds.NorthDeg + Lat};
 }
 
-double TileX(const double Longitude)
+FString WorldCoverTileName(const int32 SouthDegrees, const int32 WestDegrees)
 {
-    return (Longitude + 180.0) / 360.0 * static_cast<double>(1 << WorldCoverZoom);
+    return FString::Printf(TEXT("%c%02d%c%03d"), SouthDegrees >= 0 ? 'N' : 'S',
+        FMath::Abs(SouthDegrees), WestDegrees >= 0 ? 'E' : 'W', FMath::Abs(WestDegrees));
 }
 
-double TileY(const double Latitude)
+class FHttpCogSource final : public SkiPreparation::ICogByteSource
 {
-    const double Radians = FMath::DegreesToRadians(FMath::Clamp(Latitude, -85.05112878, 85.05112878));
-    return (1.0 - std::log(std::tan(Radians) + 1.0 / std::cos(Radians)) / PI) * 0.5
-        * static_cast<double>(1 << WorldCoverZoom);
-}
+public:
+    FHttpCogSource(SkiPreparation::IAcquisitionTransport& InTransport, FString InUrl,
+        const SkiPreparation::Request& InPreparationRequest,
+        const TSharedRef<SkiPreparation::Cancellation>& InCancellation,
+        const double InOperationBegan, const SkiPreparation::RetryPolicy& InPolicy,
+        const int32 InTileIndex, const int32 InTileCount,
+        TFunction<void(const SkiPreparation::HttpAcquisitionRequest&, int32, int32)> InBeforeAttempt)
+        : Transport(InTransport), Url(std::move(InUrl)), PreparationRequest(InPreparationRequest)
+        , Cancellation(InCancellation), OperationBegan(InOperationBegan), Policy(InPolicy)
+        , TileIndex(InTileIndex), TileCount(InTileCount), BeforeAttempt(std::move(InBeforeAttempt)) {}
 
-uint8 WorldCoverCode(const uint8 R, const uint8 G, const uint8 B)
-{
-    struct Color { uint8 R, G, B, Code; };
-    static constexpr Color Colors[]{{0,100,0,10},{255,187,34,20},{255,255,76,30},{240,150,255,40},
-        {250,0,0,50},{180,180,180,60},{240,240,240,70},{0,100,200,80},{0,150,160,90},
-        {0,207,117,95},{250,230,160,100}};
-    int32 Best = MAX_int32;
-    uint8 Code = 255;
-    for (const Color& Value : Colors)
+    bool Initialize(SkiPreparation::ProviderFailure& OutFailure)
     {
-        const int32 DR = static_cast<int32>(R) - Value.R;
-        const int32 DG = static_cast<int32>(G) - Value.G;
-        const int32 DB = static_cast<int32>(B) - Value.B;
-        const int32 Distance = DR * DR + DG * DG + DB * DB;
-        if (Distance < Best) { Best = Distance; Code = Value.Code; }
+        constexpr uint64 HeaderBytes = 1024ULL * 1024ULL;
+        SkiPreparation::HttpAcquisitionResult Result;
+        if (!Fetch(0, HeaderBytes, Result, OutFailure)) return false;
+        uint64 ParsedSize = 0;
+        if (!SkiPreparation::ValidateContentRange(Result.ContentRange, {0, HeaderBytes},
+                Result.Bytes.Num(), ParsedSize) || ParsedSize < HeaderBytes
+            || ParsedSize > 512ULL * 1024ULL * 1024ULL)
+        {
+            OutFailure = {};
+            OutFailure.Code = TEXT("WORLDCOVER_COG_RANGE_INVALID");
+            OutFailure.Stage = SkiPreparation::FailureStage::Acquisition;
+            OutFailure.Product = SkiPreparation::ProviderProduct::WorldCover;
+            OutFailure.Summary = TEXT("WorldCover COG returned an invalid or unsafe Content-Range.");
+            return false;
+        }
+        TotalSize = ParsedSize;
+        Cache.Add(0, MoveTemp(Result.Bytes));
+        CacheOrder.Add(0);
+        return true;
     }
-    return Code;
-}
 
-struct TileImage { int32 X = 0; int32 Y = 0; int32 Width = 0; int32 Height = 0; TArray64<uint8> Rgba; };
+    uint64 Size() const noexcept override { return TotalSize; }
+
+    bool Read(const uint64 Offset, const uint64 Length, TArray<uint8>& OutBytes,
+        FString& OutError) override
+    {
+        OutBytes.Reset();
+        if (Length == 0 || Offset > TotalSize || Length > TotalSize - Offset)
+        {
+            OutError = TEXT("COG read range is outside the immutable object.");
+            return false;
+        }
+        OutBytes.Reserve(static_cast<int32>(Length));
+        uint64 Position = Offset;
+        uint64 Remaining = Length;
+        while (Remaining > 0)
+        {
+            constexpr uint64 BlockBytes = 1024ULL * 1024ULL;
+            const uint64 BlockOffset = (Position / BlockBytes) * BlockBytes;
+            const uint64 BlockLength = FMath::Min(BlockBytes, TotalSize - BlockOffset);
+            TArray<uint8>* Block = Cache.Find(BlockOffset);
+            if (!Block)
+            {
+                SkiPreparation::HttpAcquisitionResult Result;
+                SkiPreparation::ProviderFailure Failure;
+                if (!Fetch(BlockOffset, BlockLength, Result, Failure))
+                {
+                    OutError = Failure.Summary.IsEmpty() ? TEXT("COG range acquisition failed.") : Failure.Summary;
+                    return false;
+                }
+                Cache.Add(BlockOffset, MoveTemp(Result.Bytes));
+                CacheOrder.Add(BlockOffset);
+                CachedBytes += BlockLength;
+                while (CachedBytes > 16ULL * 1024ULL * 1024ULL && CacheOrder.Num() > 1)
+                {
+                    const uint64 Evict = CacheOrder[0];
+                    CacheOrder.RemoveAt(0);
+                    if (TArray<uint8>* Bytes = Cache.Find(Evict)) CachedBytes -= Bytes->Num();
+                    Cache.Remove(Evict);
+                }
+                Block = Cache.Find(BlockOffset);
+            }
+            const uint64 Within = Position - BlockOffset;
+            const uint64 Count = FMath::Min(Remaining, BlockLength - Within);
+            OutBytes.Append(Block->GetData() + Within, static_cast<int32>(Count));
+            Position += Count;
+            Remaining -= Count;
+        }
+        return static_cast<uint64>(OutBytes.Num()) == Length;
+    }
+
+private:
+    bool Fetch(const uint64 Offset, const uint64 Length,
+        SkiPreparation::HttpAcquisitionResult& OutResult,
+        SkiPreparation::ProviderFailure& OutFailure)
+    {
+        SkiPreparation::HttpAcquisitionRequest Request;
+        Request.Url = Url;
+        Request.Product = SkiPreparation::ProviderProduct::WorldCover;
+        Request.Tile = {TileIndex - 1, 0, TileCount, 1, 0, 0, 0, 0};
+        Request.ActivityTimeoutSeconds = Policy.ActivityTimeoutSeconds;
+        Request.TotalTimeoutSeconds = Policy.TotalTimeoutSeconds;
+        Request.MaximumResponseBytes = FMath::Min<uint64>(Length, 1024ULL * 1024ULL);
+        Request.ByteRange = SkiPreparation::HttpByteRange{Offset, Length};
+        return DownloadWithRetry(Transport, Request, Policy, PreparationRequest, Cancellation,
+            OperationBegan, TileIndex, TileCount, BeforeAttempt, OutResult, OutFailure);
+    }
+
+    SkiPreparation::IAcquisitionTransport& Transport;
+    FString Url;
+    const SkiPreparation::Request& PreparationRequest;
+    TSharedRef<SkiPreparation::Cancellation> Cancellation;
+    double OperationBegan = 0.0;
+    SkiPreparation::RetryPolicy Policy;
+    int32 TileIndex = 0;
+    int32 TileCount = 0;
+    TFunction<void(const SkiPreparation::HttpAcquisitionRequest&, int32, int32)> BeforeAttempt;
+    uint64 TotalSize = 0;
+    uint64 CachedBytes = 1024ULL * 1024ULL;
+    TMap<uint64, TArray<uint8>> Cache;
+    TArray<uint64> CacheOrder;
+};
 
 bool AcquireWorldCover(SkiPreparation::IAcquisitionTransport& Transport,
     const SkiDomain::GeographicBounds& Bounds, const SkiPreparation::Request& PreparationRequest,
     const TSharedRef<SkiPreparation::Cancellation>& Cancellation, const double OperationBegan,
     const SkiPreparation::RetryPolicy& Policy,
     const TFunction<void(const SkiPreparation::HttpAcquisitionRequest&, int32, int32)>& BeforeAttempt,
-    TArray<uint8>& OutCover,
+    TArray<uint8>& OutCover, TArray<uint8>& OutValidity,
     uint32& OutWidth, uint32& OutHeight, FString& OutError,
     SkiPreparation::ProviderFailure& OutFailure)
 {
-    const int32 MinX = FMath::FloorToInt(TileX(Bounds.WestDeg));
-    const int32 MaxX = FMath::FloorToInt(TileX(Bounds.EastDeg));
-    const int32 MinY = FMath::FloorToInt(TileY(Bounds.NorthDeg));
-    const int32 MaxY = FMath::FloorToInt(TileY(Bounds.SouthDeg));
-    const int32 TileCount = (MaxX - MinX + 1) * (MaxY - MinY + 1);
+    const int32 MinWest = FMath::FloorToInt(Bounds.WestDeg / 3.0) * 3;
+    const int32 MaxWest = FMath::FloorToInt((Bounds.EastDeg - 1.0e-10) / 3.0) * 3;
+    const int32 MinSouth = FMath::FloorToInt(Bounds.SouthDeg / 3.0) * 3;
+    const int32 MaxSouth = FMath::FloorToInt((Bounds.NorthDeg - 1.0e-10) / 3.0) * 3;
+    const int32 TileCount = ((MaxWest - MinWest) / 3 + 1) * ((MaxSouth - MinSouth) / 3 + 1);
     int32 TileIndex = 0;
-    TArray<TileImage> Tiles;
-    IImageWrapperModule& Images = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
-    for (int32 X = MinX; X <= MaxX; ++X)
+    TArray<SkiPreparation::DecodedCoverWindow> Tiles;
+    for (int32 South = MinSouth; South <= MaxSouth; South += 3)
     {
-        for (int32 Y = MinY; Y <= MaxY; ++Y)
+        for (int32 West = MinWest; West <= MaxWest; West += 3)
         {
             ++TileIndex;
-            const FString Url = FString::Printf(TEXT("https://wmts.terrascope.be/?service=WMTS&request=GetTile&version=1.0.0&layer=esa-worldcover-map-10m-2021-v2_map&style=default&format=image/png&tilematrixset=EPSG:3857&TileMatrix=14&TileCol=%d&TileRow=%d&TIME=2021-01-01"), X, Y);
-            SkiPreparation::HttpAcquisitionRequest HttpRequest;
-            HttpRequest.Url = Url;
-            HttpRequest.Product = SkiPreparation::ProviderProduct::WorldCover;
-            HttpRequest.Tile = {X - MinX, Y - MinY, MaxX - MinX + 1, MaxY - MinY + 1, 0, 0, 512, 512};
-            HttpRequest.ActivityTimeoutSeconds = Policy.ActivityTimeoutSeconds;
-            HttpRequest.TotalTimeoutSeconds = Policy.TotalTimeoutSeconds;
-            HttpRequest.MaximumResponseBytes = Policy.MaximumResponseBytes;
-            SkiPreparation::HttpAcquisitionResult Downloaded;
-            if (!DownloadWithRetry(Transport, HttpRequest, Policy, PreparationRequest, Cancellation,
-                    OperationBegan, TileIndex, TileCount, BeforeAttempt, Downloaded, OutFailure))
+            const FString Name = WorldCoverTileName(South, West);
+            const FString Url = FString::Printf(TEXT("https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/ESA_WorldCover_10m_2021_v200_%s_Map.tif"), *Name);
+            FHttpCogSource Source(Transport, Url, PreparationRequest, Cancellation, OperationBegan,
+                Policy, TileIndex, TileCount, BeforeAttempt);
+            if (!Source.Initialize(OutFailure)) { OutError = OutFailure.Summary; return false; }
+            SkiDomain::GeographicBounds Intersection{
+                FMath::Max(Bounds.WestDeg, static_cast<double>(West)),
+                FMath::Max(Bounds.SouthDeg, static_cast<double>(South)),
+                FMath::Min(Bounds.EastDeg, static_cast<double>(West + 3)),
+                FMath::Min(Bounds.NorthDeg, static_cast<double>(South + 3))};
+            SkiPreparation::DecodedCoverWindow Window;
+            bool bDecoded = false;
+            const bool bDecodeJobRan = SkiPreparation::ExecuteBoundedDecodeJob(Cancellation,
+                [&]() { return OperationCurrent(PreparationRequest, Cancellation); }, [&]()
+                {
+                    bDecoded = SkiPreparation::DecodeWorldCoverCogWindow(Source, Intersection,
+                        Window, OutFailure, [&]() { return !OperationCurrent(PreparationRequest, Cancellation); });
+                    return true;
+                });
+            if (!bDecodeJobRan || !bDecoded)
             {
+                if (OutFailure.Summary.IsEmpty()) OutFailure.Summary = TEXT("WorldCover COG decode was cancelled.");
                 OutError = OutFailure.Summary;
                 return false;
             }
-            TArray<uint8>& Bytes = Downloaded.Bytes;
-            const TSharedPtr<IImageWrapper> Wrapper = Images.CreateImageWrapper(EImageFormat::PNG);
-            TileImage Tile;
-            Tile.X = X; Tile.Y = Y;
-            bool bDecoded = false;
-            const bool bDecodeJobRan = SkiPreparation::ExecuteBoundedDecodeJob(Cancellation,
-                [&]() { return OperationCurrent(PreparationRequest, Cancellation); },
-                [&]()
-                {
-                    bDecoded = Wrapper.IsValid() && Wrapper->SetCompressed(Bytes.GetData(), Bytes.Num())
-                        && Wrapper->GetRaw(ERGBFormat::RGBA, 8, Tile.Rgba);
-                    return true;
-                });
-            if (!bDecodeJobRan)
-            {
-                OutError = TEXT("WorldCover decode cancelled.");
-                OutFailure = {};
-                OutFailure.Code = TEXT("PREPARATION_CANCELLED");
-                OutFailure.Stage = SkiPreparation::FailureStage::Decoding;
-                OutFailure.Product = SkiPreparation::ProviderProduct::WorldCover;
-                OutFailure.Retry = SkiPreparation::RetryClassification::Retryable;
-                OutFailure.Summary = OutError;
-                return false;
-            }
-            if (!bDecoded)
-            {
-                OutError = TEXT("WorldCover PNG decode failed.");
-                OutFailure = {};
-                OutFailure.Code = TEXT("WORLDCOVER_PNG_DECODE_FAILED");
-                OutFailure.Stage = SkiPreparation::FailureStage::Decoding;
-                OutFailure.Product = SkiPreparation::ProviderProduct::WorldCover;
-                OutFailure.Retry = SkiPreparation::RetryClassification::Retryable;
-                OutFailure.Summary = OutError;
-                OutFailure.HttpStatus = Downloaded.HttpStatus;
-                OutFailure.ContentType = Downloaded.ContentType;
-                OutFailure.ResponseBytes = Bytes.Num();
-                OutFailure.ResponseSha256 = SkiPreparation::Sha256(Bytes);
-                return false;
-            }
-            Tile.Width = Wrapper->GetWidth();
-            Tile.Height = Wrapper->GetHeight();
-            Tiles.Add(std::move(Tile));
+            Tiles.Add(MoveTemp(Window));
         }
     }
     const double CenterLat = (Bounds.SouthDeg + Bounds.NorthDeg) * 0.5;
@@ -539,7 +597,8 @@ bool AcquireWorldCover(SkiPreparation::IAcquisitionTransport& Transport,
     const double HeightM = (Bounds.NorthDeg - Bounds.SouthDeg) * 111320.0;
     OutWidth = FMath::Clamp(FMath::RoundToInt(WidthM / 10.0), 2, 1200);
     OutHeight = FMath::Clamp(FMath::RoundToInt(HeightM / 10.0), 2, 1200);
-    OutCover.Init(255, static_cast<int32>(static_cast<uint64>(OutWidth) * OutHeight));
+    OutCover.Init(0, static_cast<int32>(static_cast<uint64>(OutWidth) * OutHeight));
+    OutValidity.Init(0, OutCover.Num());
     for (uint32 Row = 0; Row < OutHeight; ++Row)
     {
         if (!OperationCurrent(PreparationRequest, Cancellation))
@@ -555,23 +614,34 @@ bool AcquireWorldCover(SkiPreparation::IAcquisitionTransport& Transport,
         }
         const double Latitude = Bounds.NorthDeg - (static_cast<double>(Row) + 0.5) / OutHeight
             * (Bounds.NorthDeg - Bounds.SouthDeg);
-        const double Yf = TileY(Latitude);
         for (uint32 Column = 0; Column < OutWidth; ++Column)
         {
             const double Longitude = Bounds.WestDeg + (static_cast<double>(Column) + 0.5) / OutWidth
                 * (Bounds.EastDeg - Bounds.WestDeg);
-            const double Xf = TileX(Longitude);
-            const int32 TX = FMath::FloorToInt(Xf), TY = FMath::FloorToInt(Yf);
-            const TileImage* Tile = Tiles.FindByPredicate([&](const TileImage& Value) { return Value.X == TX && Value.Y == TY; });
+            const SkiPreparation::DecodedCoverWindow* Tile = Tiles.FindByPredicate(
+                [&](const SkiPreparation::DecodedCoverWindow& Value)
+                {
+                    return Longitude >= Value.ActualOuterBounds.WestDeg
+                        && Longitude <= Value.ActualOuterBounds.EastDeg
+                        && Latitude >= Value.ActualOuterBounds.SouthDeg
+                        && Latitude <= Value.ActualOuterBounds.NorthDeg;
+                });
             if (!Tile) continue;
-            const int32 PX = FMath::Clamp(FMath::FloorToInt((Xf - TX) * Tile->Width), 0, Tile->Width - 1);
-            const int32 PY = FMath::Clamp(FMath::FloorToInt((Yf - TY) * Tile->Height), 0, Tile->Height - 1);
-            const int64 Index = (static_cast<int64>(PY) * Tile->Width + PX) * 4;
-            if (Tile->Rgba[Index + 3] != 0) OutCover[static_cast<int32>(Row * OutWidth + Column)] =
-                WorldCoverCode(Tile->Rgba[Index], Tile->Rgba[Index + 1], Tile->Rgba[Index + 2]);
+            const int32 PX = FMath::Clamp(FMath::RoundToInt((Longitude
+                - Tile->SampleCenterBounds.WestDeg) / Tile->LongitudeSpacingDeg), 0,
+                static_cast<int32>(Tile->Width) - 1);
+            const int32 PY = FMath::Clamp(FMath::RoundToInt((Tile->SampleCenterBounds.NorthDeg
+                - Latitude) / Tile->LatitudeSpacingDeg), 0, static_cast<int32>(Tile->Height) - 1);
+            const int32 SourceIndex = PY * Tile->Width + PX;
+            const int32 OutputIndex = Row * OutWidth + Column;
+            if (Tile->Validity[SourceIndex])
+            {
+                OutCover[OutputIndex] = Tile->Classes[SourceIndex];
+                OutValidity[OutputIndex] = 1;
+            }
         }
     }
-    if (OutCover.Contains(255))
+    if (OutValidity.Contains(0))
     {
         OutError = TEXT("WorldCover contains missing cells.");
         OutFailure = {};
@@ -619,7 +689,7 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
     Result Output;
     const double Began = FPlatformTime::Seconds();
     RetryPolicy Policy;
-    Policy.OperationDeadlineSeconds = RequestValue.Profile == SourceProfile::High ? 480.0 : 300.0;
+    Policy.OperationDeadlineSeconds = 300.0;
     ProviderProduct ActiveProduct = ProviderProduct::None;
     uint64 ActiveCompleted = 0;
     auto Report = [&](const State Phase, const uint64 Completed, const TCHAR* Detail)
@@ -692,10 +762,11 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
     ActiveProduct = ProviderProduct::WorldCover;
     Report(State::Acquiring, 4, TEXT("Downloading required ESA WorldCover tiles"));
     TArray<uint8> Cover;
+    TArray<uint8> CoverValidity;
     uint32 CoverWidth = 0, CoverHeight = 0;
     ProviderFailure CoverFailure;
     if (!AcquireWorldCover(*Transport, ActualBounds, RequestValue, CancellationValue, Began,
-            Policy, BeforeAttempt, Cover, CoverWidth, CoverHeight, Output.Error, CoverFailure))
+            Policy, BeforeAttempt, Cover, CoverValidity, CoverWidth, CoverHeight, Output.Error, CoverFailure))
     {
         if (Output.Error.IsEmpty()) Output.Error = TEXT("WorldCover contains missing cells.");
         if (CoverFailure.Summary.IsEmpty()) CoverFailure.Summary = Output.Error;
@@ -705,30 +776,6 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
     ActiveProduct = ProviderProduct::None;
     if (!OperationCurrent(RequestValue, CancellationValue)) return Output;
     Report(State::Deriving, 5, TEXT("Deriving compact cover and contour products"));
-    TArray<PackageAssetBytes> Assets;
-    Assets.Add({TEXT("cover.u8"), TEXT("worldcover-byte-grid"), std::move(Cover), true, {},
-        TEXT("ESA WorldCover 2021 v200"), TEXT("CC BY 4.0")});
-    Assets.Add({TEXT("surround.f32le"), TEXT("heightfield-surround-f32le"), FloatBytes(Surround), true, {},
-        TEXT("USGS 3DEP"), TEXT("USGS public domain")});
-    PackageAssetBytes Contours{TEXT("contours.f32le"), TEXT("contour-segments-f32le"), {}, true, {},
-        TEXT("derived from USGS 3DEP"), TEXT("generated artifact")};
-    for (uint32 Row = 0; Row < Core.Height; Row += FMath::Max(1U, Core.Height / 128U))
-    {
-        const float Segment[4]{static_cast<float>(Core.WestM), static_cast<float>(Core.SampleNorthM(Row)),
-            static_cast<float>(Core.EastM(Core.Width - 1)), static_cast<float>(Core.SampleNorthM(Row))};
-        Contours.Bytes.Append(reinterpret_cast<const uint8*>(Segment), sizeof(Segment));
-    }
-    Assets.Add(std::move(Contours));
-    PackageAssetBytes CoverDisplay{TEXT("cover-display.u8"), TEXT("cover-display-compact"), {}, true, {},
-        TEXT("derived from ESA WorldCover 2021 v200"), TEXT("CC BY 4.0")};
-    CoverDisplay.Bytes = Assets[0].Bytes;
-    Assets.Add(std::move(CoverDisplay));
-    Assets.Add({TEXT("imagery.jpg"), TEXT("image/jpeg"), {}, false,
-        TEXT("NAIP was unavailable or not returned by the current source request."),
-        TEXT("USDA/USGS NAIP"), TEXT("public domain")});
-    Assets.Add({TEXT("vectors.json"), TEXT("overpass-json"), {}, false,
-        TEXT("Overpass vector context was unavailable or omitted after bounded acquisition."),
-        TEXT("OpenStreetMap Overpass"), TEXT("ODbL")});
     Output.Warnings.Add(TEXT("Optional NAIP imagery was not installed."));
     Output.Warnings.Add(TEXT("Optional Overpass vector context was not installed."));
     SkiDomain::TerrainManifest Manifest;
@@ -744,31 +791,130 @@ SkiPreparation::Result SkiPreparation::NativeTerrainProvider::Prepare(const Requ
     Manifest.CoverWidth = CoverWidth;
     Manifest.CoverHeight = CoverHeight;
     if (!OperationCurrent(RequestValue, CancellationValue)) return Output;
-    Report(State::WritingStaging, 6, TEXT("Writing content-addressed package staging"));
-    PackageStore Store(DataRoot);
-    if (!Store.WriteAndActivate(std::move(Manifest), Core, Output.PackageDirectory,
-        Output.Manifest, Output.Error, Assets, RequestValue.Lease,
-        RequestValue.SessionGeneration, RequestValue.OperationGeneration))
+    Report(State::WritingStaging, 6, TEXT("Writing TerrainCore and analytical CoverEcology staging"));
+
+    SkiDomain::TerrainCoreManifest TerrainCore;
+    TerrainCore.GeneratorVersion = "mountain-planner-terraincore-v2";
+    TerrainCore.ProcessingVersions = {"usgs-3dep-medium-export-v1", "terraincore-derivation-v1"};
+    TerrainCore.LocalOrigin = Manifest.LocalOrigin;
+    TerrainCore.Width = Core.Width;
+    TerrainCore.Height = Core.Height;
+    TerrainCore.DeliveredEastSpacingM = Core.EastSpacingM;
+    TerrainCore.DeliveredNorthSpacingM = Core.NorthSpacingM;
+    TerrainCore.Registration = SkiDomain::PixelRegistration::SampleCenter;
+    TerrainCore.SampleCenterBounds = {Core.WestM, Core.SampleNorthM(Core.Height - 1U),
+        Core.EastM(Core.Width - 1U), Core.NorthM};
+    SkiDomain::ComputeTerrainCoreBounds(TerrainCore.Width, TerrainCore.Height,
+        TerrainCore.DeliveredEastSpacingM, TerrainCore.DeliveredNorthSpacingM,
+        TerrainCore.SampleCenterBounds, TerrainCore.OuterBounds);
+    TerrainCore.Source.SourceId = "usgs-3dep-export";
+    TerrainCore.Source.Product = "USGS 3DEP dynamic export (Medium)";
+    TerrainCore.Source.AcquisitionEpoch = Manifest.RequestedAtUtc;
+    TerrainCore.Source.HorizontalCrs = "EPSG:4326/WGS84 to local ENU";
+    TerrainCore.Source.HorizontalDatum = "WGS84";
+    TerrainCore.Source.VerticalDatum = Manifest.VerticalDatum;
+    TerrainCore.Source.License = "USGS public domain";
+    TerrainCore.Source.Attribution = "USGS 3D Elevation Program";
+    TerrainCore.Source.NativeSpacingReported = false;
+    TerrainCore.Source.NativeEastSpacingM = 0.0;
+    TerrainCore.Source.NativeNorthSpacingM = 0.0;
+    SkiDomain::TerrainCoreSource SurroundSource = TerrainCore.Source;
+    SurroundSource.SourceId = "usgs-3dep-surround";
+    SurroundSource.Product = "USGS 3DEP required surrounding elevation";
+    TerrainCore.AdditionalSources.push_back(std::move(SurroundSource));
+
+    TerrainCorePackageStore CoreStore(DataRoot);
+    FString CoreDirectory;
+    if (!CoreStore.WriteAndActivate(TerrainCore, Core, CoreDirectory,
+            Output.TerrainCoreManifest, Output.Error, RequestValue.Lease,
+            RequestValue.SessionGeneration, RequestValue.OperationGeneration))
     {
         ProviderFailure Failure;
-        Failure.Code = TEXT("PACKAGE_WRITE_FAILED");
+        Failure.Code = TEXT("TERRAINCORE_WRITE_FAILED");
         Failure.Stage = FailureStage::Writing;
         Failure.Summary = Output.Error;
         FinishFailure(std::move(Failure));
         return Output;
     }
-    if (!OperationCurrent(RequestValue, CancellationValue)) return Output;
-    Report(State::Verifying, 7, TEXT("Verifying activated package"));
-    if (!Store.Load(UTF8_TO_TCHAR(Output.Manifest.ContentId.c_str()), Output.Manifest,
-        Output.Heightfield, Output.Error, &Output.Cover))
+
+    SkiDomain::CoverEcologyManifest Ecology;
+    Ecology.GeneratorVersion = "mountain-planner-cover-ecology-v1";
+    Ecology.CoverRevision = 1;
+    Ecology.Source = {"esa-worldcover-2021-v200", "ESA WorldCover analytical class COG",
+        "2021", "official-class-value-cog", "CC BY 4.0",
+        "ESA WorldCover project / Contains modified Copernicus Sentinel data (2021)"};
+    Ecology.Transform.Width = CoverWidth;
+    Ecology.Transform.Height = CoverHeight;
+    Ecology.Transform.LongitudeStepDeg = (ActualBounds.EastDeg - ActualBounds.WestDeg) / CoverWidth;
+    Ecology.Transform.LatitudeStepDeg = (ActualBounds.NorthDeg - ActualBounds.SouthDeg) / CoverHeight;
+    Ecology.Transform.SampleCenterBounds = {
+        ActualBounds.WestDeg + Ecology.Transform.LongitudeStepDeg * 0.5,
+        ActualBounds.SouthDeg + Ecology.Transform.LatitudeStepDeg * 0.5,
+        ActualBounds.EastDeg - Ecology.Transform.LongitudeStepDeg * 0.5,
+        ActualBounds.NorthDeg - Ecology.Transform.LatitudeStepDeg * 0.5};
+    SkiDomain::ComputeCoverEcologyOuterBounds(CoverWidth, CoverHeight,
+        Ecology.Transform.LongitudeStepDeg, Ecology.Transform.LatitudeStepDeg,
+        Ecology.Transform.SampleCenterBounds, Ecology.Transform.OuterBounds);
+    TArray<uint8> PackedValidity;
+    PackedValidity.Init(0, FMath::DivideAndRoundUp(CoverValidity.Num(), 8));
+    for (int32 Index = 0; Index < CoverValidity.Num(); ++Index)
+        if (CoverValidity[Index]) PackedValidity[Index / 8] |= static_cast<uint8>(1U << (Index % 8));
+    CoverEcologyStore EcologyStore(DataRoot);
+    FString EcologyDirectory;
+    if (!EcologyStore.WriteAndActivate(Ecology, Cover, PackedValidity, EcologyDirectory,
+            Output.CoverEcologyManifest, Output.Error, RequestValue.Lease,
+            RequestValue.SessionGeneration, RequestValue.OperationGeneration))
     {
         ProviderFailure Failure;
-        Failure.Code = TEXT("PACKAGE_VERIFY_FAILED");
+        Failure.Code = TEXT("COVER_ECOLOGY_WRITE_FAILED");
         Failure.Stage = FailureStage::Verification;
         Failure.Summary = Output.Error;
         FinishFailure(std::move(Failure));
         return Output;
     }
+
+    SkiDomain::InstalledTerrainReceipt Installation;
+    Installation.GeneratorVersion = "mountain-planner-installed-terrain-v1";
+    Installation.TerrainCoreId = Output.TerrainCoreManifest.ContentId;
+    Installation.CoverEcologyId = Output.CoverEcologyManifest.ContentId;
+    Installation.OptionalSources = {
+        {"naip", "USDA NAIP RGB+NIR", SkiDomain::OptionalSourceStatus::Unavailable, {},
+            "NO_COMPLETE_COVERAGE_OR_NOT_RETURNED", "USGS public domain", "USDA/USGS"},
+        {"overpass", "OpenStreetMap vector context", SkiDomain::OptionalSourceStatus::NotRequested, {},
+            "NOT_REQUESTED_IN_P1_MEDIUM", "ODbL 1.0", "OpenStreetMap contributors"}};
+    InstalledTerrainStore InstallationStore(DataRoot);
+    if (!InstallationStore.WriteAndActivate(Installation, Output.PackageDirectory,
+            Output.InstallationReceipt, Output.Error, RequestValue.Lease,
+            RequestValue.SessionGeneration, RequestValue.OperationGeneration))
+    {
+        ProviderFailure Failure;
+        Failure.Code = TEXT("COMPOSITE_ACTIVATION_FAILED");
+        Failure.Stage = FailureStage::Activation;
+        Failure.Summary = Output.Error;
+        FinishFailure(std::move(Failure));
+        return Output;
+    }
+    if (!OperationCurrent(RequestValue, CancellationValue)) return Output;
+    Report(State::Verifying, 7, TEXT("Reopening TerrainCore, CoverEcology, and composite installation"));
+    TerrainCorePackageIndex CoreIndex;
+    CoverEcologyPackageIndex EcologyIndex;
+    InstalledTerrainIndex InstallationIndex;
+    if (!CoreStore.Open(UTF8_TO_TCHAR(Output.TerrainCoreManifest.ContentId.c_str()), CoreIndex, Output.Error)
+        || !EcologyStore.Open(UTF8_TO_TCHAR(Output.CoverEcologyManifest.ContentId.c_str()), EcologyIndex, Output.Error)
+        || !InstallationStore.Open(UTF8_TO_TCHAR(Output.InstallationReceipt.ContentId.c_str()), InstallationIndex, Output.Error))
+    {
+        ProviderFailure Failure;
+        Failure.Code = TEXT("COMPOSITE_VERIFY_FAILED");
+        Failure.Stage = FailureStage::Verification;
+        Failure.Summary = Output.Error;
+        FinishFailure(std::move(Failure));
+        return Output;
+    }
+    Output.Manifest = MoveTemp(Manifest);
+    Output.Heightfield = MoveTemp(Core);
+    Output.Cover = MoveTemp(Cover);
+    Output.CoverValidity = MoveTemp(CoverValidity);
+    Output.HasNativeV2Installation = true;
     Output.Ok = true;
     Output.FinalState = State::Installed;
     Report(State::Installed, 8, TEXT("Native terrain package installed"));
