@@ -3,6 +3,7 @@
 #include "SkiPreparation/GeoTiffDecoder.h"
 #include "SkiPreparation/CoverEcologyStore.h"
 #include "SkiPreparation/TerrainAcquisition.h"
+#include "SkiPreparation/SkiNetGateway.h"
 #include "SkiPreparation/TerrainCorePackageStore.h"
 #include "SkiPreparation/TerrainPackageStore.h"
 #include "SkiPreparation/WorldCoverCogDecoder.h"
@@ -807,7 +808,7 @@ SkiPreparation::NativeTerrainProvider::NativeTerrainProvider(FString InDataRoot,
     TSharedPtr<IAcquisitionTransport, ESPMode::ThreadSafe> InTransport)
     : DataRoot(std::move(InDataRoot)), Transport(std::move(InTransport))
 {
-    if (!Transport) Transport = MakeShared<UnrealHttpAcquisitionTransport, ESPMode::ThreadSafe>();
+    if (!Transport) Transport = MakeShared<SkiNetGateway, ESPMode::ThreadSafe>();
     InitializePreparationDiagnostics(DataRoot);
 }
 

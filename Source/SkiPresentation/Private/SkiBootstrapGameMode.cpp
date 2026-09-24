@@ -3,6 +3,9 @@
 #include "SkiP1Widget.h"
 #include "SkiTerrainViewController.h"
 #include "SkiTerrainCoreRegression.h"
+#include "SkiSiteMapSpikeRunner.h"
+#include "SkiM0ShippingProjectionProbe.h"
+#include "SkiM0TerrainRenderProbe.h"
 #include "SkiApplication/Bootstrap.h"
 #include "SkiApplication/TerrainCoreEditedRepository.h"
 #include "SkiApplication/TerrainCoreRepository.h"
@@ -14,6 +17,9 @@
 #include "SkiPreparation/TerrainAcquisition.h"
 #include "SkiPreparation/TerrainPackageStore.h"
 #include "SkiPreparation/TerrainCorePackageStore.h"
+#include "SkiPreparation/M0TerrainCoreScale.h"
+#include "SkiPreparation/M0RasterProjectionProbe.h"
+#include "SkiPreparation/SkiNetGateway.h"
 #include "SkiTerrainRuntime/SkiTerrainActor.h"
 #include "Async/Async.h"
 #include "Camera/CameraActor.h"
@@ -260,6 +266,176 @@ void ASkiBootstrapGameMode::BeginPlay()
         FPlatformMisc::RequestExitWithStatus(false, Ready && Written ? 0 : 1);
         return;
     }
+    if (FParse::Param(FCommandLine::Get(), TEXT("SkiM0TerrainCoreScale")))
+    {
+        FString ReceiptPath, Token, Report, Error, PackageRoot, ContentId;
+        int32 Side = 0;
+        FGuid ParsedToken;
+        const bool ArgumentsValid = ExpectedMap
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Receipt="), ReceiptPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Token="), Token)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiM0Side="), Side)
+            && FGuid::Parse(Token, ParsedToken);
+        const bool bKeepPackage = FParse::Param(FCommandLine::Get(), TEXT("SkiM0KeepPackage"));
+        const bool Passed = ArgumentsValid && (bKeepPackage
+            ? SkiPreparation::RunM0TerrainCoreScale(static_cast<uint32>(Side), Report, Error,
+                PackageRoot, ContentId)
+            : SkiPreparation::RunM0TerrainCoreScale(static_cast<uint32>(Side), Report, Error));
+        Report.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+        Report.ReplaceInline(TEXT("\""), TEXT("\\\""));
+        Error.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+        Error.ReplaceInline(TEXT("\""), TEXT("\\\""));
+        PackageRoot.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+        PackageRoot.ReplaceInline(TEXT("\""), TEXT("\\\""));
+        const FString Receipt = FString::Printf(
+            TEXT("{\"token\":\"%s\",\"scenario\":\"m0-terraincore-scale\",\"side\":%d,\"passed\":%s,\"report\":\"%s\",\"error\":\"%s\",\"packageRoot\":\"%s\",\"contentId\":\"%s\"}"),
+            *Token, Side, Passed ? TEXT("true") : TEXT("false"), *Report, *Error,
+            *PackageRoot, *ContentId);
+        const bool Written = ArgumentsValid && FFileHelper::SaveStringToFile(Receipt,
+            *ReceiptPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+        FPlatformMisc::RequestExitWithStatus(false, Passed && Written ? 0 : 1);
+        return;
+    }
+    if (FParse::Param(FCommandLine::Get(), TEXT("SkiM0TerrainCoreRender")))
+    {
+        FString Root, ContentId, ReceiptPath, Token;
+        const bool ArgumentsValid = ExpectedMap
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiM0RenderRoot="), Root)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiM0ContentId="), ContentId)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Receipt="), ReceiptPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Token="), Token);
+        if (!ArgumentsValid || !StartM0TerrainRenderProbe(GetWorld(), Root, ContentId,
+                ReceiptPath, Token))
+            FPlatformMisc::RequestExitWithStatus(false, 1);
+        return;
+    }
+    if (FParse::Param(FCommandLine::Get(), TEXT("SkiM0MapSpike")))
+    {
+        FString ReceiptPath, Token;
+        const bool ArgumentsValid = ExpectedMap
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiM0MapReceipt="), ReceiptPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Token="), Token);
+        if (!ArgumentsValid || !StartSkiSiteMapSpike(GetWorld(), ReceiptPath, Token))
+            FPlatformMisc::RequestExitWithStatus(false, 1);
+        return;
+    }
+    if (FParse::Param(FCommandLine::Get(), TEXT("SkiM0RasterProjection")))
+    {
+        FString ReceiptPath, Token, CogPath, GpkgPath;
+        const bool ArgumentsValid = ExpectedMap
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Receipt="), ReceiptPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Token="), Token)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiM0Cog="), CogPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiM0GeoPackage="), GpkgPath);
+        SkiPreparation::FM0RasterProjectionReceipt Probe;
+        if (ArgumentsValid)
+        {
+            Probe = SkiPreparation::RunM0RasterProjectionProbe(CogPath, GpkgPath);
+            ProbeM0ShippingProjection(*GetWorld(), Probe);
+        }
+        const bool Passed = ArgumentsValid && Probe.bCogPassed
+            && Probe.bGeoPackagePassed
+            && (Probe.bShippingProjPassed || Probe.bFallbackProjectionPassed);
+        const FString Receipt = FString::Printf(TEXT("{\"token\":\"%s\",\"scenario\":\"m0-raster-projection\",\"passed\":%s,\"probe\":%s}"),
+            *Token, Passed ? TEXT("true") : TEXT("false"), *Probe.ToJson());
+        const bool Written = ArgumentsValid && FFileHelper::SaveStringToFile(Receipt,
+            *ReceiptPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+        FPlatformMisc::RequestExitWithStatus(false, Passed && Written ? 0 : 1);
+        return;
+    }
+    if (FParse::Param(FCommandLine::Get(), TEXT("SkiM0RealS1M")))
+    {
+        FString ReceiptPath, Token, CogUrl;
+        const bool ArgumentsValid = ExpectedMap
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Receipt="), ReceiptPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Token="), Token)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiM0CogUrl="), CogUrl);
+        const auto Probe = ArgumentsValid
+            ? SkiPreparation::RunM0RealS1MCogProbe(CogUrl)
+            : SkiPreparation::FM0RasterProjectionReceipt{};
+        const bool Passed = ArgumentsValid && Probe.bCogPassed
+            && Probe.bRealS1MProbe && Probe.bBaseTileDecoded && Probe.bOverviewTileDecoded;
+        const FString Receipt = FString::Printf(
+            TEXT("{\"token\":\"%s\",\"scenario\":\"m0-real-s1m\",\"passed\":%s,\"probe\":%s}"),
+            *Token, Passed ? TEXT("true") : TEXT("false"), *Probe.ToJson());
+        const bool Written = ArgumentsValid && FFileHelper::SaveStringToFile(Receipt,
+            *ReceiptPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+        FPlatformMisc::RequestExitWithStatus(false, Passed && Written ? 0 : 1);
+        return;
+    }
+#if !UE_BUILD_SHIPPING
+    FString M0Scenario;
+    if (FParse::Value(FCommandLine::Get(), TEXT("SkiP1Scenario="), M0Scenario)
+        && M0Scenario == TEXT("gateway-redirect"))
+    {
+        FString ReceiptPath, Url, CaPath;
+        const bool ArgumentsValid = ExpectedMap
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Receipt="), ReceiptPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiGatewayTestUrl="), Url)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiGatewayTestCA="), CaPath);
+        const auto Result = ArgumentsValid
+            ? SkiPreparation::SkiNetGateway::RunTestRedirectProbe(Url, CaPath)
+            : SkiPreparation::HttpAcquisitionResult{};
+        const bool Passed = ArgumentsValid && Result.RequestStatus == TEXT("REDIRECT_DENIED")
+            && Result.HttpStatus >= 300 && Result.HttpStatus < 400;
+        const FString Receipt = FString::Printf(
+            TEXT("{\"scenario\":\"gateway-redirect\",\"requestStatus\":\"%s\",\"httpStatus\":%d,\"passed\":%s}"),
+            *Result.RequestStatus, Result.HttpStatus, Passed ? TEXT("true") : TEXT("false"));
+        const bool Written = ArgumentsValid && FFileHelper::SaveStringToFile(Receipt,
+            *ReceiptPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+        FPlatformMisc::RequestExitWithStatus(false, Passed && Written ? 0 : 1);
+        return;
+    }
+    if (M0Scenario == TEXT("gateway-range"))
+    {
+        FString ReceiptPath, Url, CaPath;
+        const bool ArgumentsValid = ExpectedMap
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Receipt="), ReceiptPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiGatewayTestUrl="), Url)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiGatewayTestCA="), CaPath);
+        const auto Result = ArgumentsValid
+            ? SkiPreparation::SkiNetGateway::RunTestRangeProbe(Url, CaPath, 4, 4)
+            : SkiPreparation::HttpAcquisitionResult{};
+        FString Hex;
+        for (uint8 Byte : Result.Bytes) Hex += FString::Printf(TEXT("%02x"), Byte);
+        const bool bInvalidRangeCase = Url.EndsWith(TEXT("/range/bad-content-range"));
+        const bool Passed = ArgumentsValid && (bInvalidRangeCase
+            ? Result.RequestStatus == TEXT("InvalidContentRange")
+            : Result.Ok() && Result.HttpStatus == 206 && Hex == TEXT("08000000"));
+        const FString Receipt = FString::Printf(
+            TEXT("{\"scenario\":\"gateway-range\",\"httpStatus\":%d,\"bytesHex\":\"%s\",\"requestStatus\":\"%s\",\"passed\":%s}"),
+            Result.HttpStatus, *Hex, *Result.RequestStatus, Passed ? TEXT("true") : TEXT("false"));
+        const bool Written = ArgumentsValid && FFileHelper::SaveStringToFile(Receipt,
+            *ReceiptPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+        FPlatformMisc::RequestExitWithStatus(false, Passed && Written ? 0 : 1);
+        return;
+    }
+    if (M0Scenario == TEXT("gateway-cog"))
+    {
+        FString ReceiptPath, Url, CaPath, GpkgPath;
+        const bool ArgumentsValid = ExpectedMap
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Receipt="), ReceiptPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiGatewayTestUrl="), Url)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiGatewayTestCA="), CaPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiM0GeoPackage="), GpkgPath);
+        SkiPreparation::FM0RasterProjectionReceipt Probe;
+        if (ArgumentsValid)
+        {
+            Probe = SkiPreparation::RunM0GatewayRasterProbe(Url, CaPath, GpkgPath);
+            ProbeM0ShippingProjection(*GetWorld(), Probe);
+        }
+        const bool Passed = ArgumentsValid && Probe.bCogPassed && Probe.bGeoPackagePassed
+            && (Probe.bShippingProjPassed || Probe.bFallbackProjectionPassed)
+            && Probe.GatewayRangeRequests > 1;
+        const FString Receipt = FString::Printf(
+            TEXT("{\"scenario\":\"gateway-cog\",\"passed\":%s,\"probe\":%s}"),
+            Passed ? TEXT("true") : TEXT("false"), *Probe.ToJson());
+        const bool Written = ArgumentsValid && FFileHelper::SaveStringToFile(Receipt,
+            *ReceiptPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+        FPlatformMisc::RequestExitWithStatus(false, Passed && Written ? 0 : 1);
+        return;
+    }
+#endif
     if (FParse::Param(FCommandLine::Get(), TEXT("SkiP1UiLayoutSmoke")))
     {
         if (!BeginP1UiLayoutSmoke()) FPlatformMisc::RequestExitWithStatus(false, 1);

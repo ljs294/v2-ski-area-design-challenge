@@ -73,6 +73,8 @@ struct SKIPREPARATION_API HttpAcquisitionRequest
     uint64 MaximumResponseBytes = 16ULL * 1024ULL * 1024ULL;
     /** Typed single byte range. Arbitrary caller-supplied headers are intentionally unsupported. */
     TOptional<HttpByteRange> ByteRange;
+    /** Optional pinned ETag for resumable reads; sent only as a typed If-Match header. */
+    FString IfMatchETag;
     TSharedPtr<AcquisitionResourceLease, ESPMode::ThreadSafe> BackendLifetime;
 };
 
@@ -84,6 +86,8 @@ struct SKIPREPARATION_API HttpAcquisitionResult
     FString ContentType;
     FString RetryAfter;
     FString ContentRange;
+    /** Bounded server ETag, used to pin later range requests with If-Match. */
+    FString ETag;
     int32 HttpStatus = 0;
     uint64 BytesReceived = 0;
     double TimeToFirstByteSeconds = -1.0;
@@ -126,6 +130,9 @@ private:
     uint64 StartingTransportCalls = 0;
     bool bInstalled = false;
 };
+
+/** Counts an acquisition attempt and rejects it before a transport handle is created. */
+SKIPREPARATION_API bool PermitAcquisitionBeforeHandle() noexcept;
 
 SKIPREPARATION_API AcquisitionPlan BuildElevationAcquisitionPlan(
     const SkiDomain::GeographicBounds& Bounds, SourceProfile Profile, uint32 MaximumTileAxis = 1000);

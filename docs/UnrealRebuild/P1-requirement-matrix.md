@@ -10,6 +10,11 @@ The Section 0 remediation is frozen in commit `de7413dee3e011529c6289ce631c782a5
 The current repository guidance reserves staging and committing to the owner.
 Keep Section 2 changes unstaged until the owner accepts a tested checkpoint.
 
+Section 2R is a newly authorized native picker and complete-resort route; see
+[its decision record](Section2R-site-picker-plan.md). The existing CEF rows and
+receipts below remain red historical Section 2 evidence. No Section 2R M0 gate
+or new playable-resort row is accepted until its named packaged proof exists.
+
 ## Section 2 working audit — 2026-09-23
 
 Section 2 is **blocked, not accepted**. The Shipping selector audit

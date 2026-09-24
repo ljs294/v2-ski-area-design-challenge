@@ -153,6 +153,12 @@ bool SkiPreparation::ScopedAcquisitionPortDeny::IsActive() const noexcept
     return bInstalled && AcquisitionPortDenyDepth.load(std::memory_order_acquire) > 0;
 }
 
+bool SkiPreparation::PermitAcquisitionBeforeHandle() noexcept
+{
+    AcquisitionTransportCalls.fetch_add(1, std::memory_order_acq_rel);
+    return AcquisitionPortDenyDepth.load(std::memory_order_acquire) == 0;
+}
+
 uint64 SkiPreparation::ScopedAcquisitionPortDeny::ObservedTransportCalls() const noexcept
 {
     const uint64 Current = AcquisitionTransportCalls.load(std::memory_order_acquire);

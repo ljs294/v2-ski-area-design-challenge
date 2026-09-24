@@ -4,6 +4,9 @@
 #include "Algo/Reverse.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformMemory.h"
+#include "HAL/PlatformTime.h"
+#include "Tests/M0TerrainCoreTiming.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
@@ -1878,6 +1881,14 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
     OutPackageDirectory.Reset();
     OutManifest = {};
     OutError.Reset();
+    const auto ObserveMemory = [&]()
+    {
+        if (GM0TerrainCoreTiming)
+            GM0TerrainCoreTiming->ObservedPeakPhysicalBytes = FMath::Max<uint64>(
+                GM0TerrainCoreTiming->ObservedPeakPhysicalBytes,
+                FPlatformMemory::GetStats().UsedPhysical);
+    };
+    ObserveMemory();
     const auto Current = [&]()
     {
         return !Lease || Lease->IsCurrent(SessionGeneration, OperationGeneration);
@@ -1920,6 +1931,7 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
     const auto FinishShard = [&]() -> bool
     {
         if (!ShardHandle) return true;
+        const double Started = GM0TerrainCoreTiming ? FPlatformTime::Seconds() : 0.0;
         ShardHandle.Close();
         if (!ValidateNoReparsePath(ShardPath, true, &OutError)) return false;
         FString Hash;
@@ -1927,10 +1939,13 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
         SkiDomain::TerrainCoreShardDescriptor& Shard = Manifest.Shards.back();
         Shard.Bytes = ShardBytes;
         Shard.Sha256 = TCHAR_TO_UTF8(*Hash);
+        if (GM0TerrainCoreTiming)
+            GM0TerrainCoreTiming->ShardWriteSeconds += FPlatformTime::Seconds() - Started;
         return true;
     };
     const auto StartShard = [&]() -> bool
     {
+        const double Started = GM0TerrainCoreTiming ? FPlatformTime::Seconds() : 0.0;
         if (Manifest.Shards.size() >= SkiDomain::TerrainCoreMaxShards)
         {
             OutError = TEXT("TerrainCore package requires too many shards.");
@@ -1948,6 +1963,8 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
         }
         Manifest.Shards.push_back({TCHAR_TO_UTF8(*Relative), {}, 0});
         ShardBytes = 0;
+        if (GM0TerrainCoreTiming)
+            GM0TerrainCoreTiming->ShardWriteSeconds += FPlatformTime::Seconds() - Started;
         return true;
     };
     if (!StartShard()) { Cleanup(); return false; }
@@ -1963,6 +1980,7 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
         {
             ShardHandle.Close(); Cleanup(); return false;
         }
+        ObserveMemory();
         if (Encoded.Descriptor.LodIndex != Geometry.LodIndex
             || Encoded.Descriptor.LodFactor != Geometry.LodFactor
             || Encoded.Descriptor.TileX != Geometry.TileX
@@ -2000,26 +2018,33 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
         Tile.HeightShardIndex = static_cast<uint32>(Manifest.Shards.size() - 1U);
         Tile.HeightPath = Manifest.Shards.back().Path;
         Tile.HeightOffset = ShardBytes;
+        const double HeightWriteStarted = GM0TerrainCoreTiming ? FPlatformTime::Seconds() : 0.0;
         if (!ShardHandle.Write(Encoded.CompressedHeights.GetData(),
             Encoded.CompressedHeights.Num()))
         {
             OutError = TEXT("Unable to write TerrainCore height tile.");
             ShardHandle.Close(); Cleanup(); return false;
         }
+        if (GM0TerrainCoreTiming)
+            GM0TerrainCoreTiming->ShardWriteSeconds += FPlatformTime::Seconds() - HeightWriteStarted;
         ShardBytes += Tile.HeightBytes;
         Tile.ValidityShardIndex = Tile.HeightShardIndex;
         Tile.ValidityPath = Tile.HeightPath;
         Tile.ValidityOffset = ShardBytes;
+        const double ValidityWriteStarted = GM0TerrainCoreTiming ? FPlatformTime::Seconds() : 0.0;
         if (!ShardHandle.Write(Encoded.CompressedValidity.GetData(),
             Encoded.CompressedValidity.Num()))
         {
             OutError = TEXT("Unable to write TerrainCore validity tile.");
             ShardHandle.Close(); Cleanup(); return false;
         }
+        if (GM0TerrainCoreTiming)
+            GM0TerrainCoreTiming->ShardWriteSeconds += FPlatformTime::Seconds() - ValidityWriteStarted;
         ShardBytes += Tile.ValidityBytes;
         if (Tile.ProvenanceId.empty()) Tile.ProvenanceId = Manifest.Source.SourceId;
         if (Tile.ProcessingVersion.empty()) Tile.ProcessingVersion = "terraincore-derivation-v1";
         Manifest.Tiles.push_back(std::move(Tile));
+        ObserveMemory();
     }
     if (!FinishShard()) { Cleanup(); return false; }
     const FString Unsigned = SerializeTerrainCoreManifest(Manifest, false);
@@ -2042,14 +2067,25 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
         OutError = TEXT("Unable to write the TerrainCore manifest.");
         Cleanup(); return false;
     }
+    if (GM0TerrainCoreTiming)
+    {
+        GM0TerrainCoreTiming->StagingBytes = JsonBytes;
+        for (const auto& Shard : Manifest.Shards)
+            GM0TerrainCoreTiming->StagingBytes += Shard.Bytes;
+    }
     TerrainCorePackageIndex Staged;
     const FString Id = UTF8_TO_TCHAR(Manifest.ContentId.c_str());
+    const double StagedVerifyStarted = GM0TerrainCoreTiming ? FPlatformTime::Seconds() : 0.0;
+    ObserveMemory();
     if (!OpenAtDirectory(Root, Stage, Id, Staged, OutError)
         || !VerifyAtDirectory(Root, Staged, OutError))
     {
         OutError = TEXT("Staged TerrainCore verification failed: ") + OutError;
         Cleanup(); return false;
     }
+    if (GM0TerrainCoreTiming)
+        GM0TerrainCoreTiming->InternalVerifySeconds += FPlatformTime::Seconds() - StagedVerifyStarted;
+    ObserveMemory();
     const FString Packages = FPaths::Combine(Root, TEXT("TerrainCore"));
     const FString Target = FPaths::Combine(Packages, Id);
     if (!EnsureSecureDirectory(Packages, OutError))
@@ -2121,6 +2157,7 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
         return false;
     }
     if (!Lease) Publish();
+    ObserveMemory();
     return Published;
 }
 

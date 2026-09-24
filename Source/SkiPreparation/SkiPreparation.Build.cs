@@ -7,8 +7,9 @@ public class SkiPreparation : ModuleRules
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PublicDependencyModuleNames.AddRange(new[] { "Core", "SkiApplication", "SkiDomain" });
         PrivateDependencyModuleNames.AddRange(new[] {
-            "HTTP", "Json", "JsonUtilities", "ImageCore", "ImageWrapper", "LibTiff", "Projects"
+            "HTTP", "Json", "JsonUtilities", "ImageCore", "ImageWrapper", "LibTiff", "Projects",
+            "PROJ", "SQLiteCore", "SSL"
         });
-        AddEngineThirdPartyPrivateStaticDependencies(Target, "OpenSSL", "LibJpegTurbo", "zlib");
+        AddEngineThirdPartyPrivateStaticDependencies(Target, "libcurl", "nghttp2", "OpenSSL", "LibJpegTurbo", "zlib");
     }
 }

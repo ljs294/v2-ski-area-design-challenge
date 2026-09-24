@@ -4,6 +4,15 @@ P1 starts from committed P0 baseline `31af9880e12bd8230508a42ca6789d405e5b4bbe`.
 
 The live accounting record is [the P1 requirement and acceptance matrix](P1-requirement-matrix.md). Code presence does not close a row without its named deterministic and packaged evidence; owner-review rows also require explicit owner acceptance.
 
+**Section 2R amendment (2026-09-23):** the owner authorized a native Unreal site
+picker and complete offline resort in place of the blocked CEF selector route,
+with verified USGS 1 m acquisition moved forward from P1A. The approved
+[Section 2R decision record](Section2R-site-picker-plan.md) governs this new
+candidate. The CEF Shipping failure remains historical evidence; its recovery
+steps and the no-replacement-picker rule below do not constrain Section 2R.
+Section 2R's M0 gates must pass before dependent milestones proceed. The
+current repository rule reserves staging and committing to the owner.
+
 ## Scope and architecture
 
 P1 proves that one packaged Windows runtime can select, prepare, install, render, edit, query and reopen real terrain. Preparation is native C++; the embedded MapLibre page submits only a bounded site request. Existing TypeScript terrain and `GameSave` schemas remain unchanged. P2 construction, full grading/undo, simulation, weather and source retirement are excluded.
