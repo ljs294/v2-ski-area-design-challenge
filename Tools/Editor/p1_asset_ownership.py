@@ -11,6 +11,7 @@ ASSETS = {
     "Content/P1Generated/M_Terrain_LowAngle.uasset": "Material",
     "Content/P1Generated/M_Terrain_Overcast.uasset": "Material",
     "Content/P1Generated/M_Overlay.uasset": "Material",
+    "Content/P1Generated/M_Photo.uasset": "Material",
 }
 RECEIPT = "Content/P1Generated/ownership.json"
 

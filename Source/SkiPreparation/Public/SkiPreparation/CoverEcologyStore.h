@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "SkiDomain/CoverEcology.h"
+#include "SkiPreparation/SiteContext.h"
 #include "SkiPreparation/TerrainPreparation.h"
 
 namespace SkiPreparation
@@ -14,8 +15,18 @@ struct SKIPREPARATION_API CoverEcologyPackageIndex
 
 struct SKIPREPARATION_API InstalledTerrainIndex
 {
+    std::uint32_t SchemaVersion = 0;
     SkiDomain::InstalledTerrainReceipt Receipt;
+    CompositeInstallReceipt CompositeReceipt;
     FString ReceiptDirectory;
+};
+
+struct SKIPREPARATION_API InstalledTerrainLibraryEntry
+{
+    FString ContentId;
+    FString SourceId;
+    FString AcquisitionEpoch;
+    FString GeneratorVersion;
 };
 
 class SKIPREPARATION_API CoverEcologyStore
@@ -50,7 +61,15 @@ public:
         FString& OutError,
         const TSharedPtr<PreparationOperationLease, ESPMode::ThreadSafe>& Lease = nullptr,
         uint64 SessionGeneration = 0, uint64 OperationGeneration = 0) const;
+    bool WriteAndActivate(CompositeInstallReceipt Receipt,
+        FString& OutReceiptDirectory, CompositeInstallReceipt& OutReceipt,
+        FString& OutError,
+        const TSharedPtr<PreparationOperationLease, ESPMode::ThreadSafe>& Lease = nullptr,
+        uint64 SessionGeneration = 0, uint64 OperationGeneration = 0) const;
     bool Open(const FString& ContentId, InstalledTerrainIndex& OutIndex,
+        FString& OutError) const;
+    /** Lists only canonical receipt directories whose complete composite passes Open. */
+    bool ListVerified(TArray<InstalledTerrainLibraryEntry>& OutEntries,
         FString& OutError) const;
 
 private:

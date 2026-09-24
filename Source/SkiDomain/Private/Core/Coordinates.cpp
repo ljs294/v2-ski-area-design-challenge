@@ -12,6 +12,13 @@ double Radians(const double Degrees) noexcept
 {
     return Degrees * Pi / 180.0;
 }
+
+double NormalizeLongitude(const double LongitudeDeg) noexcept
+{
+    // remainder handles both ordinary seam crossings and large finite unwrapped values
+    // without the precision loss of repeatedly adding or subtracting 360 degrees.
+    return std::remainder(LongitudeDeg, 360.0);
+}
 }
 
 bool SkiDomain::IsValidGeodetic(const GeodeticPoint& Point) noexcept
@@ -78,14 +85,14 @@ bool SkiDomain::TrySeaLevelGeodeticFromEnu(const LocalFrame& Frame,
     // Solve the two horizontal coordinates at height zero; the local tangent plane's
     // Up coordinate cannot be assumed to be zero away from the origin.
     double Latitude = Frame.Origin.LatitudeDeg + NorthM / 111320.0;
-    double Longitude = Frame.Origin.LongitudeDeg
-        + EastM / (111320.0 * Frame.CosLatitude);
+    double Longitude = NormalizeLongitude(Frame.Origin.LongitudeDeg
+        + EastM / (111320.0 * Frame.CosLatitude));
     constexpr double DeltaDeg = 1.0e-5;
     for (int Iteration = 0; Iteration < 5; ++Iteration)
     {
         const GeodeticPoint Candidate{Latitude, Longitude, 0.0};
         if (!IsValidGeodetic(Candidate)
-            || Latitude + DeltaDeg > 90.0 || Longitude + DeltaDeg > 180.0)
+            || Latitude + DeltaDeg > 90.0)
         {
             return false;
         }
@@ -98,7 +105,8 @@ bool SkiDomain::TrySeaLevelGeodeticFromEnu(const LocalFrame& Frame,
             return true;
         }
         const EnuPoint LatitudeOffset = ToEnu(Frame, {Latitude + DeltaDeg, Longitude, 0.0});
-        const EnuPoint LongitudeOffset = ToEnu(Frame, {Latitude, Longitude + DeltaDeg, 0.0});
+        const EnuPoint LongitudeOffset = ToEnu(Frame,
+            {Latitude, NormalizeLongitude(Longitude + DeltaDeg), 0.0});
         const double EastLat = (LatitudeOffset.EastM - Current.EastM) / DeltaDeg;
         const double NorthLat = (LatitudeOffset.NorthM - Current.NorthM) / DeltaDeg;
         const double EastLon = (LongitudeOffset.EastM - Current.EastM) / DeltaDeg;
@@ -106,7 +114,8 @@ bool SkiDomain::TrySeaLevelGeodeticFromEnu(const LocalFrame& Frame,
         const double Determinant = EastLat * NorthLon - EastLon * NorthLat;
         if (!std::isfinite(Determinant) || std::abs(Determinant) < 1.0) return false;
         Latitude += (EastError * NorthLon - EastLon * NorthError) / Determinant;
-        Longitude += (EastLat * NorthError - EastError * NorthLat) / Determinant;
+        Longitude = NormalizeLongitude(Longitude
+            + (EastLat * NorthError - EastError * NorthLat) / Determinant);
     }
     OutPoint = {Latitude, Longitude, 0.0};
     if (!IsValidGeodetic(OutPoint)) return false;

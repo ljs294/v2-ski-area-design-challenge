@@ -2,19 +2,27 @@
   "sources": [
     "Source/SkiDomain/Private/Core/Coordinates.cpp",
     "Source/SkiDomain/Private/Core/CoverEcology.cpp",
+    "Source/SkiDomain/Private/Core/ElevationSources.cpp",
     "Source/SkiDomain/Private/Core/Heightfield.cpp",
+    "Source/SkiDomain/Private/Core/PlaceCoordinates.cpp",
     "Source/SkiDomain/Private/Core/Revision.cpp",
+    "Source/SkiDomain/Private/Core/SiteSelection.cpp",
     "Source/SkiDomain/Private/Core/TerrainCore.cpp",
+    "Source/SkiDomain/Private/Core/TerrainQuality.cpp",
     "Source/SkiDomain/Private/Core/TerrainPackage.cpp",
     "Source/SkiDomain/Private/Core/TerrainTile.cpp"
   ],
   "headers": [
     "Source/SkiDomain/Public/SkiDomain/Coordinates.h",
     "Source/SkiDomain/Public/SkiDomain/CoverEcology.h",
+    "Source/SkiDomain/Public/SkiDomain/ElevationSources.h",
     "Source/SkiDomain/Public/SkiDomain/Export.h",
     "Source/SkiDomain/Public/SkiDomain/Heightfield.h",
+    "Source/SkiDomain/Public/SkiDomain/PlaceCoordinates.h",
     "Source/SkiDomain/Public/SkiDomain/Revision.h",
+    "Source/SkiDomain/Public/SkiDomain/SiteSelection.h",
     "Source/SkiDomain/Public/SkiDomain/TerrainCore.h",
+    "Source/SkiDomain/Public/SkiDomain/TerrainQuality.h",
     "Source/SkiDomain/Public/SkiDomain/TerrainPackage.h",
     "Source/SkiDomain/Public/SkiDomain/TerrainTile.h"
   ]

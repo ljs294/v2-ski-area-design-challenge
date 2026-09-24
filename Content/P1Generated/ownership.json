@@ -1,5 +1,5 @@
 {
-  "recipe_sha256": "00505b9436f1e9d0ed9be2bf72b30df21eeb07a4be33a454fa378c5be910210e",
+  "recipe_sha256": "5537219bb3625deac7161d380da8a9c679b5aad40b3b492ed9d1f31d9cf8cbd2",
   "assets": {
     "Content/P1Generated/M_Terrain_ClearMidday.uasset": {
       "class": "Material",
@@ -52,6 +52,16 @@
         "world": "Runtime-spawned editable terrain",
         "beauty_scene": false,
         "game_mode": "/Script/SkiPresentation.SkiBootstrapGameMode"
+      }
+    },
+    "Content/P1Generated/M_Photo.uasset": {
+      "class": "Material",
+      "sha256": "206f5591959818d4b4a573e80146c05f7ba14bf737ba17b04993a7a3c59e9100",
+      "properties": {
+        "role": "photo imagery vertex-color passthrough",
+        "shading_model": "Unlit",
+        "vertex_color_passthrough": true,
+        "surface_tint": false
       }
     }
   }

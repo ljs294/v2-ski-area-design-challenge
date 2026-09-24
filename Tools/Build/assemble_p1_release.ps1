@@ -18,7 +18,7 @@ $tiffReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-geotiff-r
 $acquisitionReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-acquisition-regression.json'
 $uiReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-ui-layout.json'
 $terrainCoreReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-terraincore-regression.json'
-$selectorReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-selector.json'
+$frontendReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-frontend.json'
 $mediumReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-medium-regression.json'
 $performanceReceiptPath = Join-Path $repoRoot 'test-results\p1\smoke-Shipping-performance-regression.json'
 $visualReceiptPath = Join-Path $repoRoot 'test-results\p1\visual-Shipping.json'
@@ -94,7 +94,7 @@ $uiEditorReceipt = Assert-EditorGateReceipt -Path $uiEditorReceiptPath -Command 
 $terrainCoreEditorReceipt = Assert-EditorGateReceipt -Path $terrainCoreEditorReceiptPath -Command 'terraincore'
 $p1EditorReceipt = Assert-EditorGateReceipt -Path $p1EditorReceiptPath -Command 'p1'
 $automationReceipt = Assert-EditorGateReceipt -Path $automationReceiptPath -Command 'automation'
-$expectedNativeTerrainCoreTests = @('SkiDomain.CoverEcology', 'SkiDomain.Revision', 'SkiDomain.Terrain', 'SkiDomain.TerrainCore')
+$expectedNativeTerrainCoreTests = @('SkiDomain.CoverEcology', 'SkiDomain.ElevationSources', 'SkiDomain.PlaceCoordinates', 'SkiDomain.Revision', 'SkiDomain.SiteSelection', 'SkiDomain.Terrain', 'SkiDomain.TerrainCore', 'SkiDomain.TerrainQuality')
 $recordedNativeTests = @($terrainCoreEditorReceipt.result.native_receipts | ForEach-Object { [string]$_.name } | Sort-Object)
 if (($recordedNativeTests -join '|') -ne (($expectedNativeTerrainCoreTests | Sort-Object) -join '|') -or
     @($terrainCoreEditorReceipt.result.native_receipts | Where-Object {
@@ -137,7 +137,7 @@ function Assert-ShippingRegressionReceipt {
 $acquisitionReceipt = Assert-ShippingRegressionReceipt -Path $acquisitionReceiptPath -Scenario 'acquisition-regression' -Label 'acquisition-policy'
 $uiReceipt = Assert-ShippingRegressionReceipt -Path $uiReceiptPath -Scenario 'ui-layout' -Label 'UI-layout'
 $terrainCoreReceipt = Assert-ShippingRegressionReceipt -Path $terrainCoreReceiptPath -Scenario 'terraincore-regression' -Label 'TerrainCore'
-$selectorReceipt = Assert-ShippingRegressionReceipt -Path $selectorReceiptPath -Scenario 'selector' -Label 'selector'
+$frontendReceipt = Assert-ShippingRegressionReceipt -Path $frontendReceiptPath -Scenario 'frontend' -Label 'native frontend'
 $mediumReceipt = Assert-ShippingRegressionReceipt -Path $mediumReceiptPath -Scenario 'medium-regression' -Label 'Medium composite'
 $performanceReceipt = Assert-ShippingRegressionReceipt -Path $performanceReceiptPath -Scenario 'performance-regression' -Label 'performance'
 if (-not (Test-Path -LiteralPath $visualReceiptPath -PathType Leaf)) {
@@ -151,11 +151,11 @@ if ($visualReceipt.command -ne 'visual' -or $visualReceipt.result.status -ne 'PA
     @($visualReceipt.result.captures).Count -ne 14) {
     throw 'The Shipping visual evidence is absent, stale, incomplete, or belongs to another package.'
 }
-$selectorProof = $selectorReceipt.result.receipt
-if (-not $selectorProof.selector -or $selectorProof.profile -ne 'medium' -or
-    -not $selectorProof.closedBeforeAcceptance -or $selectorProof.blockedNavigation -lt 1 -or
-    $selectorProof.blockedPopup -lt 1) {
-    throw 'The Shipping selector did not prove its Medium-only, closed, allow-listed workflow.'
+$frontendProof = $frontendReceipt.result.receipt
+if (-not $frontendProof.passed -or -not $frontendProof.nativeTitle -or
+    -not $frontendProof.nativePickerPlaceholder -or -not $frontendProof.installedIdForwarded -or
+    -not $frontendProof.browserWidgetAbsent) {
+    throw 'The Shipping native frontend did not prove its title and library workflow.'
 }
 $mediumProof = $mediumReceipt.result.receipt
 if ($mediumProof.schemaVersion -ne 2 -or $mediumProof.qualityTier -ne 'medium' -or
@@ -244,7 +244,7 @@ if ($shippingMcpProof.status -ne 'PASS' -or
     $shippingMcpProof.root_module -ne 'SkiPresentation' -or
     [string]$shippingMcpProof.target_receipt_sha256 -notmatch '^[0-9a-f]{64}$' -or
     [string]$shippingMcpProof.target_rules_sha256 -notmatch '^[0-9a-f]{64}$' -or
-    @($shippingMcpProof.forbidden_plugins_absent).Count -ne 5) {
+    @($shippingMcpProof.forbidden_plugins_absent).Count -ne 6) {
     throw 'The Shipping package lacks exact Game-target/module proof for MCP exclusion.'
 }
 
@@ -260,7 +260,7 @@ $requiredEvidenceReceipts = [ordered]@{
     'shipping-acquisition' = @{ Path = $acquisitionReceiptPath; Receipt = $acquisitionReceipt }
     'shipping-ui' = @{ Path = $uiReceiptPath; Receipt = $uiReceipt }
     'shipping-terraincore' = @{ Path = $terrainCoreReceiptPath; Receipt = $terrainCoreReceipt }
-    'shipping-selector' = @{ Path = $selectorReceiptPath; Receipt = $selectorReceipt }
+    'shipping-frontend' = @{ Path = $frontendReceiptPath; Receipt = $frontendReceipt }
     'shipping-medium' = @{ Path = $mediumReceiptPath; Receipt = $mediumReceipt }
     'shipping-performance' = @{ Path = $performanceReceiptPath; Receipt = $performanceReceipt }
     'shipping-visual' = @{ Path = $visualReceiptPath; Receipt = $visualReceipt }
@@ -350,20 +350,18 @@ QUICK START
 
 1. Keep this entire folder together. Do not move the EXE out by itself.
 2. Double-click START SAMPLE TERRAIN.bat for the reliable built-in test terrain.
-3. In the selector, click the map, choose a 2-10 km size and profile, then click
-   Prepare selected mountain.
+3. Use the native title to open an installed resort. New resort creation is
+   unavailable until the next Section 2R milestones land.
 
-LIVE TERRAIN
+NATIVE FRONTEND
 
-Double-click START MOUNTAIN PLANNER.bat to use live terrain providers. This mode
-requires internet access for the selector map, USGS elevation and ESA WorldCover.
-Live provider qualification is still in progress, so begin with sample terrain.
+Double-click START MOUNTAIN PLANNER.bat to see the native resort library.
+Live new-resort acquisition is unavailable in this M1 build; use sample terrain.
 
 REQUIREMENTS
 
 - 64-bit Windows 10 or Windows 11
 - A DirectX-capable GPU
-- Internet access for live terrain
 
 The application is self-contained. Testers do not need Unreal Editor, Python,
 Node.js, a development server or the source repository.

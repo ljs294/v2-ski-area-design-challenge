@@ -1,5 +1,6 @@
 #include "SkiBootstrapGameMode.h"
 #include "SkiBootstrapWidget.h"
+#include "SkiFlowSubsystem.h"
 #include "SkiP1Widget.h"
 #include "SkiTerrainViewController.h"
 #include "SkiTerrainCoreRegression.h"
@@ -19,14 +20,25 @@
 #include "SkiPreparation/TerrainCorePackageStore.h"
 #include "SkiPreparation/M0TerrainCoreScale.h"
 #include "SkiPreparation/M0RasterProjectionProbe.h"
+#include "SkiPreparation/PlaceSearch.h"
+#include "SkiPreparation/SiteContext.h"
+#include "SkiPreparation/SiteContextPhotoDecoder.h"
 #include "SkiPreparation/SkiNetGateway.h"
 #include "SkiTerrainRuntime/SkiTerrainActor.h"
+#include "SkiSiteMap.h"
 #include "Async/Async.h"
 #include "Camera/CameraActor.h"
 #include "Engine/World.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/GameInstance.h"
 #include "HighResScreenshot.h"
 #include "GameFramework/PlayerController.h"
+#include "Components/Button.h"
+#include "Components/EditableTextBox.h"
+#include "Components/ScrollBox.h"
+#include "Components/TextBlock.h"
+#include "Components/Widget.h"
+#include "Components/VerticalBox.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformMisc.h"
 #include "HAL/PlatformProcess.h"
@@ -38,11 +50,62 @@
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
+#include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
 #include "UnrealClient.h"
 #include "UObject/Package.h"
 
+#include <algorithm>
 #include <atomic>
+
+struct FSkiInstalledPhotoCompletion
+{
+    uint64 RequestSerial = 0;
+    uint64 Generation = 0;
+    SkiApplication::TerrainCoreTileKey Key;
+    bool bSucceeded = false;
+    TArray<FColor> Pixels;
+    FString Error;
+};
+
+struct FSkiInstalledPhotoMailbox
+{
+    std::atomic_bool Cancelled = false;
+    FCriticalSection Mutex;
+    TArray<FSkiInstalledPhotoCompletion> Completions;
+};
+
+struct FSkiInstalledPhotoStreamState
+{
+    uint64 RequestSerial = 0;
+    uint64 Generation = 0;
+    TArray<SkiApplication::TerrainCoreTileKey> DesiredKeys;
+    int32 NextKeyIndex = 0;
+    int32 InFlightReads = 0;
+    std::shared_ptr<FSkiInstalledPhotoMailbox> Mailbox;
+    std::shared_ptr<const SkiPreparation::SiteContextPackageIndex> SiteContext;
+    FString DataRoot;
+    bool bReportedReadFailure = false;
+    int32 SubmittedTiles = 0;
+};
+
+struct FSkiPreparedInstalledTerrain
+{
+    std::shared_ptr<SkiPreparation::TerrainCorePackageStore> CoreStore;
+    SkiPreparation::InstalledTerrainIndex Installation;
+    SkiPreparation::TerrainCorePackageIndex Core;
+    SkiPreparation::CoverEcologyPackageIndex Ecology;
+    SkiPreparation::SiteContextPackageIndex SiteContext;
+    TArray<uint8> Cover;
+    TArray<uint8> Validity;
+    std::shared_ptr<const SkiApplication::ITerrainCoreRepository> PresentedRepository;
+    SkiDomain::Revision Revision = 1;
+    FString EditSetId;
+    FString DataRoot;
+    FString Error;
+    bool bHasVerifiedSiteContext = false;
+    bool bReady = false;
+};
 
 namespace
 {
@@ -191,6 +254,89 @@ std::shared_ptr<SkiApplication::TerrainCoreRepository> OpenRuntimeTerrainCoreRep
     return Repository;
 }
 
+std::shared_ptr<FSkiPreparedInstalledTerrain> PrepareInstalledTerrain(
+    const FString& Root, const FString& ContentId, const FString& EditSetId)
+{
+    auto Prepared = std::make_shared<FSkiPreparedInstalledTerrain>();
+    Prepared->EditSetId = EditSetId;
+    Prepared->DataRoot = Root;
+    SkiPreparation::InstalledTerrainStore InstallationStore(Root);
+    Prepared->CoreStore = std::make_shared<SkiPreparation::TerrainCorePackageStore>(Root);
+    SkiPreparation::CoverEcologyStore CoverStore(Root);
+    FString TerrainCoreId;
+    FString CoverEcologyId;
+    if (!InstallationStore.Open(ContentId, Prepared->Installation, Prepared->Error))
+        return Prepared;
+    if (!ASkiBootstrapGameMode::ResolveVerifiedInstalledTerrainComponents(ContentId,
+            Prepared->Installation, true, TerrainCoreId, CoverEcologyId))
+    {
+        Prepared->Error = TEXT("Installed receipt is not a verified playable schema-2 or schema-3 package.");
+        return Prepared;
+    }
+    if (!Prepared->CoreStore->Open(TerrainCoreId, Prepared->Core, Prepared->Error)
+        || !CoverStore.Open(CoverEcologyId, Prepared->Ecology, Prepared->Error)
+        || !CoverStore.ReadChannels(Prepared->Ecology, Prepared->Cover,
+            Prepared->Validity, Prepared->Error)) return Prepared;
+
+    if (Prepared->Installation.SchemaVersion == SkiPreparation::CompositeInstallReceiptSchema)
+    {
+        const SkiPreparation::CompositeInstallComponent* SiteContextComponent = nullptr;
+        for (const SkiPreparation::CompositeInstallComponent& Component
+                : Prepared->Installation.CompositeReceipt.Components)
+        {
+            if (Component.Kind == SkiPreparation::CompositeInstallComponentKind::SiteContext)
+            {
+                SiteContextComponent = &Component;
+                break;
+            }
+        }
+        if (!SiteContextComponent)
+        {
+            Prepared->Error = TEXT("Verified schema-3 installation is missing its SiteContext component.");
+            return Prepared;
+        }
+
+        const FString SiteContextId = UTF8_TO_TCHAR(SiteContextComponent->ContentId.c_str());
+        SkiPreparation::SiteContextStore SiteContextStore(Root);
+        // InstalledTerrainStore::Open already verified the SiteContext bytes and the
+        // manifest hash from the composite receipt. Reopen only to retain its metadata.
+        if (!SiteContextStore.Open(SiteContextId, Prepared->Core.Manifest,
+                Prepared->SiteContext, Prepared->Error)) return Prepared;
+        if (UTF8_TO_TCHAR(Prepared->SiteContext.Manifest.ContentId.c_str()) != SiteContextId)
+        {
+            Prepared->Error = TEXT("Verified schema-3 SiteContext identity changed before presentation.");
+            return Prepared;
+        }
+        Prepared->bHasVerifiedSiteContext = true;
+    }
+
+    auto Repository = OpenRuntimeTerrainCoreRepository(Prepared->CoreStore,
+        Prepared->Core, Prepared->Error);
+    if (!Repository) return Prepared;
+    Prepared->PresentedRepository = Repository;
+    if (!EditSetId.IsEmpty())
+    {
+        SkiDomain::TerrainEditSet Edits;
+        if (!IsContentId(EditSetId)
+            || !Prepared->CoreStore->LoadEditSet(
+                TerrainCoreId,
+                EditSetId, Prepared->Core.Manifest.Width, Prepared->Core.Manifest.Height,
+                Edits, Prepared->Error)) return Prepared;
+        std::string EditError;
+        auto Edited = SkiApplication::TerrainCoreEditedRepository::Create(
+            Repository, Edits, Edits.BaseRevision, EditError);
+        if (!Edited)
+        {
+            Prepared->Error = UTF8_TO_TCHAR(EditError.c_str());
+            return Prepared;
+        }
+        Prepared->PresentedRepository = Edited;
+        Prepared->Revision = Edits.EditRevision;
+    }
+    Prepared->bReady = true;
+    return Prepared;
+}
+
 SkiDomain::TerrainCoreManifest MakeTerrainCoreManifest(
     const SkiDomain::TerrainManifest& Legacy,
     const SkiDomain::Heightfield& Heightfield)
@@ -236,9 +382,160 @@ SkiDomain::TerrainCoreManifest MakeTerrainCoreManifest(
 }
 }
 
+FString ComposeInstalledTerrainDetails(const FString& ExistingDetails,
+    const std::uint32_t InstallationSchema,
+    const SkiPreparation::SiteContextManifest& SiteContext,
+    const SkiDomain::TerrainQualityReport& Quality)
+{
+    if (InstallationSchema != SkiPreparation::CompositeInstallReceiptSchema)
+        return ExistingDetails;
+
+    const auto FormatFraction = [](const double Fraction)
+    {
+        if (!FMath::IsFinite(Fraction) || Fraction < 0.0 || Fraction > 1.0)
+            return FString(TEXT("unknown"));
+        return FString::Printf(TEXT("%.1f%%"), Fraction * 100.0);
+    };
+    const auto GradeName = [](const SkiDomain::TerrainGrade Grade)
+    {
+        switch (Grade)
+        {
+        case SkiDomain::TerrainGrade::A: return TEXT("A");
+        case SkiDomain::TerrainGrade::B: return TEXT("B");
+        case SkiDomain::TerrainGrade::C: return TEXT("C");
+        case SkiDomain::TerrainGrade::D: return TEXT("D");
+        default: return TEXT("unknown");
+        }
+    };
+
+    FString AttributionSummary;
+    for (const SkiPreparation::SiteContextAttribution& Attribution : SiteContext.Attributions)
+    {
+        if (!AttributionSummary.IsEmpty()) AttributionSummary += TEXT("; ");
+        AttributionSummary += FString::Printf(TEXT("%s — %s (%s)"),
+            UTF8_TO_TCHAR(Attribution.Provider.c_str()),
+            UTF8_TO_TCHAR(Attribution.Text.c_str()),
+            UTF8_TO_TCHAR(Attribution.License.c_str()));
+    }
+    if (AttributionSummary.IsEmpty()) AttributionSummary = TEXT("not recorded");
+
+    uint64 VectorAssetBytes = 0;
+    bool bFoundVectorAsset = false;
+    for (const SkiPreparation::SiteContextAsset& Asset : SiteContext.Assets)
+    {
+        if (Asset.Path == SiteContext.VectorAssetPath)
+        {
+            VectorAssetBytes = Asset.Length;
+            bFoundVectorAsset = true;
+            break;
+        }
+    }
+    const FString VectorAssetSummary = bFoundVectorAsset
+        ? FString::Printf(TEXT("%s · %llu bytes"),
+            UTF8_TO_TCHAR(SiteContext.VectorAssetPath.c_str()),
+            static_cast<unsigned long long>(VectorAssetBytes))
+        : FString::Printf(TEXT("%s · size unavailable"),
+            UTF8_TO_TCHAR(SiteContext.VectorAssetPath.c_str()));
+
+    const SkiPreparation::SiteContextVectorSourceLineage& Lineage = SiteContext.VectorSource;
+    const FString LineageSummary = SiteContext.SchemaVersion >= SkiPreparation::SiteContextSchema
+        ? FString::Printf(TEXT("%s · %s · source %s · retrieved %s · %s"),
+            UTF8_TO_TCHAR(Lineage.Provider.c_str()), UTF8_TO_TCHAR(Lineage.Endpoint.c_str()),
+            UTF8_TO_TCHAR(Lineage.SourceTimestampUtc.c_str()),
+            UTF8_TO_TCHAR(Lineage.RetrievedAtUtc.c_str()),
+            UTF8_TO_TCHAR(Lineage.License.c_str()))
+        : TEXT("not recorded in legacy SiteContext schema 1");
+
+    const FString SourceMixSummary = Quality.SourceMix.Unknown
+        ? TEXT("unknown")
+        : FString::Printf(TEXT("S1M %s / Project 1 m %s / 1/3 arc-second %s%s"),
+            *FormatFraction(Quality.SourceMix.S1M),
+            *FormatFraction(Quality.SourceMix.Project1m),
+            *FormatFraction(Quality.SourceMix.ArcSec13),
+            Quality.SourceMix.Estimated ? TEXT(" (estimated)") : TEXT(""));
+
+    const FString SiteContextSummary = FString::Printf(
+        TEXT("Site context metadata\n")
+        TEXT("Imagery: %llu verified tiles\n")
+        TEXT("Attribution: %s\n")
+        TEXT("OSM lineage: %s\n")
+        TEXT("OSM feature asset: %s\n")
+        TEXT("Terrain quality: Grade %s · source mix %s · unknown metadata %s · NoData %s\n")
+        TEXT("Photo presentation: verified tiles load on demand for the current terrain view.\n")
+        TEXT("Vector presentation gap: installed OSM features are not yet decoded or rendered."),
+        static_cast<unsigned long long>(SiteContext.ImageryTiles.size()), *AttributionSummary,
+        *LineageSummary, *VectorAssetSummary, GradeName(Quality.Grade), *SourceMixSummary,
+        *FormatFraction(Quality.UnknownMetadataFraction), *FormatFraction(Quality.NoDataFraction));
+    return ExistingDetails + TEXT("\n\n") + SiteContextSummary;
+}
+
+bool ASkiBootstrapGameMode::ResolveVerifiedInstalledTerrainComponents(
+    const FString& ContentId, const SkiPreparation::InstalledTerrainIndex& Index,
+    const bool bStoreOpenVerified, FString& OutTerrainCoreId,
+    FString& OutCoverEcologyId)
+{
+    OutTerrainCoreId.Reset();
+    OutCoverEcologyId.Reset();
+    if (!bStoreOpenVerified || !IsContentId(ContentId)) return false;
+
+    const std::string ExpectedId(TCHAR_TO_UTF8(*ContentId));
+    if (Index.SchemaVersion == SkiDomain::InstalledTerrainSchema
+        && Index.Receipt.SchemaVersion == SkiDomain::InstalledTerrainSchema
+        && Index.Receipt.ContentId == ExpectedId
+        && SkiDomain::ValidateInstalledTerrainReceipt(Index.Receipt).Ok())
+    {
+        const FString TerrainCoreId = UTF8_TO_TCHAR(Index.Receipt.TerrainCoreId.c_str());
+        const FString CoverEcologyId = UTF8_TO_TCHAR(Index.Receipt.CoverEcologyId.c_str());
+        if (!IsContentId(TerrainCoreId) || !IsContentId(CoverEcologyId)) return false;
+        OutTerrainCoreId = TerrainCoreId;
+        OutCoverEcologyId = CoverEcologyId;
+        return true;
+    }
+
+    const SkiPreparation::CompositeInstallReceipt& Receipt = Index.CompositeReceipt;
+    if (Index.SchemaVersion != SkiPreparation::CompositeInstallReceiptSchema
+        || Receipt.SchemaVersion != SkiPreparation::CompositeInstallReceiptSchema
+        || Receipt.ContentId != ExpectedId
+        || !SkiPreparation::ValidateCompositeInstallReceipt(Receipt).Ok()) return false;
+
+    const SkiPreparation::CompositeInstallComponent* TerrainCore = nullptr;
+    const SkiPreparation::CompositeInstallComponent* CoverEcology = nullptr;
+    for (const SkiPreparation::CompositeInstallComponent& Component : Receipt.Components)
+    {
+        if (Component.Kind == SkiPreparation::CompositeInstallComponentKind::TerrainCore)
+            TerrainCore = &Component;
+        else if (Component.Kind == SkiPreparation::CompositeInstallComponentKind::CoverEcology)
+            CoverEcology = &Component;
+    }
+    if (!TerrainCore || !CoverEcology) return false;
+
+    const FString TerrainCoreId = UTF8_TO_TCHAR(TerrainCore->ContentId.c_str());
+    const FString CoverEcologyId = UTF8_TO_TCHAR(CoverEcology->ContentId.c_str());
+    if (!IsContentId(TerrainCoreId) || !IsContentId(CoverEcologyId)) return false;
+    OutTerrainCoreId = TerrainCoreId;
+    OutCoverEcologyId = CoverEcologyId;
+    return true;
+}
+
 ASkiBootstrapGameMode::ASkiBootstrapGameMode()
 {
     PlayerControllerClass = ASkiTerrainViewController::StaticClass();
+}
+
+bool ASkiBootstrapGameMode::IsPickerViewportScrollAtEnd(const float ScrollOffset,
+    const float ScrollMaximum, const float Tolerance) noexcept
+{
+    if (!FMath::IsFinite(ScrollOffset) || !FMath::IsFinite(ScrollMaximum)
+        || !FMath::IsFinite(Tolerance) || ScrollMaximum < 0.0F || Tolerance < 0.0F
+        || ScrollOffset < -Tolerance || ScrollOffset > ScrollMaximum + Tolerance)
+        return false;
+    return ScrollMaximum <= Tolerance || ScrollOffset >= ScrollMaximum - Tolerance;
+}
+
+void ASkiBootstrapGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    ClearInstalledPhotoContext();
+    Super::EndPlay(EndPlayReason);
 }
 
 void ASkiBootstrapGameMode::BeginPlay()
@@ -246,7 +543,9 @@ void ASkiBootstrapGameMode::BeginPlay()
     Super::BeginPlay();
     SkiPreparation::InitializePreparationDiagnostics(FPaths::ProjectSavedDir());
     APlayerController* Controller = GetWorld()->GetFirstPlayerController();
-    const bool ExpectedMap = GetWorld()->GetOutermost()->GetName() == TEXT("/Game/P0Generated/Bootstrap");
+    const FString CurrentMap = GetWorld()->GetOutermost()->GetName();
+    const bool bMountainMap = CurrentMap == TEXT("/Game/P1Generated/P1Terrain");
+    const bool ExpectedMap = CurrentMap == TEXT("/Game/P0Generated/Bootstrap") || bMountainMap;
 
     // Explicit local startup probe, available in Shipping without enabling logging,
     // an automation listener, or editor modules. This does not qualify GPU visuals.
@@ -441,6 +740,13 @@ void ASkiBootstrapGameMode::BeginPlay()
         if (!BeginP1UiLayoutSmoke()) FPlatformMisc::RequestExitWithStatus(false, 1);
         return;
     }
+#if !UE_BUILD_SHIPPING
+    if (FParse::Param(FCommandLine::Get(), TEXT("SkiP1PickerViewportSmoke")))
+    {
+        if (!BeginP1PickerViewportSmoke()) FPlatformMisc::RequestExitWithStatus(false, 1);
+        return;
+    }
+#endif
     if (FParse::Param(FCommandLine::Get(), TEXT("SkiP1Smoke")))
     {
         FPlatformMisc::RequestExitWithStatus(false, RunP1Smoke() ? 0 : 1);
@@ -459,73 +765,173 @@ void ASkiBootstrapGameMode::BeginPlay()
 
     P1Widget = Controller ? CreateWidget<USkiP1Widget>(Controller, USkiP1Widget::StaticClass()) : nullptr;
     if (!ExpectedMap || !SkiApplication::CheckDomainBoundary() || !P1Widget || !P1Widget->IsP1Ready()) return;
-    if (FParse::Param(FCommandLine::Get(), TEXT("SkiP1SelectorSmoke")))
+    if (!bMountainMap && FParse::Param(FCommandLine::Get(), TEXT("SkiM1FrontEndSmoke")))
     {
-        P1Widget->SetSelectionHandler([this](const SkiPreparation::Request& Request)
-        {
-            FString DataRoot, ReceiptPath, Token;
-            FGuid ParsedToken;
-            const bool ArgumentsValid = FParse::Value(FCommandLine::Get(), TEXT("SkiP1DataRoot="), DataRoot)
-                && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Receipt="), ReceiptPath)
-                && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Token="), Token)
-                && FGuid::Parse(Token, ParsedToken);
-            DataRoot = FPaths::ConvertRelativePathToFull(DataRoot);
-            ReceiptPath = FPaths::ConvertRelativePathToFull(ReceiptPath);
-            FString RootPrefix = DataRoot;
-            if (!RootPrefix.EndsWith(TEXT("/")) && !RootPrefix.EndsWith(TEXT("\\"))) RootPrefix += TEXT("/");
-            RootPrefix.ReplaceInline(TEXT("\\"), TEXT("/"));
-            FString NormalReceipt = ReceiptPath;
-            NormalReceipt.ReplaceInline(TEXT("\\"), TEXT("/"));
-            const bool PathValid = NormalReceipt.StartsWith(RootPrefix)
-                && FPaths::GetCleanFilename(ReceiptPath) == Token + TEXT(".receipt.json");
-            const bool ClosedBeforeAcceptance = P1Widget && P1Widget->IsSelectorClosed();
-            bool BridgeUnbound = false, CefClosed = false, WindowReleased = false;
-            double CloseMs = 0.0;
-            const bool ProofAvailable = P1Widget
-                && P1Widget->GetSelectorTeardownProof(BridgeUnbound, CefClosed, WindowReleased, CloseMs);
-            const int32 BlockedNavigation = P1Widget ? P1Widget->GetBlockedSelectorNavigationCount() : 0;
-            const int32 BlockedPopup = P1Widget ? P1Widget->GetBlockedSelectorPopupCount() : 0;
-            const FString Receipt = FString::Printf(TEXT("{\"token\":\"%s\",\"selector\":true,\"profile\":\"%s\",\"closedBeforeAcceptance\":%s,\"blockedNavigation\":%d,\"blockedPopup\":%d,\"popupDelegateProbeDenied\":%s,\"bridgeUnbound\":%s,\"cefBrowserClosed\":%s,\"windowReleased\":%s,\"closeMs\":%.1f}"),
-                *ParsedToken.ToString(EGuidFormats::DigitsWithHyphensLower),
-                Request.Profile == SkiPreparation::SourceProfile::Medium ? TEXT("medium") : TEXT("legacy-standard"),
-                ClosedBeforeAcceptance ? TEXT("true") : TEXT("false"), BlockedNavigation, BlockedPopup,
-                P1Widget && P1Widget->WasSelectorPopupDelegateProbeDenied() ? TEXT("true") : TEXT("false"),
-                ProofAvailable && BridgeUnbound ? TEXT("true") : TEXT("false"),
-                ProofAvailable && CefClosed ? TEXT("true") : TEXT("false"),
-                ProofAvailable && WindowReleased ? TEXT("true") : TEXT("false"), CloseMs);
-            const bool Written = ArgumentsValid && PathValid && FFileHelper::SaveStringToFile(Receipt, *ReceiptPath,
-                FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
-            FPlatformMisc::RequestExitWithStatus(false, Written ? 0 : 1);
-        });
-    }
-    else P1Widget->SetSelectionHandler([this](const SkiPreparation::Request& Request) { BeginP1Preparation(Request); });
-    P1Widget->SetOpenInstalledHandler([this] { OpenLatestInstalledTerrain(); });
-    P1Widget->AddToViewport();
-    Controller->bShowMouseCursor = true;
-    Controller->SetInputMode(FInputModeUIOnly());
-    FString SelectorDiagnostic;
-    if (FParse::Value(FCommandLine::Get(), TEXT("SkiP1SelectorDiagnostic="), SelectorDiagnostic))
-    {
-        if (SelectorDiagnostic != TEXT("blank") && SelectorDiagnostic != TEXT("no-tiles")
-            && SelectorDiagnostic != TEXT("full"))
+        FString DataRoot, ReceiptPath, Token;
+        FGuid ParsedToken;
+        const bool ArgumentsValid = FParse::Value(FCommandLine::Get(), TEXT("SkiP1DataRoot="), DataRoot)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Receipt="), ReceiptPath)
+            && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Token="), Token)
+            && FGuid::Parse(Token, ParsedToken);
+        DataRoot = FPaths::ConvertRelativePathToFull(DataRoot);
+        ReceiptPath = FPaths::ConvertRelativePathToFull(ReceiptPath);
+        FPaths::NormalizeFilename(DataRoot);
+        FPaths::NormalizeFilename(ReceiptPath);
+        const bool CanonicalPaths = FPaths::CollapseRelativeDirectories(DataRoot)
+            && FPaths::CollapseRelativeDirectories(ReceiptPath);
+        if (!DataRoot.EndsWith(TEXT("/"))) DataRoot += TEXT("/");
+        const bool PathValid = ArgumentsValid && CanonicalPaths
+            && ReceiptPath.StartsWith(DataRoot, ESearchCase::IgnoreCase)
+            && FPaths::GetCleanFilename(ReceiptPath) == Token + TEXT(".receipt.json");
+        if (!PathValid)
         {
             FPlatformMisc::RequestExitWithStatus(false, 1);
             return;
         }
-        P1Widget->SetSelectionHandler({});
+        P1Widget->AddToViewport();
         P1Widget->OpenSelector();
-        FTimerHandle DiagnosticTimer;
-        GetWorldTimerManager().SetTimer(DiagnosticTimer,
-            FTimerDelegate::CreateLambda([] { FPlatformMisc::RequestExitWithStatus(false, 0); }),
-            5.0F, false);
+        SkiPreparation::Request FixtureRequest;
+        FixtureRequest.Name = TEXT("Verified fixture resort");
+        FixtureRequest.Bounds = {-121.56, 46.95, -121.53, 46.97};
+        FixtureRequest.SessionGeneration = 91;
+        FixtureRequest.OperationGeneration = 1;
+        FixtureRequest.Lease = MakeShared<SkiPreparation::PreparationOperationLease,
+            ESPMode::ThreadSafe>(91, 1);
+        const TSharedRef<SkiPreparation::Cancellation> FixtureCancellation =
+            MakeShared<SkiPreparation::Cancellation>();
+        const SkiPreparation::Result FixtureResult =
+            SkiPreparation::FixtureTerrainProvider(DataRoot).Prepare(
+                FixtureRequest, FixtureCancellation, {});
+        SkiPreparation::InstalledTerrainStore Store(DataRoot);
+        TArray<SkiPreparation::InstalledTerrainLibraryEntry> Verified;
+        FString Error;
+        const bool bListed = FixtureResult.Ok && Store.ListVerified(Verified, Error)
+            && Verified.Num() == 1;
+        FString InstalledId;
+        if (bListed)
+        {
+            InstalledId = Verified[0].ContentId;
+            FSkiInstalledResortItem Fixture;
+            Fixture.ContentId = InstalledId;
+            Fixture.DisplayName = FixtureRequest.Name;
+            Fixture.Detail = Verified[0].SourceId;
+            P1Widget->SetInstalledResorts({Fixture});
+        }
+        InstalledOpenDataRootOverride = DataRoot;
+        P1Widget->SetOpenInstalledByIdHandler([this](const FString& ContentId)
+        {
+            TransitionToInstalledTerrain(ContentId);
+        });
+        const bool Passed = bListed && !P1Widget->HasLiveSelector()
+            && P1Widget->RunNativeFrontEndSmoke(InstalledId, Error, true);
+        if (!Passed || !P1Widget->IsNativeTitleReady())
+        {
+            FPlatformMisc::RequestExitWithStatus(false, 1);
+            return;
+        }
         return;
     }
+    P1Widget->SetSelectionHandler([this](const SkiPreparation::Request& Request) { BeginP1Preparation(Request); });
+    P1Widget->SetOpenInstalledHandler([this] { OpenLatestInstalledTerrain(); });
+    P1Widget->SetOpenInstalledByIdHandler([this](const FString& ContentId)
+    {
+        TransitionToInstalledTerrain(ContentId);
+    });
+    P1Widget->SetNavigationHandler([this]
+    {
+        ++InstalledOpenGeneration;
+        PendingInstalledOpenId.Empty();
+        DeferredInstalledOpenId.Empty();
+        if (P1Widget) P1Widget->SetSelectorStatus(TEXT("Choose an installed resort, or start a new resort."));
+    });
+    const TSharedRef<SkiPreparation::IAcquisitionTransport, ESPMode::ThreadSafe>
+        PlaceSearchTransport = MakeShared<SkiPreparation::SkiNetGateway, ESPMode::ThreadSafe>();
+    const TSharedRef<SkiPreparation::IPlaceSearchProvider, ESPMode::ThreadSafe>
+        PlaceSearchProvider = MakeShared<SkiPreparation::NominatimSearchProvider,
+            ESPMode::ThreadSafe>(PlaceSearchTransport);
+    P1Widget->SetPlaceSearchHandler([PlaceSearchProvider](const FString& Query,
+        const TSharedRef<SkiPreparation::Cancellation>& Cancellation,
+        FSkiPlaceSearchCompletion Completion)
+    {
+        Async(EAsyncExecution::ThreadPool,
+            [PlaceSearchProvider, Query, Cancellation, Completion = MoveTemp(Completion)]() mutable
+        {
+            TArray<SkiPreparation::PlaceSearchResult> ProviderResults;
+            FString Error;
+            const bool bSearchSucceeded = PlaceSearchProvider->Search(Query,
+                Cancellation, ProviderResults, Error);
+            if (Cancellation->IsCancelled()) return;
+            if (!bSearchSucceeded && Error.IsEmpty()) Error = TEXT("PLACE_SEARCH_FAILED");
+
+            TArray<FSkiPlaceSearchResult> PresentationResults;
+            PresentationResults.Reserve(ProviderResults.Num());
+            for (const SkiPreparation::PlaceSearchResult& ProviderResult : ProviderResults)
+            {
+                FSkiPlaceSearchResult& PresentationResult =
+                    PresentationResults.AddDefaulted_GetRef();
+                PresentationResult.Name = ProviderResult.Name;
+                PresentationResult.Region = ProviderResult.Region.IsEmpty()
+                    ? ProviderResult.Country : ProviderResult.Region;
+                PresentationResult.LatitudeDeg = ProviderResult.Point.LatitudeDeg;
+                PresentationResult.LongitudeDeg = ProviderResult.Point.LongitudeDeg;
+                PresentationResult.BoundingBox = ProviderResult.BoundingBox;
+            }
+            Completion(MoveTemp(PresentationResults), MoveTemp(Error));
+        });
+    });
+    P1Widget->AddToViewport();
+    Controller->bShowMouseCursor = true;
+    Controller->SetInputMode(FInputModeUIOnly());
+    if (bMountainMap)
+    {
+        USkiFlowSubsystem* Flow = GetGameInstance()->GetSubsystem<USkiFlowSubsystem>();
+        const FString ContentId = Flow ? Flow->ConsumeInstalledResort() : FString();
+        const FString FlowRoot = Flow ? Flow->ConsumeInstalledDataRoot() : FString();
+        MountainAcquisitionDeny = MakeUnique<SkiPreparation::ScopedAcquisitionPortDeny>();
+        if (!IsContentId(ContentId) || !MountainAcquisitionDeny->IsActive())
+        {
+            if (Flow) Flow->SetReturnError(TEXT("The selected resort could not be opened offline."));
+            UGameplayStatics::OpenLevel(this, FName(TEXT("/Game/P0Generated/Bootstrap")));
+            return;
+        }
+        P1Widget->BeginPreparationUI([this] { ChangeSelection(); });
+        P1Widget->SetTransientStatus(TEXT("Opening and verifying the installed resort offline…"));
+        FString EditSetId;
+        FParse::Value(FCommandLine::Get(), TEXT("SkiP1EditSetId="), EditSetId);
+        const FString Root = FlowRoot.IsEmpty() ? FPaths::ProjectSavedDir() : FlowRoot;
+        const TWeakObjectPtr<ASkiBootstrapGameMode> WeakThis(this);
+        const uint64 PrepareGeneration = ++MountainPrepareGeneration;
+        Async(EAsyncExecution::ThreadPool, [WeakThis, Root, ContentId, EditSetId,
+            PrepareGeneration]()
+        {
+            auto Prepared = PrepareInstalledTerrain(Root, ContentId, EditSetId);
+            AsyncTask(ENamedThreads::GameThread,
+                [WeakThis, ContentId, PrepareGeneration, Prepared = MoveTemp(Prepared)]()
+            {
+                if (!WeakThis.IsValid()
+                    || WeakThis->MountainPrepareGeneration != PrepareGeneration
+                    || !WeakThis->GetWorld()
+                    || WeakThis->GetWorld()->GetOutermost()->GetName()
+                        != TEXT("/Game/P1Generated/P1Terrain")) return;
+                if (WeakThis->OpenInstalledTerrain(ContentId, Prepared)) return;
+                if (USkiFlowSubsystem* ReturnFlow = WeakThis->GetGameInstance()
+                    ->GetSubsystem<USkiFlowSubsystem>())
+                    ReturnFlow->SetReturnError(TEXT("The selected resort could not be opened offline."));
+                UGameplayStatics::OpenLevel(WeakThis.Get(), FName(TEXT("/Game/P0Generated/Bootstrap")));
+            });
+        });
+        return;
+    }
+    if (USkiFlowSubsystem* Flow = GetGameInstance()->GetSubsystem<USkiFlowSubsystem>())
+        ReturnErrorNotice = Flow->ConsumeReturnError();
+    RefreshInstalledLibrary();
     FString InstalledChoice;
-    if (FParse::Value(FCommandLine::Get(), TEXT("SkiP1OpenInstalled="), InstalledChoice))
+    if (ReturnErrorNotice.IsEmpty()
+        && FParse::Value(FCommandLine::Get(), TEXT("SkiP1OpenInstalled="), InstalledChoice))
     {
         if (InstalledChoice.Equals(TEXT("latest"), ESearchCase::IgnoreCase))
             OpenLatestInstalledTerrain();
-        else if (IsContentId(InstalledChoice)) OpenInstalledTerrain(InstalledChoice);
+        else if (IsContentId(InstalledChoice)) TransitionToInstalledTerrain(InstalledChoice);
         else
         {
             P1Widget->OpenSelector();
@@ -664,6 +1070,660 @@ void ASkiBootstrapGameMode::FinishP1UiLayoutSmoke()
         FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
     FPlatformMisc::RequestExitWithStatus(false, Valid && Written ? 0 : 1);
 }
+
+#if !UE_BUILD_SHIPPING
+namespace
+{
+FVector4 PickerViewportRect(const UWidget* Widget, const FVector2D& RootPosition)
+{
+    if (!Widget) return FVector4(0, 0, 0, 0);
+    const FGeometry Geometry = Widget->GetCachedGeometry();
+    const FVector2D Position = Geometry.GetAbsolutePosition() - RootPosition;
+    const FVector2D Size = Geometry.GetAbsoluteSize();
+    return FVector4(Position.X, Position.Y, Size.X, Size.Y);
+}
+
+bool PickerViewportRectValid(const FVector4& Rect)
+{
+    return FMath::IsFinite(Rect.X) && FMath::IsFinite(Rect.Y)
+        && FMath::IsFinite(Rect.Z) && FMath::IsFinite(Rect.W)
+        && Rect.Z > 0.0 && Rect.W > 0.0;
+}
+
+bool PickerViewportRectInside(const FVector4& Inner, const FVector4& Outer,
+    const double Tolerance = 1.0)
+{
+    return PickerViewportRectValid(Inner) && PickerViewportRectValid(Outer)
+        && Inner.X >= Outer.X - Tolerance && Inner.Y >= Outer.Y - Tolerance
+        && Inner.X + Inner.Z <= Outer.X + Outer.Z + Tolerance
+        && Inner.Y + Inner.W <= Outer.Y + Outer.W + Tolerance;
+}
+
+FString PickerViewportRectJson(const FVector4& Rect)
+{
+    return FString::Printf(TEXT("[%.1f,%.1f,%.1f,%.1f]"), Rect.X, Rect.Y, Rect.Z, Rect.W);
+}
+
+FString EscapePickerViewportJsonString(const FString& Value)
+{
+    FString Escaped = Value;
+    return Escaped.ReplaceCharWithEscapedChar();
+}
+
+void FailPickerViewportSmoke(const TCHAR* Message)
+{
+    UE_LOG(LogTemp, Error, TEXT("P1 picker viewport smoke failed: %s"), Message);
+    FPlatformMisc::RequestExitWithStatus(false, 1);
+}
+}
+
+bool ASkiBootstrapGameMode::BeginP1PickerViewportSmoke()
+{
+    FString DataRoot;
+    FGuid ParsedToken;
+    if (!FParse::Value(FCommandLine::Get(), TEXT("SkiP1DataRoot="), DataRoot)
+        || !FParse::Value(FCommandLine::Get(), TEXT("SkiP1Receipt="), PickerViewportReceiptPath)
+        || !FParse::Value(FCommandLine::Get(), TEXT("SkiP1Screenshot="), PickerViewportScreenshotPath)
+        || !FParse::Value(FCommandLine::Get(), TEXT("SkiP1Token="), PickerViewportToken)
+        || !FGuid::Parse(PickerViewportToken, ParsedToken)) return false;
+
+    DataRoot = FPaths::ConvertRelativePathToFull(DataRoot);
+    PickerViewportReceiptPath = FPaths::ConvertRelativePathToFull(PickerViewportReceiptPath);
+    PickerViewportScreenshotPath = FPaths::ConvertRelativePathToFull(PickerViewportScreenshotPath);
+    FPaths::NormalizeFilename(DataRoot);
+    FPaths::NormalizeFilename(PickerViewportReceiptPath);
+    FPaths::NormalizeFilename(PickerViewportScreenshotPath);
+    if (!FPaths::CollapseRelativeDirectories(DataRoot)
+        || !FPaths::CollapseRelativeDirectories(PickerViewportReceiptPath)
+        || !FPaths::CollapseRelativeDirectories(PickerViewportScreenshotPath)) return false;
+    FString Prefix = DataRoot;
+    Prefix.ReplaceInline(TEXT("\\"), TEXT("/"));
+    if (!Prefix.EndsWith(TEXT("/"))) Prefix += TEXT("/");
+    FString ReceiptPath = PickerViewportReceiptPath;
+    ReceiptPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+    FString ScreenshotPath = PickerViewportScreenshotPath;
+    ScreenshotPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+    if (!ReceiptPath.StartsWith(Prefix, ESearchCase::IgnoreCase)
+        || !ScreenshotPath.StartsWith(Prefix, ESearchCase::IgnoreCase)
+        || FPaths::GetCleanFilename(PickerViewportReceiptPath)
+            != PickerViewportToken + TEXT(".receipt.json")
+        || FPaths::GetCleanFilename(PickerViewportScreenshotPath)
+            != PickerViewportToken + TEXT(".png")) return false;
+
+    APlayerController* Controller = GetWorld()->GetFirstPlayerController();
+    P1Widget = Controller ? CreateWidget<USkiP1Widget>(Controller, USkiP1Widget::StaticClass()) : nullptr;
+    if (!P1Widget || !P1Widget->IsP1Ready()) return false;
+    P1Widget->OpenSelector();
+    P1Widget->AddToViewport();
+
+    USkiSiteMapWidget* MapWidget = Cast<USkiSiteMapWidget>(
+        P1Widget->GetWidgetFromName(TEXT("SiteMap")));
+    UButton* NewResortButton = Cast<UButton>(
+        P1Widget->GetWidgetFromName(TEXT("NewResort")));
+    if (!MapWidget || !NewResortButton) return false;
+
+    // The screenshot contains the real map widget and native picker UI, but the
+    // viewport run is hermetic: no tile or place-search request may escape.
+    MapWidget->SetNetworkEnabled(false);
+    P1Widget->ForceLayoutPrepass();
+    NewResortButton->OnClicked.Broadcast();
+    if (!P1Widget->IsNativeSitePickerReady()) return false;
+
+    FTimerHandle LayoutTimer;
+    GetWorldTimerManager().SetTimer(LayoutTimer, this,
+        &ASkiBootstrapGameMode::InspectP1PickerViewportTop, 0.25F, false);
+    return true;
+}
+
+void ASkiBootstrapGameMode::InspectP1PickerViewportTop()
+{
+    if (!P1Widget) { FailPickerViewportSmoke(TEXT("picker widget was destroyed")); return; }
+    P1Widget->ForceLayoutPrepass();
+    APlayerController* Controller = GetWorld()->GetFirstPlayerController();
+    if (!Controller) { FailPickerViewportSmoke(TEXT("player controller is missing")); return; }
+    Controller->GetViewportSize(PickerViewportWidth, PickerViewportHeight);
+    const bool ExpectedResolution =
+        (PickerViewportWidth == 1280 && PickerViewportHeight == 720)
+        || (PickerViewportWidth == 1920 && PickerViewportHeight == 1080)
+        || (PickerViewportWidth == 2560 && PickerViewportHeight == 1080)
+        || (PickerViewportWidth == 2560 && PickerViewportHeight == 1440)
+        || (PickerViewportWidth == 576 && PickerViewportHeight == 1024);
+    if (!ExpectedResolution)
+    {
+        FailPickerViewportSmoke(TEXT("viewport does not match the requested M2 test matrix"));
+        return;
+    }
+
+    const FVector2D RootPosition = P1Widget->GetCachedGeometry().GetAbsolutePosition();
+    const FVector2D RootSize = P1Widget->GetCachedGeometry().GetAbsoluteSize();
+    const FVector4 ViewportRect(0, 0, PickerViewportWidth, PickerViewportHeight);
+    UWidget* MapWidget = P1Widget->GetWidgetFromName(TEXT("SiteMap"));
+    UWidget* PanelWidget = P1Widget->GetWidgetFromName(TEXT("SelectorPanel"));
+    UWidget* ScrollWidget = P1Widget->GetWidgetFromName(TEXT("PickerScroll"));
+    UWidget* HeadingWidget = P1Widget->GetWidgetFromName(TEXT("PickerHeading"));
+    UWidget* SubtitleWidget = P1Widget->GetWidgetFromName(TEXT("PickerSubtitle"));
+    UWidget* StepsWidget = P1Widget->GetWidgetFromName(TEXT("PickerSteps"));
+    UWidget* LocationControlsWidget = P1Widget->GetWidgetFromName(TEXT("LocationControls"));
+    UWidget* LocationHeadingWidget = P1Widget->GetWidgetFromName(TEXT("LocationHeading"));
+    UWidget* LocationSearchWidget = P1Widget->GetWidgetFromName(TEXT("LocationSearchBox"));
+    UWidget* SearchButtonWidget = P1Widget->GetWidgetFromName(TEXT("SearchLocation"));
+    UWidget* SelectSiteButtonWidget = P1Widget->GetWidgetFromName(TEXT("SelectSite"));
+    UWidget* SearchStatusWidget = P1Widget->GetWidgetFromName(TEXT("PickerSearchStatus"));
+    UWidget* BoundaryControlsWidget = P1Widget->GetWidgetFromName(TEXT("BoundaryControls"));
+    UWidget* NameControlsWidget = P1Widget->GetWidgetFromName(TEXT("ResortNameControls"));
+    UScrollBox* PickerScroll = Cast<UScrollBox>(ScrollWidget);
+    const FVector4 PanelRect = PickerViewportRect(PanelWidget, RootPosition);
+    const FVector4 MapRect = PickerViewportRect(MapWidget, RootPosition);
+    const FVector4 ScrollRect = PickerViewportRect(ScrollWidget, RootPosition);
+    const FVector4 HeadingRect = PickerViewportRect(HeadingWidget, RootPosition);
+    const FVector4 SubtitleRect = PickerViewportRect(SubtitleWidget, RootPosition);
+    const FVector4 StepsRect = PickerViewportRect(StepsWidget, RootPosition);
+    const FVector4 LocationControlsRect = PickerViewportRect(LocationControlsWidget, RootPosition);
+    const FVector4 LocationHeadingRect = PickerViewportRect(LocationHeadingWidget, RootPosition);
+    const FVector4 LocationSearchRect = PickerViewportRect(LocationSearchWidget, RootPosition);
+    const FVector4 SearchButtonRect = PickerViewportRect(SearchButtonWidget, RootPosition);
+    const FVector4 SelectSiteRect = PickerViewportRect(SelectSiteButtonWidget, RootPosition);
+    UTextBlock* Heading = Cast<UTextBlock>(HeadingWidget);
+    UTextBlock* Subtitle = Cast<UTextBlock>(SubtitleWidget);
+    UTextBlock* LocationHeading = Cast<UTextBlock>(LocationHeadingWidget);
+    UEditableTextBox* LocationSearch = Cast<UEditableTextBox>(LocationSearchWidget);
+    UButton* SearchButton = Cast<UButton>(SearchButtonWidget);
+    UButton* SelectSiteButton = Cast<UButton>(SelectSiteButtonWidget);
+    UTextBlock* SearchStatus = Cast<UTextBlock>(SearchStatusWidget);
+    UTextBlock* SearchButtonLabel = SearchButton
+        ? Cast<UTextBlock>(SearchButton->GetChildAt(0)) : nullptr;
+    UTextBlock* SelectSiteLabel = SelectSiteButton
+        ? Cast<UTextBlock>(SelectSiteButton->GetChildAt(0)) : nullptr;
+    UVerticalBox* Steps = Cast<UVerticalBox>(StepsWidget);
+    if (!PickerScroll || !Heading || !Subtitle || !LocationHeading || !LocationSearch
+        || !SearchButtonLabel || !SelectSiteButton || !SelectSiteLabel || !SearchStatus
+        || !Steps || !LocationControlsWidget || !BoundaryControlsWidget || !NameControlsWidget)
+    {
+        FailPickerViewportSmoke(TEXT("required picker content widgets are missing"));
+        return;
+    }
+
+    TArray<FVector4> StepRects;
+    TArray<FString> StepTexts;
+    for (int32 Index = 0; Index < 4; ++Index)
+    {
+        UTextBlock* Step = Index < Steps->GetChildrenCount()
+            ? Cast<UTextBlock>(Steps->GetChildAt(Index)) : nullptr;
+        if (!Step)
+        {
+            FailPickerViewportSmoke(TEXT("one of the four picker steps is missing"));
+            return;
+        }
+        StepRects.Add(PickerViewportRect(Step, RootPosition));
+        StepTexts.Add(Step->GetText().ToString());
+    }
+
+    const FString HeadingText = Heading->GetText().ToString();
+    const FString SubtitleText = Subtitle->GetText().ToString();
+    const FString LocationHeadingText = LocationHeading->GetText().ToString();
+    const FString SearchButtonText = SearchButtonLabel->GetText().ToString();
+    const FString SelectSiteText = SelectSiteLabel->GetText().ToString();
+    PickerViewportScrollRect = ScrollRect;
+    PickerViewportScrollAtStart = PickerScroll->GetScrollOffset();
+
+    const bool TopValid = P1Widget->IsNativeSitePickerReady()
+        && MapWidget && MapWidget->GetVisibility() == ESlateVisibility::Visible
+        && PanelWidget && ScrollWidget && HeadingWidget && SubtitleWidget && StepsWidget
+        && LocationControlsWidget->GetVisibility() == ESlateVisibility::Visible
+        && BoundaryControlsWidget->GetVisibility() == ESlateVisibility::Collapsed
+        && NameControlsWidget->GetVisibility() == ESlateVisibility::Collapsed
+        && !SelectSiteButton->GetIsEnabled()
+        && LocationHeadingWidget && LocationSearchWidget && SearchButtonWidget
+        && RootSize.X > 0.0 && RootSize.Y > 0.0
+        && PickerViewportRectInside(PanelRect, ViewportRect)
+        && PickerViewportRectInside(MapRect, ViewportRect)
+        && FMath::Abs(MapRect.X) <= 1.0 && FMath::Abs(MapRect.Y) <= 1.0
+        && FMath::Abs(MapRect.Z - PickerViewportWidth) <= 1.0
+        && FMath::Abs(MapRect.W - PickerViewportHeight) <= 1.0
+        && PickerViewportRectInside(HeadingRect, PanelRect)
+        && PickerViewportRectInside(SubtitleRect, PanelRect)
+        && PickerViewportRectInside(StepsRect, PanelRect)
+        && PickerViewportRectInside(ScrollRect, PanelRect)
+        && PickerViewportRectInside(LocationControlsRect, ScrollRect)
+        && PickerViewportRectInside(LocationHeadingRect, ScrollRect)
+        && PickerViewportRectInside(LocationSearchRect, ScrollRect)
+        && PickerViewportRectInside(SearchButtonRect, ScrollRect)
+        && PickerViewportRectInside(SelectSiteRect, ScrollRect)
+        && PickerViewportScrollAtStart <= 1.0F
+        && HeadingText.Contains(TEXT("New resort"))
+        && SubtitleText == TEXT("Find the mountain you want to make your own.")
+        && LocationHeadingText.Contains(TEXT("Search a place"))
+        && SearchButtonText.Contains(TEXT("Search / go to coordinates"))
+        && SelectSiteText.Contains(TEXT("Select site"))
+        && StepTexts.Num() == 4
+        && StepTexts[0].StartsWith(TEXT("●"))
+        && StepTexts[1].StartsWith(TEXT("○"))
+        && StepTexts[0].Contains(TEXT("Choose location"))
+        && StepTexts[1].Contains(TEXT("Define boundary"))
+        && StepTexts[2].Contains(TEXT("Name resort"))
+        && StepTexts[3].Contains(TEXT("Download"));
+    for (const FVector4& StepRect : StepRects)
+    {
+        if (!PickerViewportRectInside(StepRect, StepsRect))
+        {
+            FailPickerViewportSmoke(TEXT("picker step label leaves its visible stepper"));
+            return;
+        }
+    }
+    if (!TopValid)
+    {
+        FailPickerViewportSmoke(TEXT("picker Step 1 visibility, header, location controls, or scroll bounds are invalid"));
+        return;
+    }
+    bPickerViewportTopValid = true;
+    PickerViewportTopRectsJson = FString::Printf(
+        TEXT("\"panel\":%s,\"map\":%s,\"scroll\":%s,\"heading\":%s,\"subtitle\":%s,\"steps\":%s"),
+        *PickerViewportRectJson(PanelRect), *PickerViewportRectJson(MapRect),
+        *PickerViewportRectJson(ScrollRect), *PickerViewportRectJson(HeadingRect),
+        *PickerViewportRectJson(SubtitleRect), *PickerViewportRectJson(StepsRect));
+
+    LocationSearch->SetText(FText::FromString(TEXT("47.25, -121.55")));
+    SearchButton->OnClicked.Broadcast();
+    const FString SearchStatusText = SearchStatus->GetText().ToString();
+    if (!SelectSiteButton->GetIsEnabled() || !SearchStatusText.Contains(TEXT("Centered at"))
+        || !SearchStatusText.Contains(TEXT("Select site")))
+    {
+        FailPickerViewportSmoke(TEXT("coordinate search did not enable the real Select site action"));
+        return;
+    }
+    PickerViewportStep1EvidenceJson = FString::Printf(
+        TEXT("\"step1\":{\"locationVisible\":true,\"boundaryVisible\":false,\"nameVisible\":false,\"selectSiteInitiallyDisabled\":true,\"selectSiteEnabledAfterSearch\":true,\"locationQuery\":\"47.25, -121.55\",\"activeLabel\":\"%s\",\"searchStatus\":\"%s\",\"texts\":{\"locationHeading\":\"%s\",\"searchButton\":\"%s\",\"selectSiteButton\":\"%s\"},\"rects\":{\"locationControls\":%s,\"locationHeading\":%s,\"locationSearch\":%s,\"searchButton\":%s,\"selectSiteButton\":%s}}"),
+        *EscapePickerViewportJsonString(StepTexts[0]),
+        *EscapePickerViewportJsonString(SearchStatusText),
+        *EscapePickerViewportJsonString(LocationHeadingText),
+        *EscapePickerViewportJsonString(SearchButtonText),
+        *EscapePickerViewportJsonString(SelectSiteText),
+        *PickerViewportRectJson(LocationControlsRect),
+        *PickerViewportRectJson(LocationHeadingRect),
+        *PickerViewportRectJson(LocationSearchRect), *PickerViewportRectJson(SearchButtonRect),
+        *PickerViewportRectJson(SelectSiteRect));
+
+    SelectSiteButton->OnClicked.Broadcast();
+    P1Widget->ForceLayoutPrepass();
+    FTimerHandle BoundaryTimer;
+    GetWorldTimerManager().SetTimer(BoundaryTimer, this,
+        &ASkiBootstrapGameMode::InspectP1PickerViewportBoundary, 0.12F, false);
+}
+
+void ASkiBootstrapGameMode::InspectP1PickerViewportBoundary()
+{
+    if (!P1Widget || !bPickerViewportTopValid || PickerViewportStep1EvidenceJson.IsEmpty())
+    { FailPickerViewportSmoke(TEXT("picker did not preserve its Step 1 evidence")); return; }
+    P1Widget->ForceLayoutPrepass();
+    const FVector2D RootPosition = P1Widget->GetCachedGeometry().GetAbsolutePosition();
+    UScrollBox* PickerScroll = Cast<UScrollBox>(P1Widget->GetWidgetFromName(TEXT("PickerScroll")));
+    UWidget* LocationControls = P1Widget->GetWidgetFromName(TEXT("LocationControls"));
+    UWidget* BoundaryControls = P1Widget->GetWidgetFromName(TEXT("BoundaryControls"));
+    UWidget* NameControls = P1Widget->GetWidgetFromName(TEXT("ResortNameControls"));
+    UWidget* BoundaryHeadingWidget = P1Widget->GetWidgetFromName(TEXT("BoundaryHeading"));
+    UWidget* BoundaryInstructionsWidget = P1Widget->GetWidgetFromName(TEXT("BoundaryInstructions"));
+    UWidget* ClearBoundaryWidget = P1Widget->GetWidgetFromName(TEXT("ClearBoundary"));
+    UWidget* BoundaryStatusWidget = P1Widget->GetWidgetFromName(TEXT("PickerBoundaryStatus"));
+    UWidget* PreviewStatusWidget = P1Widget->GetWidgetFromName(TEXT("PickerPreviewStatus"));
+    UVerticalBox* Steps = Cast<UVerticalBox>(P1Widget->GetWidgetFromName(TEXT("PickerSteps")));
+    UTextBlock* BoundaryHeading = Cast<UTextBlock>(BoundaryHeadingWidget);
+    UTextBlock* BoundaryInstructions = Cast<UTextBlock>(BoundaryInstructionsWidget);
+    UTextBlock* BoundaryStatus = Cast<UTextBlock>(BoundaryStatusWidget);
+    UTextBlock* PreviewStatus = Cast<UTextBlock>(PreviewStatusWidget);
+    USkiSiteMapWidget* MapWidget = Cast<USkiSiteMapWidget>(P1Widget->GetWidgetFromName(TEXT("SiteMap")));
+    if (!PickerScroll || !LocationControls || !BoundaryControls || !NameControls
+        || !BoundaryHeading || !BoundaryInstructions || !ClearBoundaryWidget
+        || !BoundaryStatus || !PreviewStatus || !Steps || !MapWidget)
+    {
+        FailPickerViewportSmoke(TEXT("picker Step 2 content widgets are missing"));
+        return;
+    }
+
+    TArray<FString> StepTexts;
+    for (int32 Index = 0; Index < 4; ++Index)
+    {
+        UTextBlock* Step = Index < Steps->GetChildrenCount()
+            ? Cast<UTextBlock>(Steps->GetChildAt(Index)) : nullptr;
+        if (!Step) { FailPickerViewportSmoke(TEXT("picker Step 2 label is missing")); return; }
+        StepTexts.Add(Step->GetText().ToString());
+    }
+    const FVector4 BoundaryHeadingRect = PickerViewportRect(BoundaryHeadingWidget, RootPosition);
+    const FVector4 BoundaryInstructionsRect = PickerViewportRect(BoundaryInstructionsWidget, RootPosition);
+    const FVector4 ClearBoundaryRect = PickerViewportRect(ClearBoundaryWidget, RootPosition);
+    const FVector4 BoundaryStatusRect = PickerViewportRect(BoundaryStatusWidget, RootPosition);
+    const FVector4 PreviewStatusRect = PickerViewportRect(PreviewStatusWidget, RootPosition);
+    const bool Step2Valid = PickerScroll->GetScrollOffset() <= 1.0F
+        && LocationControls->GetVisibility() == ESlateVisibility::Collapsed
+        && BoundaryControls->GetVisibility() == ESlateVisibility::Visible
+        && NameControls->GetVisibility() == ESlateVisibility::Collapsed
+        && StepTexts[0].StartsWith(TEXT("✓")) && StepTexts[1].StartsWith(TEXT("●"))
+        && StepTexts[1].Contains(TEXT("Define boundary"))
+        && BoundaryHeading->GetText().ToString().Contains(TEXT("Define your boundary"))
+        && BoundaryInstructions->GetText().ToString().Contains(TEXT("Drag on the map"))
+        && PickerViewportRectInside(BoundaryHeadingRect, PickerViewportScrollRect)
+        && PickerViewportRectInside(BoundaryInstructionsRect, PickerViewportScrollRect)
+        && PickerViewportRectInside(ClearBoundaryRect, PickerViewportScrollRect)
+        && PickerViewportRectInside(BoundaryStatusRect, PickerViewportScrollRect)
+        && PickerViewportRectInside(PreviewStatusRect, PickerViewportScrollRect);
+    if (!Step2Valid)
+    {
+        FailPickerViewportSmoke(TEXT("picker did not expose valid Step 2 boundary controls"));
+        return;
+    }
+    PickerViewportStep2EvidenceJson = FString::Printf(
+        TEXT("\"step2\":{\"locationVisible\":false,\"boundaryVisible\":true,\"nameVisible\":false,\"activeLabel\":\"%s\",\"scrollAtStart\":%.2f,\"texts\":{\"boundaryHeading\":\"%s\",\"boundaryInstructions\":\"%s\",\"boundaryStatus\":\"%s\",\"previewStatus\":\"%s\"},\"rects\":{\"boundaryHeading\":%s,\"boundaryInstructions\":%s,\"clearBoundary\":%s,\"boundaryStatus\":%s,\"previewStatus\":%s}}"),
+        *EscapePickerViewportJsonString(StepTexts[1]), PickerScroll->GetScrollOffset(),
+        *EscapePickerViewportJsonString(BoundaryHeading->GetText().ToString()),
+        *EscapePickerViewportJsonString(BoundaryInstructions->GetText().ToString()),
+        *EscapePickerViewportJsonString(BoundaryStatus->GetText().ToString()),
+        *EscapePickerViewportJsonString(PreviewStatus->GetText().ToString()),
+        *PickerViewportRectJson(BoundaryHeadingRect),
+        *PickerViewportRectJson(BoundaryInstructionsRect), *PickerViewportRectJson(ClearBoundaryRect),
+        *PickerViewportRectJson(BoundaryStatusRect), *PickerViewportRectJson(PreviewStatusRect));
+
+    FGuid SmokeToken;
+    if (!FGuid::Parse(PickerViewportToken, SmokeToken)
+        || !MapWidget->CreateViewportSmokeBoundary(SmokeToken)
+        || !MapWidget->HasValidSelection())
+    {
+        FailPickerViewportSmoke(TEXT("tokened native boundary rectangle did not pass real selection validation"));
+        return;
+    }
+    P1Widget->ForceLayoutPrepass();
+    FTimerHandle NameTimer;
+    GetWorldTimerManager().SetTimer(NameTimer, this,
+        &ASkiBootstrapGameMode::InspectP1PickerViewportName, 0.12F, false);
+}
+
+void ASkiBootstrapGameMode::InspectP1PickerViewportName()
+{
+    if (!P1Widget || !bPickerViewportTopValid || PickerViewportStep2EvidenceJson.IsEmpty())
+    { FailPickerViewportSmoke(TEXT("picker did not preserve its Step 2 evidence")); return; }
+    P1Widget->ForceLayoutPrepass();
+    const FVector2D RootPosition = P1Widget->GetCachedGeometry().GetAbsolutePosition();
+    UScrollBox* PickerScroll = Cast<UScrollBox>(P1Widget->GetWidgetFromName(TEXT("PickerScroll")));
+    UWidget* LocationControls = P1Widget->GetWidgetFromName(TEXT("LocationControls"));
+    UWidget* BoundaryControls = P1Widget->GetWidgetFromName(TEXT("BoundaryControls"));
+    UWidget* NameControls = P1Widget->GetWidgetFromName(TEXT("ResortNameControls"));
+    UWidget* BoundaryHeadingWidget = P1Widget->GetWidgetFromName(TEXT("BoundaryHeading"));
+    UWidget* BoundaryInstructionsWidget = P1Widget->GetWidgetFromName(TEXT("BoundaryInstructions"));
+    UWidget* NameHeadingWidget = P1Widget->GetWidgetFromName(TEXT("ResortNameHeading"));
+    UWidget* NameBoxWidget = P1Widget->GetWidgetFromName(TEXT("ResortNameBox"));
+    UWidget* DownloadButtonWidget = P1Widget->GetWidgetFromName(TEXT("PickerDownload"));
+    UWidget* DownloadLabelWidget = P1Widget->GetWidgetFromName(TEXT("PickerDownloadLabel"));
+    UWidget* StepsWidget = P1Widget->GetWidgetFromName(TEXT("PickerSteps"));
+    UButton* DownloadButton = Cast<UButton>(DownloadButtonWidget);
+    UTextBlock* BoundaryHeading = Cast<UTextBlock>(BoundaryHeadingWidget);
+    UTextBlock* BoundaryInstructions = Cast<UTextBlock>(BoundaryInstructionsWidget);
+    UTextBlock* NameHeading = Cast<UTextBlock>(NameHeadingWidget);
+    UEditableTextBox* NameBox = Cast<UEditableTextBox>(NameBoxWidget);
+    UTextBlock* DownloadLabel = Cast<UTextBlock>(DownloadLabelWidget);
+    UVerticalBox* Steps = Cast<UVerticalBox>(StepsWidget);
+    USkiSiteMapWidget* MapWidget = Cast<USkiSiteMapWidget>(P1Widget->GetWidgetFromName(TEXT("SiteMap")));
+    if (!PickerScroll || !LocationControls || !BoundaryControls || !NameControls
+        || !BoundaryHeading || !BoundaryInstructions || !NameHeading || !NameBox
+        || !DownloadButton || !DownloadLabel || !Steps || !MapWidget)
+    {
+        FailPickerViewportSmoke(TEXT("picker Step 3 content widgets are missing"));
+        return;
+    }
+
+    TArray<FString> StepTexts;
+    TArray<FString> SerializedStepTexts;
+    TArray<FString> StepRectTexts;
+    for (int32 Index = 0; Index < 4; ++Index)
+    {
+        UTextBlock* Step = Index < Steps->GetChildrenCount()
+            ? Cast<UTextBlock>(Steps->GetChildAt(Index)) : nullptr;
+        if (!Step) { FailPickerViewportSmoke(TEXT("picker Step 3 label is missing")); return; }
+        const FString StepText = Step->GetText().ToString();
+        const FVector4 StepRect = PickerViewportRect(Step, RootPosition);
+        if (!PickerViewportRectInside(StepRect, PickerViewportRect(StepsWidget, RootPosition)))
+        { FailPickerViewportSmoke(TEXT("picker Step 3 label leaves its visible stepper")); return; }
+        StepTexts.Add(StepText);
+        SerializedStepTexts.Add(FString::Printf(TEXT("\"%s\""), *EscapePickerViewportJsonString(StepText)));
+        StepRectTexts.Add(PickerViewportRectJson(StepRect));
+    }
+    const FVector4 BoundaryControlsRect = PickerViewportRect(BoundaryControls, RootPosition);
+    const FVector4 BoundaryHeadingRect = PickerViewportRect(BoundaryHeadingWidget, RootPosition);
+    const FVector4 BoundaryInstructionsRect = PickerViewportRect(BoundaryInstructionsWidget, RootPosition);
+    const FVector4 NameControlsRect = PickerViewportRect(NameControls, RootPosition);
+    const FVector4 NameHeadingRect = PickerViewportRect(NameHeadingWidget, RootPosition);
+    const FVector4 NameBoxRect = PickerViewportRect(NameBoxWidget, RootPosition);
+    const FVector4 DownloadButtonRect = PickerViewportRect(DownloadButtonWidget, RootPosition);
+    const FVector4 DownloadLabelRect = PickerViewportRect(DownloadLabelWidget, RootPosition);
+    const FString BoundaryHeadingText = BoundaryHeading->GetText().ToString();
+    const FString BoundaryInstructionsText = BoundaryInstructions->GetText().ToString();
+    const FString NameHeadingText = NameHeading->GetText().ToString();
+    const FString DownloadLabelText = DownloadLabel->GetText().ToString();
+    const bool Step3Valid = PickerScroll->GetScrollOffset() <= 1.0F
+        && LocationControls->GetVisibility() == ESlateVisibility::Collapsed
+        && BoundaryControls->GetVisibility() == ESlateVisibility::Visible
+        && NameControls->GetVisibility() == ESlateVisibility::Visible
+        && MapWidget->HasValidSelection() && !DownloadButton->GetIsEnabled()
+        && StepTexts[0].StartsWith(TEXT("✓")) && StepTexts[1].StartsWith(TEXT("✓"))
+        && StepTexts[2].StartsWith(TEXT("●")) && StepTexts[2].Contains(TEXT("Name resort"))
+        && BoundaryHeadingText.Contains(TEXT("Define your boundary"))
+        && BoundaryInstructionsText.Contains(TEXT("Drag on the map"))
+        && NameHeadingText.Contains(TEXT("Name your resort"))
+        && DownloadLabelText.Contains(TEXT("Download unavailable"))
+        && PickerViewportRectValid(BoundaryControlsRect)
+        && PickerViewportRectValid(BoundaryHeadingRect)
+        && PickerViewportRectValid(BoundaryInstructionsRect)
+        && PickerViewportRectValid(NameControlsRect)
+        && PickerViewportRectValid(NameHeadingRect) && PickerViewportRectValid(NameBoxRect)
+        && PickerViewportRectValid(DownloadButtonRect) && PickerViewportRectValid(DownloadLabelRect);
+    if (!Step3Valid)
+    {
+        TArray<FString> FailedPredicates;
+        auto RecordFailedPredicate = [&FailedPredicates](const bool bPassed, const TCHAR* Name)
+        {
+            if (!bPassed) FailedPredicates.Add(Name);
+        };
+        RecordFailedPredicate(PickerScroll->GetScrollOffset() <= 1.0F, TEXT("scroll-at-start"));
+        RecordFailedPredicate(LocationControls->GetVisibility() == ESlateVisibility::Collapsed,
+            TEXT("location-collapsed"));
+        RecordFailedPredicate(BoundaryControls->GetVisibility() == ESlateVisibility::Visible,
+            TEXT("boundary-visible"));
+        RecordFailedPredicate(NameControls->GetVisibility() == ESlateVisibility::Visible,
+            TEXT("name-visible"));
+        RecordFailedPredicate(MapWidget->HasValidSelection(), TEXT("selection-valid"));
+        RecordFailedPredicate(!DownloadButton->GetIsEnabled(), TEXT("download-disabled"));
+        RecordFailedPredicate(StepTexts[0].StartsWith(TEXT("✓")), TEXT("step-1-complete"));
+        RecordFailedPredicate(StepTexts[1].StartsWith(TEXT("✓")), TEXT("step-2-complete"));
+        RecordFailedPredicate(StepTexts[2].StartsWith(TEXT("●")), TEXT("step-3-active"));
+        RecordFailedPredicate(StepTexts[2].Contains(TEXT("Name resort")), TEXT("step-3-name-label"));
+        RecordFailedPredicate(BoundaryHeadingText.Contains(TEXT("Define your boundary")),
+            TEXT("boundary-heading-text"));
+        RecordFailedPredicate(BoundaryInstructionsText.Contains(TEXT("Drag on the map")),
+            TEXT("boundary-instructions-text"));
+        RecordFailedPredicate(NameHeadingText.Contains(TEXT("Name your resort")),
+            TEXT("name-heading-text"));
+        RecordFailedPredicate(DownloadLabelText.Contains(TEXT("Download unavailable")),
+            TEXT("download-label-text"));
+        RecordFailedPredicate(PickerViewportRectValid(BoundaryControlsRect),
+            TEXT("boundary-controls-rect"));
+        RecordFailedPredicate(PickerViewportRectValid(BoundaryHeadingRect),
+            TEXT("boundary-heading-rect"));
+        RecordFailedPredicate(PickerViewportRectValid(BoundaryInstructionsRect),
+            TEXT("boundary-instructions-rect"));
+        RecordFailedPredicate(PickerViewportRectValid(NameControlsRect), TEXT("name-controls-rect"));
+        RecordFailedPredicate(PickerViewportRectValid(NameHeadingRect), TEXT("name-heading-rect"));
+        RecordFailedPredicate(PickerViewportRectValid(NameBoxRect), TEXT("name-box-rect"));
+        RecordFailedPredicate(PickerViewportRectValid(DownloadButtonRect),
+            TEXT("download-button-rect"));
+        RecordFailedPredicate(PickerViewportRectValid(DownloadLabelRect),
+            TEXT("download-label-rect"));
+
+        const FString Diagnostic = FString::Printf(
+            TEXT("valid site boundary did not reveal the frozen Step 3 name and disabled Download content; failed=[%s]; scroll=%.2f; visibility(location/boundary/name)=%d/%d/%d; selection=%d; downloadEnabled=%d; stepTexts=[%s | %s | %s | %s]; text(name/boundary/download)=[%s | %s | %s]; rects(boundary/name/download)=[%s | %s | %s]"),
+            *FString::Join(FailedPredicates, TEXT(",")), PickerScroll->GetScrollOffset(),
+            static_cast<int32>(LocationControls->GetVisibility()),
+            static_cast<int32>(BoundaryControls->GetVisibility()),
+            static_cast<int32>(NameControls->GetVisibility()),
+            MapWidget->HasValidSelection() ? 1 : 0, DownloadButton->GetIsEnabled() ? 1 : 0,
+            *EscapePickerViewportJsonString(StepTexts[0]),
+            *EscapePickerViewportJsonString(StepTexts[1]),
+            *EscapePickerViewportJsonString(StepTexts[2]),
+            *EscapePickerViewportJsonString(StepTexts[3]),
+            *EscapePickerViewportJsonString(NameHeadingText),
+            *EscapePickerViewportJsonString(BoundaryHeadingText),
+            *EscapePickerViewportJsonString(DownloadLabelText),
+            *PickerViewportRectJson(BoundaryControlsRect),
+            *PickerViewportRectJson(NameControlsRect),
+            *PickerViewportRectJson(DownloadButtonRect));
+        FailPickerViewportSmoke(*Diagnostic);
+        return;
+    }
+    PickerViewportStepsJson = FString::Join(SerializedStepTexts, TEXT(","));
+    PickerViewportTopRectsJson += FString::Printf(TEXT(",\"stepItems\":[%s]"),
+        *FString::Join(StepRectTexts, TEXT(",")));
+    UTextBlock* Heading = Cast<UTextBlock>(P1Widget->GetWidgetFromName(TEXT("PickerHeading")));
+    UTextBlock* Subtitle = Cast<UTextBlock>(P1Widget->GetWidgetFromName(TEXT("PickerSubtitle")));
+    PickerViewportTextJson = FString::Printf(
+        TEXT("{\"heading\":\"%s\",\"subtitle\":\"%s\",\"steps\":[%s]}"),
+        *EscapePickerViewportJsonString(Heading->GetText().ToString()),
+        *EscapePickerViewportJsonString(Subtitle->GetText().ToString()),
+        *PickerViewportStepsJson);
+    PickerViewportStep3EvidenceJson = FString::Printf(
+        TEXT("\"step3\":{\"locationVisible\":false,\"boundaryVisible\":true,\"nameVisible\":true,\"selectionValid\":true,\"downloadEnabled\":false,\"activeLabel\":\"%s\",\"texts\":{\"boundaryHeading\":\"%s\",\"boundaryInstructions\":\"%s\",\"resortNameHeading\":\"%s\",\"downloadLabel\":\"%s\"},\"rects\":{\"boundaryControls\":%s,\"boundaryHeading\":%s,\"boundaryInstructions\":%s,\"nameControls\":%s,\"resortNameHeading\":%s,\"nameBox\":%s,\"downloadButton\":%s,\"downloadLabel\":%s"),
+        *EscapePickerViewportJsonString(StepTexts[2]),
+        *EscapePickerViewportJsonString(BoundaryHeadingText),
+        *EscapePickerViewportJsonString(BoundaryInstructionsText),
+        *EscapePickerViewportJsonString(NameHeadingText), *EscapePickerViewportJsonString(DownloadLabelText),
+        *PickerViewportRectJson(BoundaryControlsRect), *PickerViewportRectJson(BoundaryHeadingRect),
+        *PickerViewportRectJson(BoundaryInstructionsRect), *PickerViewportRectJson(NameControlsRect),
+        *PickerViewportRectJson(NameHeadingRect), *PickerViewportRectJson(NameBoxRect),
+        *PickerViewportRectJson(DownloadButtonRect), *PickerViewportRectJson(DownloadLabelRect));
+
+    PickerScroll->ScrollToEnd();
+    P1Widget->ForceLayoutPrepass();
+    FTimerHandle BottomTimer;
+    GetWorldTimerManager().SetTimer(BottomTimer, this,
+        &ASkiBootstrapGameMode::InspectP1PickerViewportBottom, 0.12F, false);
+}
+
+void ASkiBootstrapGameMode::InspectP1PickerViewportBottom()
+{
+    if (!P1Widget || !bPickerViewportTopValid || PickerViewportStep2EvidenceJson.IsEmpty()
+        || PickerViewportStep3EvidenceJson.IsEmpty())
+    { FailPickerViewportSmoke(TEXT("picker did not preserve the Step 3 state before scrolling")); return; }
+    P1Widget->ForceLayoutPrepass();
+    UScrollBox* PickerScroll = Cast<UScrollBox>(
+        P1Widget->GetWidgetFromName(TEXT("PickerScroll")));
+    UWidget* NameControlsWidget = P1Widget->GetWidgetFromName(TEXT("ResortNameControls"));
+    UWidget* NameHeadingWidget = P1Widget->GetWidgetFromName(TEXT("ResortNameHeading"));
+    UWidget* NameBoxWidget = P1Widget->GetWidgetFromName(TEXT("ResortNameBox"));
+    UWidget* DownloadButtonWidget = P1Widget->GetWidgetFromName(TEXT("PickerDownload"));
+    UWidget* DownloadLabelWidget = P1Widget->GetWidgetFromName(TEXT("PickerDownloadLabel"));
+    UButton* DownloadButton = Cast<UButton>(DownloadButtonWidget);
+    UTextBlock* NameHeading = Cast<UTextBlock>(NameHeadingWidget);
+    UTextBlock* DownloadLabel = Cast<UTextBlock>(DownloadLabelWidget);
+    if (!PickerScroll || !NameControlsWidget || !NameHeading || !NameBoxWidget
+        || !DownloadButton || !DownloadLabel
+        || NameControlsWidget->GetVisibility() != ESlateVisibility::Visible)
+    {
+        FailPickerViewportSmoke(TEXT("picker bottom content widgets are missing"));
+        return;
+    }
+
+    PickerViewportScrollAtEnd = PickerScroll->GetScrollOffset();
+    PickerViewportScrollMaximum = PickerScroll->GetScrollOffsetOfEnd();
+    const FVector2D RootPosition = P1Widget->GetCachedGeometry().GetAbsolutePosition();
+    const FVector4 NameControlsRect = PickerViewportRect(NameControlsWidget, RootPosition);
+    const FVector4 NameHeadingRect = PickerViewportRect(NameHeadingWidget, RootPosition);
+    const FVector4 NameBoxRect = PickerViewportRect(NameBoxWidget, RootPosition);
+    const FVector4 DownloadButtonRect = PickerViewportRect(DownloadButtonWidget, RootPosition);
+    const FVector4 DownloadLabelRect = PickerViewportRect(DownloadLabelWidget, RootPosition);
+    const bool BottomValid = IsPickerViewportScrollAtEnd(PickerViewportScrollAtEnd,
+            PickerViewportScrollMaximum)
+        && PickerViewportRectInside(NameControlsRect, PickerViewportScrollRect)
+        && PickerViewportRectInside(NameHeadingRect, PickerViewportScrollRect)
+        && PickerViewportRectInside(NameBoxRect, PickerViewportScrollRect)
+        && PickerViewportRectInside(DownloadButtonRect, PickerViewportScrollRect)
+        && PickerViewportRectInside(DownloadLabelRect, DownloadButtonRect)
+        && !DownloadButton->GetIsEnabled()
+        && NameHeading->GetText().ToString().Contains(TEXT("Name your resort"))
+        && DownloadLabel->GetText().ToString().Contains(TEXT("Download unavailable"));
+    if (!BottomValid)
+    {
+        FailPickerViewportSmoke(TEXT("scrolling cannot reach visible Step 3 name and disabled Download controls"));
+        return;
+    }
+    bPickerViewportBottomValid = true;
+    PickerViewportStep3EvidenceJson += FString::Printf(
+        TEXT("},\"scrollAtEnd\":%.2f,\"scrollMaximum\":%.2f,\"bottomRects\":{\"nameControls\":%s,\"resortNameHeading\":%s,\"nameBox\":%s,\"downloadButton\":%s,\"downloadLabel\":%s}}"),
+        PickerViewportScrollAtEnd, PickerViewportScrollMaximum,
+        *PickerViewportRectJson(NameControlsRect), *PickerViewportRectJson(NameHeadingRect),
+        *PickerViewportRectJson(NameBoxRect), *PickerViewportRectJson(DownloadButtonRect),
+        *PickerViewportRectJson(DownloadLabelRect));
+
+    FTimerHandle ScreenshotTimer;
+    GetWorldTimerManager().SetTimer(ScreenshotTimer, this,
+        &ASkiBootstrapGameMode::RequestP1PickerViewportScreenshot, 0.12F, false);
+}
+
+void ASkiBootstrapGameMode::RequestP1PickerViewportScreenshot()
+{
+    if (!P1Widget || !bPickerViewportTopValid || !bPickerViewportBottomValid)
+    {
+        FailPickerViewportSmoke(TEXT("picker was not ready for screenshot capture"));
+        return;
+    }
+    UScrollBox* PickerScroll = Cast<UScrollBox>(
+        P1Widget->GetWidgetFromName(TEXT("PickerScroll")));
+    if (!PickerScroll || !IsPickerViewportScrollAtEnd(PickerScroll->GetScrollOffset(),
+            PickerScroll->GetScrollOffsetOfEnd()))
+    {
+        FailPickerViewportSmoke(TEXT("picker did not remain at the name-step scroll bottom before capture"));
+        return;
+    }
+    FScreenshotRequest::RequestScreenshot(PickerViewportScreenshotPath, true, false, false);
+    FTimerHandle FinishTimer;
+    GetWorldTimerManager().SetTimer(FinishTimer, this,
+        &ASkiBootstrapGameMode::FinishP1PickerViewportSmoke, 1.5F, false);
+}
+
+void ASkiBootstrapGameMode::FinishP1PickerViewportSmoke()
+{
+    if (!P1Widget || !bPickerViewportTopValid || !bPickerViewportBottomValid
+        || PickerViewportStep1EvidenceJson.IsEmpty() || PickerViewportStep2EvidenceJson.IsEmpty()
+        || PickerViewportStep3EvidenceJson.IsEmpty()
+        || !FPaths::FileExists(PickerViewportScreenshotPath))
+    {
+        FailPickerViewportSmoke(TEXT("rendered picker screenshot was not written"));
+        return;
+    }
+    TArray<uint8> ScreenshotBytes;
+    if (!FFileHelper::LoadFileToArray(ScreenshotBytes, *PickerViewportScreenshotPath))
+    {
+        FailPickerViewportSmoke(TEXT("rendered picker screenshot could not be read back"));
+        return;
+    }
+    APlayerController* Controller = GetWorld()->GetFirstPlayerController();
+    int32 Width = 0;
+    int32 Height = 0;
+    if (!Controller) { FailPickerViewportSmoke(TEXT("player controller disappeared")); return; }
+    Controller->GetViewportSize(Width, Height);
+    if (Width != PickerViewportWidth || Height != PickerViewportHeight)
+    {
+        FailPickerViewportSmoke(TEXT("viewport changed before screenshot receipt"));
+        return;
+    }
+    const FString ScreenshotHash = SkiPreparation::Sha256(ScreenshotBytes);
+    const FString Receipt = FString::Printf(
+        TEXT("{\"token\":\"%s\",\"scenario\":\"picker-viewport\",\"resolution\":[%d,%d],\"viewport\":[%d,%d],\"captureKind\":\"rendered-viewport-png\",\"capturedStep\":\"name-resort\",\"capturedScrollPosition\":\"end\",\"nativePickerVisible\":true,\"mapWidgetPresent\":true,\"networkDisabled\":true,\"topContentVisible\":true,\"bottomContentReachable\":true,\"visualReviewRequired\":true,\"scrollAtStart\":%.2f,\"scrollAtEnd\":%.2f,\"scrollMaximum\":%.2f,\"rects\":{%s},\"texts\":%s,\"stepStates\":{%s,%s,%s},\"screenshotPath\":\"%s\",\"screenshotSha256\":\"%s\"}"),
+        *PickerViewportToken, Width, Height, Width, Height, PickerViewportScrollAtStart,
+        PickerViewportScrollAtEnd, PickerViewportScrollMaximum,
+        *PickerViewportTopRectsJson, *PickerViewportTextJson,
+        *PickerViewportStep1EvidenceJson, *PickerViewportStep2EvidenceJson,
+        *PickerViewportStep3EvidenceJson,
+        *EscapePickerViewportJsonString(PickerViewportScreenshotPath), *ScreenshotHash);
+    const bool Written = FFileHelper::SaveStringToFile(Receipt, *PickerViewportReceiptPath,
+        FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+    FPlatformMisc::RequestExitWithStatus(false, Written ? 0 : 1);
+}
+#endif
 
 bool ASkiBootstrapGameMode::BeginP1VisualCapture()
 {
@@ -1465,6 +2525,14 @@ bool ASkiBootstrapGameMode::RunP1Smoke()
 
 void ASkiBootstrapGameMode::BeginP1Preparation(const SkiPreparation::Request& Request)
 {
+    if (GetWorld() && GetWorld()->GetOutermost()->GetName()
+        == TEXT("/Game/P1Generated/P1Terrain"))
+    {
+        if (P1Widget)
+            P1Widget->SetTransientStatus(TEXT("Resort acquisition is unavailable in the Mountain phase."));
+        return;
+    }
+    MountainAcquisitionDeny.Reset();
     if (PreparationCancellation) PreparationCancellation->Cancel();
     if (PreparationLease) PreparationLease->Invalidate();
     PreparationCancellation = MakeShared<SkiPreparation::Cancellation>();
@@ -1696,46 +2764,205 @@ void ASkiBootstrapGameMode::FinishP1Preparation(SkiPreparation::Result Result,
 
 void ASkiBootstrapGameMode::OpenLatestInstalledTerrain()
 {
-    const FString Root = FPaths::ProjectSavedDir();
-    const FString Installations = FPaths::Combine(Root, TEXT("InstalledTerrain"));
-    TArray<FString> Names;
-    IFileManager::Get().FindFiles(Names, *FPaths::Combine(Installations, TEXT("*")),
-        false, true);
-    TArray<TPair<FDateTime, FString>> Candidates;
-    for (const FString& Name : Names)
+    if (bInstalledVerifierBusy)
     {
-        if (IsContentId(Name))
-            Candidates.Emplace(IFileManager::Get().GetTimeStamp(
-                *FPaths::Combine(Installations, Name)), Name);
+        if (DeferredInstalledOpenId == TEXT("latest")) return;
+        if (PendingInstalledOpenId == TEXT("latest")
+            && DeferredInstalledOpenId.IsEmpty()) return;
+        DeferredInstalledOpenId = TEXT("latest");
+        ++InstalledOpenGeneration;
+        if (P1Widget) P1Widget->SetSelectorStatus(TEXT("Waiting for the previous resort verification…"));
+        return;
     }
-    // Directory time is only a chooser. Open validates the receipt and all required stores.
-    Candidates.Sort([](const TPair<FDateTime, FString>& A,
-        const TPair<FDateTime, FString>& B)
+    if (PendingInstalledOpenId == TEXT("latest")) return;
+    PendingInstalledOpenId = TEXT("latest");
+    bInstalledVerifierBusy = true;
+    const FString Root = FPaths::ProjectSavedDir();
+    const uint64 Generation = ++InstalledOpenGeneration;
+    const TWeakObjectPtr<ASkiBootstrapGameMode> WeakThis(this);
+    if (P1Widget) P1Widget->SetSelectorStatus(TEXT("Finding the latest verified resort…"));
+    Async(EAsyncExecution::ThreadPool, [WeakThis, Root, Generation]()
     {
-        return A.Key == B.Key ? A.Value < B.Value : A.Key > B.Key;
+        const FString Installations = FPaths::Combine(Root, TEXT("InstalledTerrain"));
+        TArray<FString> Names;
+        IFileManager::Get().FindFiles(Names, *FPaths::Combine(Installations, TEXT("*")),
+            false, true);
+        TArray<TPair<FDateTime, FString>> Candidates;
+        for (const FString& Name : Names)
+        {
+            if (IsContentId(Name))
+                Candidates.Emplace(IFileManager::Get().GetTimeStamp(
+                    *FPaths::Combine(Installations, Name)), Name);
+        }
+        Candidates.Sort([](const TPair<FDateTime, FString>& A,
+            const TPair<FDateTime, FString>& B)
+        {
+            return A.Key == B.Key ? A.Value < B.Value : A.Key > B.Key;
+        });
+        SkiPreparation::InstalledTerrainStore Store(Root);
+        FString SelectedId;
+        for (const auto& Candidate : Candidates)
+        {
+            SkiPreparation::InstalledTerrainIndex Index;
+            FString Error;
+            FString TerrainCoreId;
+            FString CoverEcologyId;
+            const bool bOpened = Store.Open(Candidate.Value, Index, Error);
+            if (ASkiBootstrapGameMode::ResolveVerifiedInstalledTerrainComponents(
+                    Candidate.Value, Index, bOpened, TerrainCoreId, CoverEcologyId))
+            {
+                SelectedId = Candidate.Value;
+                break;
+            }
+        }
+        AsyncTask(ENamedThreads::GameThread,
+            [WeakThis, Generation, SelectedId = MoveTemp(SelectedId)]()
+        {
+            if (!WeakThis.IsValid()) return;
+            WeakThis->bInstalledVerifierBusy = false;
+            WeakThis->PendingInstalledOpenId.Empty();
+            if (!WeakThis->DeferredInstalledOpenId.IsEmpty())
+            {
+                const FString Next = MoveTemp(WeakThis->DeferredInstalledOpenId);
+                WeakThis->DeferredInstalledOpenId.Empty();
+                if (Next == TEXT("latest")) WeakThis->OpenLatestInstalledTerrain();
+                else WeakThis->TransitionToInstalledTerrain(Next);
+                return;
+            }
+            if (WeakThis->InstalledOpenGeneration != Generation) return;
+            if (!SelectedId.IsEmpty()) WeakThis->TransitionToInstalledTerrain(SelectedId);
+            else if (WeakThis->P1Widget)
+                WeakThis->P1Widget->SetSelectorStatus(TEXT("No verified installed resort was found."));
+        });
     });
-    SkiPreparation::InstalledTerrainStore Store(Root);
-    for (const auto& Candidate : Candidates)
+}
+
+void ASkiBootstrapGameMode::TransitionToInstalledTerrain(const FString& ContentId)
+{
+    if (!IsContentId(ContentId))
+    {
+        if (P1Widget) P1Widget->SetSelectorStatus(TEXT("Installed terrain ID is invalid."));
+        return;
+    }
+    if (bInstalledVerifierBusy)
+    {
+        if (DeferredInstalledOpenId == ContentId) return;
+        if (PendingInstalledOpenId == ContentId
+            && DeferredInstalledOpenId.IsEmpty()) return;
+        DeferredInstalledOpenId = ContentId;
+        ++InstalledOpenGeneration;
+        if (P1Widget) P1Widget->SetSelectorStatus(TEXT("Waiting for the previous resort verification…"));
+        return;
+    }
+    if (PendingInstalledOpenId == ContentId) return;
+    PendingInstalledOpenId = ContentId;
+    bInstalledVerifierBusy = true;
+    const uint64 Generation = ++InstalledOpenGeneration;
+    const FString Root = InstalledOpenDataRootOverride.IsEmpty()
+        ? FPaths::ProjectSavedDir() : InstalledOpenDataRootOverride;
+    const TWeakObjectPtr<ASkiBootstrapGameMode> WeakThis(this);
+    if (P1Widget) P1Widget->SetSelectorStatus(TEXT("Verifying installed resort…"));
+    Async(EAsyncExecution::ThreadPool, [WeakThis, Root, ContentId, Generation]()
     {
         SkiPreparation::InstalledTerrainIndex Index;
         FString Error;
-        if (Store.Open(Candidate.Value, Index, Error))
+        FString TerrainCoreId;
+        FString CoverEcologyId;
+        const bool bOpened = SkiPreparation::InstalledTerrainStore(Root).Open(
+            ContentId, Index, Error);
+        const bool bVerified = ASkiBootstrapGameMode::ResolveVerifiedInstalledTerrainComponents(
+            ContentId, Index, bOpened, TerrainCoreId, CoverEcologyId);
+        if (bOpened && !bVerified && Error.IsEmpty())
+            Error = TEXT("Installed receipt is not a verified playable schema-2 or schema-3 package.");
+        AsyncTask(ENamedThreads::GameThread,
+            [WeakThis, ContentId, Generation, bVerified, Error = MoveTemp(Error)]()
         {
-            OpenInstalledTerrain(Candidate.Value);
-            return;
-        }
-    }
-    if (P1Widget)
-    {
-        P1Widget->OpenSelector();
-        P1Widget->SetSelectorStatus(TEXT("No verified installed terrain was found. Choose bounds to prepare one."));
-    }
+            if (!WeakThis.IsValid()) return;
+            WeakThis->bInstalledVerifierBusy = false;
+            WeakThis->PendingInstalledOpenId.Empty();
+            if (!WeakThis->DeferredInstalledOpenId.IsEmpty())
+            {
+                const FString Next = MoveTemp(WeakThis->DeferredInstalledOpenId);
+                WeakThis->DeferredInstalledOpenId.Empty();
+                if (Next == TEXT("latest")) WeakThis->OpenLatestInstalledTerrain();
+                else WeakThis->TransitionToInstalledTerrain(Next);
+                return;
+            }
+            if (WeakThis->InstalledOpenGeneration != Generation) return;
+            if (!bVerified)
+            {
+                if (WeakThis->P1Widget)
+                    WeakThis->P1Widget->SetSelectorStatus(
+                        TEXT("Installed resort could not be verified: ") + Error);
+                return;
+            }
+            USkiFlowSubsystem* Flow = WeakThis->GetGameInstance()->GetSubsystem<USkiFlowSubsystem>();
+            if (!Flow)
+            {
+                if (WeakThis->P1Widget)
+                    WeakThis->P1Widget->SetSelectorStatus(TEXT("Resort navigation is unavailable."));
+                return;
+            }
+            Flow->QueueInstalledResort(ContentId, WeakThis->InstalledOpenDataRootOverride);
+            UGameplayStatics::OpenLevel(WeakThis.Get(), FName(TEXT("/Game/P1Generated/P1Terrain")));
+        });
+    });
 }
 
-bool ASkiBootstrapGameMode::OpenInstalledTerrain(const FString& ContentId)
+void ASkiBootstrapGameMode::RefreshInstalledLibrary()
+{
+    if (!P1Widget) return;
+    const uint64 Generation = ++LibraryRefreshGeneration;
+    const FString Root = FPaths::ProjectSavedDir();
+    const TWeakObjectPtr<ASkiBootstrapGameMode> WeakThis(this);
+    P1Widget->SetSelectorStatus(TEXT("Checking installed resorts…"));
+    Async(EAsyncExecution::ThreadPool, [WeakThis, Root, Generation]()
+    {
+        SkiPreparation::InstalledTerrainStore Store(Root);
+        TArray<SkiPreparation::InstalledTerrainLibraryEntry> Verified;
+        FString Error;
+        const bool bListed = Store.ListVerified(Verified, Error);
+        AsyncTask(ENamedThreads::GameThread,
+            [WeakThis, Generation, bListed, Verified = MoveTemp(Verified), Error = MoveTemp(Error)]()
+        {
+            if (!WeakThis.IsValid() || WeakThis->LibraryRefreshGeneration != Generation
+                || !WeakThis->P1Widget) return;
+            TArray<FSkiInstalledResortItem> Items;
+            if (bListed)
+            {
+                Items.Reserve(Verified.Num());
+                for (const auto& Entry : Verified)
+                {
+                    FSkiInstalledResortItem& Item = Items.AddDefaulted_GetRef();
+                    Item.ContentId = Entry.ContentId;
+                    Item.DisplayName = TEXT("Installed resort ") + Entry.ContentId.Left(8);
+                    Item.Detail = Entry.SourceId.IsEmpty() ? TEXT("Verified terrain package")
+                        : Entry.SourceId;
+                    if (!Entry.AcquisitionEpoch.IsEmpty())
+                        Item.Detail += TEXT(" | ") + Entry.AcquisitionEpoch;
+                }
+            }
+            WeakThis->P1Widget->SetInstalledResorts(Items);
+            if (!WeakThis->PendingInstalledOpenId.IsEmpty()) return;
+            WeakThis->P1Widget->SetSelectorStatus(!WeakThis->ReturnErrorNotice.IsEmpty()
+                ? WeakThis->ReturnErrorNotice
+                : bListed
+                    ? FString::Printf(TEXT("%d verified installed resort%s."), Items.Num(),
+                        Items.Num() == 1 ? TEXT("") : TEXT("s"))
+                    : TEXT("Installed resort library could not be read: ") + Error);
+        });
+    });
+}
+
+bool ASkiBootstrapGameMode::OpenInstalledTerrain(const FString& ContentId,
+    std::shared_ptr<FSkiPreparedInstalledTerrain> Prepared)
 {
     const auto Fail = [this](const FString& Message)
     {
+        ClearInstalledPhotoContext();
+        const bool bStillInMountain = GetWorld()
+            && GetWorld()->GetOutermost()->GetName() == TEXT("/Game/P1Generated/P1Terrain");
+        if (!bStillInMountain) MountainAcquisitionDeny.Reset();
         if (P1Widget)
         {
             P1Widget->OpenSelector();
@@ -1743,51 +2970,32 @@ bool ASkiBootstrapGameMode::OpenInstalledTerrain(const FString& ContentId)
         }
         return false;
     };
+    ClearInstalledPhotoContext();
     if (!IsContentId(ContentId)) return Fail(TEXT("Installed terrain ID is invalid."));
-    SkiPreparation::ScopedAcquisitionPortDeny OfflineGuard;
-    if (!OfflineGuard.IsActive())
+    if (!MountainAcquisitionDeny)
+        MountainAcquisitionDeny = MakeUnique<SkiPreparation::ScopedAcquisitionPortDeny>();
+    if (!MountainAcquisitionDeny->IsActive())
         return Fail(TEXT("Offline terrain reopen could not disable acquisition."));
-    const FString Root = FPaths::ProjectSavedDir();
-    SkiPreparation::InstalledTerrainStore InstallationStore(Root);
-    auto CoreStore = std::make_shared<SkiPreparation::TerrainCorePackageStore>(Root);
-    SkiPreparation::CoverEcologyStore CoverStore(Root);
-    SkiPreparation::InstalledTerrainIndex Installation;
-    SkiPreparation::TerrainCorePackageIndex Core;
-    SkiPreparation::CoverEcologyPackageIndex Ecology;
-    TArray<uint8> Cover;
-    TArray<uint8> Validity;
-    FString Error;
-    if (!InstallationStore.Open(ContentId, Installation, Error)
-        || !CoreStore->Open(UTF8_TO_TCHAR(Installation.Receipt.TerrainCoreId.c_str()),
-            Core, Error)
-        || !CoverStore.Open(UTF8_TO_TCHAR(Installation.Receipt.CoverEcologyId.c_str()),
-            Ecology, Error)
-        || !CoverStore.ReadChannels(Ecology, Cover, Validity, Error))
+    if (!Prepared)
     {
-        return Fail(TEXT("Installed terrain could not be verified: ") + Error);
+        FString RequestedEditSetId;
+        FParse::Value(FCommandLine::Get(), TEXT("SkiP1EditSetId="), RequestedEditSetId);
+        Prepared = PrepareInstalledTerrain(FPaths::ProjectSavedDir(), ContentId,
+            RequestedEditSetId);
     }
-    auto Repository = OpenRuntimeTerrainCoreRepository(CoreStore, Core, Error);
-    if (!Repository) return Fail(TEXT("Installed terrain repository could not open: ") + Error);
-    std::shared_ptr<const SkiApplication::ITerrainCoreRepository> PresentedRepository = Repository;
-    SkiDomain::Revision Revision = 1;
-    FString EditSetId;
-    if (FParse::Value(FCommandLine::Get(), TEXT("SkiP1EditSetId="), EditSetId))
-    {
-        SkiDomain::TerrainEditSet Edits;
-        if (!IsContentId(EditSetId)
-            || !CoreStore->LoadEditSet(UTF8_TO_TCHAR(Installation.Receipt.TerrainCoreId.c_str()),
-                EditSetId, Core.Manifest.Width, Core.Manifest.Height, Edits, Error))
-            return Fail(TEXT("Installed terrain edit sidecar could not open: ") + Error);
-        std::string EditError;
-        auto Edited = SkiApplication::TerrainCoreEditedRepository::Create(
-            Repository, Edits, Edits.BaseRevision, EditError);
-        if (!Edited)
-            return Fail(FString(TEXT("Installed terrain edit sidecar is invalid: "))
-                + UTF8_TO_TCHAR(EditError.c_str()));
-        PresentedRepository = Edited;
-        Revision = Edits.EditRevision;
-    }
-    if (OfflineGuard.ObservedTransportCalls() != 0)
+    if (!Prepared || !Prepared->bReady
+        || (Prepared->Installation.SchemaVersion == SkiPreparation::CompositeInstallReceiptSchema
+            && !Prepared->bHasVerifiedSiteContext))
+        return Fail(TEXT("Installed terrain could not be verified: ")
+            + (Prepared ? Prepared->Error : TEXT("No prepared package.")));
+    const auto& Core = Prepared->Core;
+    const auto& Ecology = Prepared->Ecology;
+    const auto& Cover = Prepared->Cover;
+    const auto& Validity = Prepared->Validity;
+    const auto& PresentedRepository = Prepared->PresentedRepository;
+    const SkiDomain::Revision Revision = Prepared->Revision;
+    const FString& EditSetId = Prepared->EditSetId;
+    if (MountainAcquisitionDeny->ObservedTransportCalls() != 0)
         return Fail(TEXT("Offline reopen attempted network acquisition."));
     if (PreparationCancellation) PreparationCancellation->Cancel();
     if (PreparationLease) PreparationLease->Invalidate();
@@ -1822,6 +3030,35 @@ bool ASkiBootstrapGameMode::OpenInstalledTerrain(const FString& ContentId)
                 WeakThis->bTerrainCoreInitialFramePending = false;
                 if (ASkiTerrainViewController* Controller = Cast<ASkiTerrainViewController>(
                         WeakThis->GetWorld()->GetFirstPlayerController())) Controller->FrameAll();
+                if (FParse::Param(FCommandLine::Get(), TEXT("SkiM1FrontEndSmoke")))
+                {
+                    FString ReceiptPath, DataRoot, Token;
+                    const bool bArguments = FParse::Value(FCommandLine::Get(),
+                            TEXT("SkiP1Receipt="), ReceiptPath)
+                        && FParse::Value(FCommandLine::Get(), TEXT("SkiP1DataRoot="), DataRoot)
+                        && FParse::Value(FCommandLine::Get(), TEXT("SkiP1Token="), Token);
+                    ReceiptPath = FPaths::ConvertRelativePathToFull(ReceiptPath);
+                    DataRoot = FPaths::ConvertRelativePathToFull(DataRoot);
+                    FPaths::NormalizeFilename(ReceiptPath);
+                    FPaths::NormalizeFilename(DataRoot);
+                    const bool bCanonical = FPaths::CollapseRelativeDirectories(ReceiptPath)
+                        && FPaths::CollapseRelativeDirectories(DataRoot);
+                    if (!DataRoot.EndsWith(TEXT("/"))) DataRoot += TEXT("/");
+                    const bool bSafe = bArguments && bCanonical
+                        && ReceiptPath.StartsWith(DataRoot, ESearchCase::IgnoreCase)
+                        && FPaths::GetCleanFilename(ReceiptPath)
+                            == Token + TEXT(".receipt.json");
+                    const bool bOffline = WeakThis->MountainAcquisitionDeny
+                        && WeakThis->MountainAcquisitionDeny->IsActive()
+                        && WeakThis->MountainAcquisitionDeny->ObservedTransportCalls() == 0;
+                    const FString Receipt = FString::Printf(
+                        TEXT("{\"token\":\"%s\",\"scenario\":\"frontend\",\"passed\":true,\"nativeTitle\":true,\"nativePickerPlaceholder\":true,\"installedIdForwarded\":true,\"browserWidgetAbsent\":true,\"mountainTravel\":true,\"offlineReopen\":%s,\"contentId\":\"%s\"}"),
+                        *Token, bOffline ? TEXT("true") : TEXT("false"), *ContentId);
+                    const bool bWritten = bSafe && bOffline
+                        && FFileHelper::SaveStringToFile(Receipt, *ReceiptPath,
+                            FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+                    FPlatformMisc::RequestExitWithStatus(false, bWritten ? 0 : 1);
+                }
             }
         });
     if (!TerrainActor->BeginTerrainCoreStreaming(TerrainCoreSession, 4))
@@ -1853,8 +3090,8 @@ bool ASkiBootstrapGameMode::OpenInstalledTerrain(const FString& ContentId)
     }
     if (P1Widget)
     {
-        P1Widget->SetTerrainDetails(FString::Printf(
-            TEXT("Medium terrain | reopened offline\n%s\nActual %u x %u samples | delivered %.2f x %.2f m\nNative source spacing: %s\nGround grid processing: %s\nDatum %s\nTerrainCore %s\nCoverEcology %s\nInstallation %s%s"),
+        FString TerrainDetails = FString::Printf(
+            TEXT("Installed terrain | reopened offline\n%s\nActual %u x %u samples | delivered %.2f x %.2f m\nNative source spacing: %s\nGround grid processing: %s\nDatum %s\nTerrainCore %s\nCoverEcology %s\nInstallation schema %u: %s%s"),
             UTF8_TO_TCHAR(Core.Manifest.Source.Product.c_str()), Core.Manifest.Width,
             Core.Manifest.Height, Core.Manifest.DeliveredEastSpacingM,
             Core.Manifest.DeliveredNorthSpacingM,
@@ -1867,8 +3104,13 @@ bool ASkiBootstrapGameMode::OpenInstalledTerrain(const FString& ContentId)
                 ? TEXT("bilinear sampled from source export") : TEXT("see source provenance"),
             UTF8_TO_TCHAR(Core.Manifest.Source.VerticalDatum.c_str()),
             UTF8_TO_TCHAR(Core.Manifest.ContentId.c_str()),
-            UTF8_TO_TCHAR(Ecology.Manifest.ContentId.c_str()), *ContentId,
-            EditSetId.IsEmpty() ? TEXT("") : *FString::Printf(TEXT("\nEdit sidecar %s"), *EditSetId)),
+            UTF8_TO_TCHAR(Ecology.Manifest.ContentId.c_str()),
+            Prepared->Installation.SchemaVersion, *ContentId,
+            EditSetId.IsEmpty() ? TEXT("") : *FString::Printf(TEXT("\nEdit sidecar %s"), *EditSetId));
+        TerrainDetails = ComposeInstalledTerrainDetails(TerrainDetails,
+            Prepared->Installation.SchemaVersion, Prepared->SiteContext.Manifest,
+            Prepared->Installation.CompositeReceipt.Quality);
+        P1Widget->SetTerrainDetails(TerrainDetails,
             Core.Manifest.Source.SourceId.find("fixture") != std::string::npos);
         P1Widget->SetNodeStatus(FString::Printf(
             TEXT("Runtime node view\nInstalled TerrainCore: %s\nCanonical/render/query: %llu/%llu/%llu"),
@@ -1876,28 +3118,383 @@ bool ASkiBootstrapGameMode::OpenInstalledTerrain(const FString& ContentId)
             static_cast<uint64>(TerrainCoreSession->Snapshot().Revisions.Canonical),
             static_cast<uint64>(TerrainCoreSession->Snapshot().Revisions.Render),
             static_cast<uint64>(TerrainCoreSession->Snapshot().Revisions.Query)));
-        P1Widget->SetViewCommandHandler([WeakTerrain = TWeakObjectPtr<ASkiTerrainActor>(TerrainActor)](
+        const bool bPhotoAvailable = USkiP1Widget::ShouldShowPhotoCommandForInstallation(
+            Prepared->Installation.SchemaVersion, Prepared->bHasVerifiedSiteContext);
+        if (bPhotoAvailable)
+        {
+            InstalledPhotoSiteContext = std::make_shared<const SkiPreparation::SiteContextPackageIndex>(
+                Prepared->SiteContext);
+            InstalledPhotoDataRoot = Prepared->DataRoot;
+        }
+        P1Widget->SetPhotoCommandAvailable(bPhotoAvailable);
+        P1Widget->SetViewCommandHandler([
+            WeakThis = TWeakObjectPtr<ASkiBootstrapGameMode>(this),
+            WeakTerrain = TWeakObjectPtr<ASkiTerrainActor>(TerrainActor), bPhotoAvailable](
             const FName Command)
         {
             if (!WeakTerrain.IsValid()) return;
-            if (Command == TEXT("Elevation")) WeakTerrain->SetViewMode(ESkiTerrainViewMode::Elevation);
-            else if (Command == TEXT("Slope")) WeakTerrain->SetViewMode(ESkiTerrainViewMode::Slope);
-            else if (Command == TEXT("Cover")) WeakTerrain->SetViewMode(ESkiTerrainViewMode::Cover);
-            else if (Command == TEXT("Lod")) WeakTerrain->SetViewMode(ESkiTerrainViewMode::TileLod);
-            else if (Command == TEXT("LodAuto")) WeakTerrain->SetLodAuto();
-            else if (Command == TEXT("Lod0")) WeakTerrain->SetLod(0);
-            else if (Command == TEXT("Lod1")) WeakTerrain->SetLod(1);
-            else if (Command == TEXT("Lod2")) WeakTerrain->SetLod(2);
+            const bool bLodSelectionCommand = Command == TEXT("LodAuto")
+                || Command == TEXT("Lod0") || Command == TEXT("Lod1")
+                || Command == TEXT("Lod2");
+            if (Command == TEXT("Photo"))
+            {
+                if (!bPhotoAvailable || !WeakThis.IsValid()
+                    || !WeakThis->InstalledPhotoSiteContext
+                    || !WeakThis->MountainAcquisitionDeny
+                    || !WeakThis->MountainAcquisitionDeny->IsActive()
+                    || WeakThis->MountainAcquisitionDeny->ObservedTransportCalls() != 0)
+                {
+                    return;
+                }
+                WeakTerrain->SetViewMode(ESkiTerrainViewMode::Photo);
+                WeakThis->BeginInstalledPhotoPresentation();
+            }
+            else if (Command == TEXT("Elevation"))
+            {
+                if (WeakThis.IsValid()) WeakThis->CancelInstalledPhotoPresentation();
+                WeakTerrain->SetViewMode(ESkiTerrainViewMode::Elevation);
+            }
+            else if (Command == TEXT("Slope"))
+            {
+                if (WeakThis.IsValid()) WeakThis->CancelInstalledPhotoPresentation();
+                WeakTerrain->SetViewMode(ESkiTerrainViewMode::Slope);
+            }
+            else if (Command == TEXT("Cover"))
+            {
+                if (WeakThis.IsValid()) WeakThis->CancelInstalledPhotoPresentation();
+                WeakTerrain->SetViewMode(ESkiTerrainViewMode::Cover);
+            }
+            else if (Command == TEXT("Lod"))
+            {
+                if (WeakThis.IsValid()) WeakThis->CancelInstalledPhotoPresentation();
+                WeakTerrain->SetViewMode(ESkiTerrainViewMode::TileLod);
+            }
+            else if (Command == TEXT("LodAuto"))
+            {
+                WeakTerrain->SetLodAuto();
+                if (WeakThis.IsValid() && WeakTerrain->GetViewMode() == ESkiTerrainViewMode::Photo)
+                    WeakThis->RefreshInstalledPhotoSelection();
+            }
+            else if (Command == TEXT("Lod0"))
+            {
+                WeakTerrain->SetLod(0);
+                if (WeakThis.IsValid() && WeakTerrain->GetViewMode() == ESkiTerrainViewMode::Photo)
+                    WeakThis->RefreshInstalledPhotoSelection();
+            }
+            else if (Command == TEXT("Lod1"))
+            {
+                WeakTerrain->SetLod(1);
+                if (WeakThis.IsValid() && WeakTerrain->GetViewMode() == ESkiTerrainViewMode::Photo)
+                    WeakThis->RefreshInstalledPhotoSelection();
+            }
+            else if (Command == TEXT("Lod2"))
+            {
+                WeakTerrain->SetLod(2);
+                if (WeakThis.IsValid() && WeakTerrain->GetViewMode() == ESkiTerrainViewMode::Photo)
+                    WeakThis->RefreshInstalledPhotoSelection();
+            }
             else if (Command == TEXT("Vertical1")) WeakTerrain->SetVerticalExaggeration(1.0F);
             else if (Command == TEXT("Vertical2")) WeakTerrain->SetVerticalExaggeration(2.0F);
             else if (Command == TEXT("Vertical4")) WeakTerrain->SetVerticalExaggeration(4.0F);
             else if (Command == TEXT("Midday") || Command == TEXT("LowAngle")
                 || Command == TEXT("Overcast")) WeakTerrain->SetLightingPreset(Command);
-            else WeakTerrain->SetViewMode(ESkiTerrainViewMode::Presentation);
+            else
+            {
+                if (WeakThis.IsValid()) WeakThis->CancelInstalledPhotoPresentation();
+                WeakTerrain->SetViewMode(ESkiTerrainViewMode::Presentation);
+            }
         });
         P1Widget->SetTransientStatus(TEXT("Verified installed terrain; streaming offline overview."));
     }
     return true;
+}
+
+void ASkiBootstrapGameMode::BeginInstalledPhotoPresentation()
+{
+    if (!TerrainActor || !InstalledPhotoSiteContext || InstalledPhotoDataRoot.IsEmpty()
+        || TerrainActor->GetViewMode() != ESkiTerrainViewMode::Photo
+        || !MountainAcquisitionDeny || !MountainAcquisitionDeny->IsActive()
+        || MountainAcquisitionDeny->ObservedTransportCalls() != 0)
+    {
+        CancelInstalledPhotoPresentation();
+        return;
+    }
+
+    if (UWorld* World = GetWorld(); World
+        && !World->GetTimerManager().IsTimerActive(InstalledPhotoSelectionPollTimer))
+    {
+        World->GetTimerManager().SetTimer(InstalledPhotoSelectionPollTimer, this,
+            &ASkiBootstrapGameMode::RefreshInstalledPhotoSelection, 0.25F, true);
+    }
+    RefreshInstalledPhotoSelection();
+    if (P1Widget)
+        P1Widget->SetTransientStatus(TEXT("Photo view — loading verified imagery for the current terrain view."));
+}
+
+void ASkiBootstrapGameMode::RefreshInstalledPhotoSelection()
+{
+    if (!IsInGameThread()) return;
+    if (!TerrainActor || !InstalledPhotoSiteContext || InstalledPhotoDataRoot.IsEmpty()
+        || TerrainActor->GetViewMode() != ESkiTerrainViewMode::Photo
+        || !MountainAcquisitionDeny || !MountainAcquisitionDeny->IsActive()
+        || MountainAcquisitionDeny->ObservedTransportCalls() != 0)
+    {
+        CancelInstalledPhotoPresentation();
+        return;
+    }
+
+    uint64 Generation = 0;
+    TArray<SkiApplication::TerrainCoreTileKey> DesiredKeys;
+    if (!TerrainActor->GetTerrainCorePhotoRequestSnapshot(Generation, DesiredKeys)
+        || DesiredKeys.IsEmpty() || DesiredKeys.Num() > 256)
+    {
+        // Preserve the poll timer so a temporarily unavailable selection can recover.
+        if (InstalledPhotoStream)
+        {
+            if (InstalledPhotoStream->Mailbox)
+                InstalledPhotoStream->Mailbox->Cancelled.store(true, std::memory_order_release);
+            InstalledPhotoStream.reset();
+            ++InstalledPhotoRequestSerial;
+        }
+        return;
+    }
+
+    PumpInstalledPhotoCompletions();
+
+    if (!TerrainActor || TerrainActor->GetViewMode() != ESkiTerrainViewMode::Photo
+        || !TerrainActor->GetTerrainCorePhotoRequestSnapshot(Generation, DesiredKeys)
+        || DesiredKeys.IsEmpty() || DesiredKeys.Num() > 256)
+    {
+        if (InstalledPhotoStream)
+        {
+            if (InstalledPhotoStream->Mailbox)
+                InstalledPhotoStream->Mailbox->Cancelled.store(true, std::memory_order_release);
+            InstalledPhotoStream.reset();
+            ++InstalledPhotoRequestSerial;
+        }
+        return;
+    }
+
+    if (InstalledPhotoStream
+        && InstalledPhotoStream->Generation == Generation
+        && InstalledPhotoStream->DesiredKeys == DesiredKeys)
+    {
+        return;
+    }
+
+    if (InstalledPhotoStream && InstalledPhotoStream->Mailbox)
+        InstalledPhotoStream->Mailbox->Cancelled.store(true, std::memory_order_release);
+    InstalledPhotoStream.reset();
+
+    auto Stream = std::make_shared<FSkiInstalledPhotoStreamState>();
+    Stream->RequestSerial = ++InstalledPhotoRequestSerial;
+    Stream->Generation = Generation;
+    Stream->DesiredKeys = MoveTemp(DesiredKeys);
+    Stream->Mailbox = std::make_shared<FSkiInstalledPhotoMailbox>();
+    Stream->SiteContext = InstalledPhotoSiteContext;
+    Stream->DataRoot = InstalledPhotoDataRoot;
+    InstalledPhotoStream = MoveTemp(Stream);
+    IssueInstalledPhotoTileReads();
+}
+
+void ASkiBootstrapGameMode::PumpInstalledPhotoCompletions()
+{
+    if (!IsInGameThread() || !InstalledPhotoStream || !InstalledPhotoStream->Mailbox) return;
+    const std::shared_ptr<FSkiInstalledPhotoMailbox> Mailbox = InstalledPhotoStream->Mailbox;
+    if (Mailbox->Cancelled.load(std::memory_order_acquire)) return;
+
+    TArray<FSkiInstalledPhotoCompletion> Completions;
+    {
+        FScopeLock Lock(&Mailbox->Mutex);
+        Completions = MoveTemp(Mailbox->Completions);
+        Mailbox->Completions.Reset();
+    }
+    for (FSkiInstalledPhotoCompletion& Completion : Completions)
+    {
+        CompleteInstalledPhotoTileRead(Completion.RequestSerial, Completion.Generation,
+            Completion.Key, Completion.bSucceeded, MoveTemp(Completion.Pixels), Completion.Error);
+    }
+}
+
+void ASkiBootstrapGameMode::IssueInstalledPhotoTileReads()
+{
+    if (!IsInGameThread()) return;
+    const std::shared_ptr<FSkiInstalledPhotoStreamState> Stream = InstalledPhotoStream;
+    if (!Stream || !Stream->SiteContext || !Stream->Mailbox
+        || Stream->Mailbox->Cancelled.load(std::memory_order_acquire)) return;
+
+    constexpr int32 MaximumConcurrentPhotoReads = 2;
+    while (Stream->InFlightReads < MaximumConcurrentPhotoReads
+        && Stream->NextKeyIndex < Stream->DesiredKeys.Num())
+    {
+        const SkiApplication::TerrainCoreTileKey Key =
+            Stream->DesiredKeys[Stream->NextKeyIndex++];
+        ++Stream->InFlightReads;
+
+        // Capture only immutable package metadata and copied scalar request values on workers.
+        const std::shared_ptr<const SkiPreparation::SiteContextPackageIndex> SiteContext =
+            Stream->SiteContext;
+        const std::shared_ptr<FSkiInstalledPhotoMailbox> Mailbox = Stream->Mailbox;
+        const FString DataRoot = Stream->DataRoot;
+        const uint64 RequestSerial = Stream->RequestSerial;
+        const uint64 Generation = Stream->Generation;
+        Async(EAsyncExecution::ThreadPool,
+            [Mailbox, SiteContext, DataRoot, Key, RequestSerial, Generation]()
+            {
+                if (Mailbox->Cancelled.load(std::memory_order_acquire)) return;
+
+                bool bSucceeded = false;
+                TArray<FColor> Pixels;
+                FString Error;
+                const SkiPreparation::SiteContextManifest& Manifest = SiteContext->Manifest;
+                const auto Imagery = std::find_if(Manifest.ImageryTiles.begin(),
+                    Manifest.ImageryTiles.end(), [&Key](const SkiPreparation::SiteContextImageryTile& Tile)
+                    {
+                        return Tile.LodIndex == Key.Lod && Tile.TileX == Key.X
+                            && Tile.TileY == Key.Y;
+                    });
+                if (Imagery == Manifest.ImageryTiles.end()
+                    || Manifest.ImageryTilePixels != SkiPreparation::SiteContextPhotoTilePixels
+                    || Imagery->PixelWidth != SkiPreparation::SiteContextPhotoTilePixels
+                    || Imagery->PixelHeight != SkiPreparation::SiteContextPhotoTilePixels
+                    || Manifest.ImageryEncoding != "jpeg-rgb8-v1"
+                    || Imagery->AssetPath.empty())
+                {
+                    Error = TEXT("The verified SiteContext has no exact-key 256x256 imagery tile.");
+                }
+                else
+                {
+                    const std::string& AssetPath = Imagery->AssetPath;
+                    const auto Asset = std::find_if(Manifest.Assets.begin(), Manifest.Assets.end(),
+                        [&AssetPath](const SkiPreparation::SiteContextAsset& Candidate)
+                        { return Candidate.Path == AssetPath; });
+                    if (Asset == Manifest.Assets.end()
+                        || Asset->Type != Manifest.ImageryEncoding
+                        || Asset->Length == 0
+                        || Asset->Length > SkiPreparation::SiteContextPhotoTileMaxCompressedBytes)
+                    {
+                        Error = TEXT("The exact-key imagery asset is missing or exceeds the photo tile cap.");
+                    }
+                    else if (!Mailbox->Cancelled.load(std::memory_order_acquire))
+                    {
+                        const FString RelativePath = UTF8_TO_TCHAR(AssetPath.c_str());
+                        TArray<uint8> Compressed;
+                        SkiPreparation::SiteContextStore Store(DataRoot);
+                        if (Store.ReadAsset(*SiteContext, RelativePath, Compressed, Error)
+                            && Compressed.Num() > 0
+                            && static_cast<uint64>(Compressed.Num())
+                                <= SkiPreparation::SiteContextPhotoTileMaxCompressedBytes
+                            && !Mailbox->Cancelled.load(std::memory_order_acquire))
+                        {
+                            SkiPreparation::FSiteContextPhotoTile Decoded;
+                            if (SkiPreparation::DecodeSiteContextPhotoTile(Compressed,
+                                    Decoded, Error, [Mailbox]()
+                                    {
+                                        return Mailbox->Cancelled.load(std::memory_order_acquire);
+                                    })
+                                && Decoded.IsValid()
+                                && !Mailbox->Cancelled.load(std::memory_order_acquire))
+                            {
+                                Pixels = MoveTemp(Decoded.Pixels);
+                                bSucceeded = true;
+                            }
+                        }
+                        else if (Error.IsEmpty() && !Mailbox->Cancelled.load(std::memory_order_acquire))
+                        {
+                            Error = TEXT("The exact-key imagery bytes are outside the compressed tile cap.");
+                        }
+                    }
+                }
+
+                if (Mailbox->Cancelled.load(std::memory_order_acquire)) return;
+                FSkiInstalledPhotoCompletion Completion;
+                Completion.RequestSerial = RequestSerial;
+                Completion.Generation = Generation;
+                Completion.Key = Key;
+                Completion.bSucceeded = bSucceeded;
+                Completion.Pixels = MoveTemp(Pixels);
+                Completion.Error = MoveTemp(Error);
+                AsyncTask(ENamedThreads::GameThread,
+                    [Mailbox, Completion = MoveTemp(Completion)]() mutable
+                    {
+                        if (Mailbox->Cancelled.load(std::memory_order_acquire)) return;
+                        FScopeLock Lock(&Mailbox->Mutex);
+                        if (!Mailbox->Cancelled.load(std::memory_order_acquire))
+                            Mailbox->Completions.Add(MoveTemp(Completion));
+                    });
+            });
+    }
+}
+
+void ASkiBootstrapGameMode::CompleteInstalledPhotoTileRead(const uint64 RequestSerial,
+    const uint64 Generation, const SkiApplication::TerrainCoreTileKey Key,
+    const bool bSucceeded, TArray<FColor> Pixels, const FString& Error)
+{
+    if (!IsInGameThread()) return;
+    const std::shared_ptr<FSkiInstalledPhotoStreamState> Stream = InstalledPhotoStream;
+    if (!Stream || Stream->RequestSerial != RequestSerial || Stream->Generation != Generation
+        || !Stream->Mailbox || Stream->Mailbox->Cancelled.load(std::memory_order_acquire)) return;
+
+    Stream->InFlightReads = FMath::Max(0, Stream->InFlightReads - 1);
+    uint64 CurrentGeneration = 0;
+    TArray<SkiApplication::TerrainCoreTileKey> CurrentDesiredKeys;
+    const bool bCurrentSnapshot = TerrainActor
+        && TerrainActor->GetViewMode() == ESkiTerrainViewMode::Photo
+        && TerrainActor->GetTerrainCorePhotoRequestSnapshot(CurrentGeneration, CurrentDesiredKeys);
+    if (!bCurrentSnapshot || CurrentGeneration != Generation || !CurrentDesiredKeys.Contains(Key)
+        || !MountainAcquisitionDeny || !MountainAcquisitionDeny->IsActive()
+        || MountainAcquisitionDeny->ObservedTransportCalls() != 0)
+    {
+        return;
+    }
+
+    if (!bSucceeded || Pixels.Num() != static_cast<int32>(
+            SkiPreparation::SiteContextPhotoTilePixels * SkiPreparation::SiteContextPhotoTilePixels)
+        || !TerrainActor->SetTerrainCorePhotoTile(Generation, Key, MoveTemp(Pixels)))
+    {
+        if (!Stream->bReportedReadFailure)
+        {
+            Stream->bReportedReadFailure = true;
+            if (P1Widget)
+                P1Widget->SetTransientStatus(Error.IsEmpty()
+                    ? TEXT("A verified photo tile no longer matched the active terrain view.")
+                    : TEXT("A verified photo tile failed its integrity or decode check."));
+        }
+    }
+    else
+    {
+        ++Stream->SubmittedTiles;
+    }
+
+    if (Stream->NextKeyIndex >= Stream->DesiredKeys.Num() && Stream->InFlightReads == 0)
+    {
+        if (!Stream->bReportedReadFailure && Stream->SubmittedTiles == Stream->DesiredKeys.Num()
+            && P1Widget)
+        {
+            P1Widget->SetTransientStatus(FString::Printf(
+                TEXT("Photo imagery loaded for %d current-view tiles."), Stream->SubmittedTiles));
+        }
+        return;
+    }
+    IssueInstalledPhotoTileReads();
+}
+
+void ASkiBootstrapGameMode::CancelInstalledPhotoPresentation()
+{
+    if (UWorld* World = GetWorld())
+        World->GetTimerManager().ClearTimer(InstalledPhotoSelectionPollTimer);
+    if (InstalledPhotoStream && InstalledPhotoStream->Mailbox)
+        InstalledPhotoStream->Mailbox->Cancelled.store(true, std::memory_order_release);
+    InstalledPhotoStream.reset();
+    ++InstalledPhotoRequestSerial;
+}
+
+void ASkiBootstrapGameMode::ClearInstalledPhotoContext()
+{
+    CancelInstalledPhotoPresentation();
+    InstalledPhotoSiteContext.reset();
+    InstalledPhotoDataRoot.Empty();
+    if (P1Widget) P1Widget->SetPhotoCommandAvailable(false);
 }
 
 void ASkiBootstrapGameMode::RetryPreparation()
@@ -1910,6 +3507,11 @@ void ASkiBootstrapGameMode::RetryPreparation()
 
 void ASkiBootstrapGameMode::ChangeSelection()
 {
+    ClearInstalledPhotoContext();
+    ++InstalledOpenGeneration;
+    ++MountainPrepareGeneration;
+    PendingInstalledOpenId.Empty();
+    DeferredInstalledOpenId.Empty();
     if (PreparationCancellation) PreparationCancellation->Cancel();
     if (PreparationLease) PreparationLease->Invalidate();
     ++ActiveOperationGeneration;
@@ -1928,5 +3530,12 @@ void ASkiBootstrapGameMode::ChangeSelection()
     TerrainCoreSession.Reset();
     TerrainSession.Reset();
     bTerrainCoreInitialFramePending = false;
+    if (GetWorld()->GetOutermost()->GetName() == TEXT("/Game/P1Generated/P1Terrain"))
+    {
+        UGameplayStatics::OpenLevel(this, FName(TEXT("/Game/P0Generated/Bootstrap")));
+        return;
+    }
+    MountainAcquisitionDeny.Reset();
+    RefreshInstalledLibrary();
     if (P1Widget) P1Widget->ResetSelector();
 }

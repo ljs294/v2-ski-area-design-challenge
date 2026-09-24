@@ -14,7 +14,7 @@ double HaversineMeters(const double LatitudeA, const double LongitudeA,
     const double A = std::sin(DLatitude / 2.0) * std::sin(DLatitude / 2.0)
         + std::cos(LatitudeA * Radians) * std::cos(LatitudeB * Radians)
         * std::sin(DLongitude / 2.0) * std::sin(DLongitude / 2.0);
-    return 2.0 * RadiusM * std::asin(std::min(1.0, std::sqrt(A)));
+    return 2.0 * RadiusM * std::asin((std::min)(1.0, std::sqrt(A)));
 }
 }
 

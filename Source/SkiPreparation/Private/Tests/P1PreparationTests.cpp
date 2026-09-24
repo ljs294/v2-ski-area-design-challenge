@@ -13,7 +13,6 @@
 #include "SkiPreparation/FixtureTerrainProvider.h"
 #include "SkiPreparation/GeoTiffDecoder.h"
 #include "SkiPreparation/NativeTerrainProvider.h"
-#include "SkiPreparation/SelectorProtocol.h"
 #include "SkiPreparation/TerrainAcquisition.h"
 #include "SkiPreparation/TerrainCorePackageStore.h"
 #include "SkiPreparation/TerrainPackageStore.h"
@@ -214,23 +213,13 @@ bool WriteFloatTiff(const FString& Path, const uint32 Width, const uint32 Height
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FP1PreparationContractTest,
-    "MountainPlanner.P1.Preparation.PackageAndProtocol",
+    "MountainPlanner.P1.Preparation.PackageContract",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
 bool FP1PreparationContractTest::RunTest(const FString&)
 {
-    const FString Token = TEXT("13a15f75-5ba7-4ac0-bd1c-fbe114a6843a");
-    const FString Valid = FString::Printf(TEXT("{\"token\":\"%s\",\"generation\":7,\"name\":\"Crystal\",\"profile\":\"medium\",\"west\":-121.49,\"south\":46.92,\"east\":-121.46,\"north\":46.95}"), *Token);
     SkiPreparation::Request Request;
     FString Error;
-    TestTrue(TEXT("Tokened selector request validates"),
-        SkiPreparation::ValidateSelectorMessage(Valid, Token, 7, Request, Error));
-    TestFalse(TEXT("Stale selector generation rejected"),
-        SkiPreparation::ValidateSelectorMessage(Valid, Token, 8, Request, Error));
-    TestFalse(TEXT("Selector rejects added capability fields"),
-        SkiPreparation::ValidateSelectorMessage(Valid.LeftChop(1) + TEXT(",\"path\":\"C:/escape\"}"), Token, 7, Request, Error));
-
-    Request = {};
     Request.Name = TEXT("Crystal synthetic");
     Request.Bounds = {-121.49, 46.92, -121.46, 46.95};
     Request.Profile = SkiPreparation::SourceProfile::Medium;
@@ -599,20 +588,6 @@ bool FP1MediumProfileContractTest::RunTest(const FString&)
     TestTrue(TEXT("High failure explains the verified-lidar contract"),
         Error.Contains(TEXT("verified"), ESearchCase::IgnoreCase));
 
-    const FString Token = TEXT("1234567890abcdef1234567890abcdef");
-    const FString MediumJson = FString::Printf(
-        TEXT("{\"token\":\"%s\",\"generation\":4,\"name\":\"Mount Washington\",\"profile\":\"medium\",\"west\":-71.365,\"south\":44.225,\"east\":-71.241,\"north\":44.315}"),
-        *Token);
-    TestTrue(TEXT("Selector accepts Medium"),
-        SkiPreparation::ValidateSelectorMessage(MediumJson, Token, 4, Request, Error));
-    TestFalse(TEXT("Selector rejects legacy Standard"),
-        SkiPreparation::ValidateSelectorMessage(
-            MediumJson.Replace(TEXT("\"medium\""), TEXT("\"standard\"")),
-            Token, 4, Request, Error));
-    TestFalse(TEXT("Selector rejects unverified High"),
-        SkiPreparation::ValidateSelectorMessage(
-            MediumJson.Replace(TEXT("\"medium\""), TEXT("\"high\"")),
-            Token, 4, Request, Error));
     return true;
 }
 

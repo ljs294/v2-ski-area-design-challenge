@@ -198,7 +198,7 @@ bool ApproximateWgs84AsNad83(Geodetic Wgs84, Geodetic& OutNad83,
 {
     if(!Valid(Wgs84)) return false;
     OutNad83=Wgs84;
-    InOutBudget.DatumApproximationM=std::max(InOutBudget.DatumApproximationM,1.5);
+    InOutBudget.DatumApproximationM=(std::max)(InOutBudget.DatumApproximationM,1.5);
     return true;
 }
 }

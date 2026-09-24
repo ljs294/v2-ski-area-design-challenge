@@ -41,8 +41,7 @@ SkiPreparation::SiteSelectionDecision SkiPreparation::ValidateSiteSelection(
     }
     Decision.WidthM = Rectangle.EastM - Rectangle.WestM;
     Decision.HeightM = Rectangle.NorthM - Rectangle.SouthM;
-    if (Decision.WidthM < 2000.0 || Decision.HeightM < 2000.0
-        || Decision.WidthM > MaximumSideM || Decision.HeightM > MaximumSideM)
+    if (!SkiDomain::IsValidSiteRectangle(Rectangle, MaximumSideM))
     {
         Decision.Reason = TEXT("Each site side must be between 2 km and the current size ceiling.");
         return Decision;

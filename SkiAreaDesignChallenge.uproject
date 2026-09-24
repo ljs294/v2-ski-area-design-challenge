@@ -19,7 +19,6 @@
     { "Name": "AutomationTestToolset", "Enabled": true, "TargetAllowList": ["Editor"] },
     { "Name": "SlateInspectorToolset", "Enabled": true, "TargetAllowList": ["Editor"] },
     { "Name": "UMGToolSet", "Enabled": true, "TargetAllowList": ["Editor"] },
-    { "Name": "WebBrowserWidget", "Enabled": true, "PlatformAllowList": ["Win64"] },
     { "Name": "GeoReferencing", "Enabled": true, "PlatformAllowList": ["Win64"] },
     { "Name": "SQLiteCore", "Enabled": true, "PlatformAllowList": ["Win64"] },
     { "Name": "AndroidFileServer", "Enabled": false },

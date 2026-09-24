@@ -1460,10 +1460,54 @@ FString SkiPreparation::SerializeTerrainCoreManifest(
     return WriteJson(Root);
 }
 
-bool SkiPreparation::ParseTerrainCoreManifest(const FString& Json,
-    SkiDomain::TerrainCoreManifest& OutManifest, FString& OutError)
+namespace
+{
+constexpr uint32 TerrainCorePackageMaxProvenanceSidecars = 16384;
+
+/**
+ * TCP1 embeds the package ContentId, so including each TCP1 file hash in the
+ * ContentId preimage would be cyclic. The semantic plane hash is included in
+ * the ContentId preimage; the full file hash is instead declared in the final
+ * canonical package manifest and checked on every open/read.
+ */
+FString SerializeTerrainCorePackageManifest(
+    const SkiDomain::TerrainCoreManifest& Manifest,
+    const std::vector<SkiPreparation::TerrainCoreProvenanceSidecarDescriptor>& Sidecars,
+    const bool IncludeContentId, const bool IncludeFullFileHashes)
+{
+    if (Sidecars.empty())
+        return SkiPreparation::SerializeTerrainCoreManifest(Manifest, IncludeContentId);
+
+    TSharedPtr<FJsonObject> Root;
+    const FString CoreJson = SkiPreparation::SerializeTerrainCoreManifest(
+        Manifest, IncludeContentId);
+    if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(CoreJson), Root) || !Root)
+        return {};
+
+    TArray<TSharedPtr<FJsonValue>> Values;
+    Values.Reserve(static_cast<int32>(Sidecars.size()));
+    for (const SkiPreparation::TerrainCoreProvenanceSidecarDescriptor& Sidecar : Sidecars)
+    {
+        TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+        Object->SetStringField(TEXT("path"), UTF8_TO_TCHAR(Sidecar.Path.c_str()));
+        Object->SetNumberField(TEXT("bytes"), static_cast<double>(Sidecar.Bytes));
+        Object->SetStringField(TEXT("semanticSha256"),
+            UTF8_TO_TCHAR(Sidecar.SemanticSha256.c_str()));
+        if (IncludeFullFileHashes)
+            Object->SetStringField(TEXT("sha256"), UTF8_TO_TCHAR(Sidecar.Sha256.c_str()));
+        Values.Add(MakeShared<FJsonValueObject>(Object));
+    }
+    Root->SetArrayField(TEXT("provenanceSidecars"), Values);
+    return WriteJson(Root.ToSharedRef());
+}
+
+bool ParseTerrainCoreManifestInternal(const FString& Json,
+    SkiDomain::TerrainCoreManifest& OutManifest,
+    std::vector<SkiPreparation::TerrainCoreProvenanceSidecarDescriptor>* OutSidecars,
+    FString& OutError)
 {
     OutManifest = {};
+    if (OutSidecars) OutSidecars->clear();
     OutError.Reset();
     if (FTCHARToUTF8(Json).Length() > static_cast<int64>(SkiDomain::TerrainCoreMaxManifestBytes))
     {
@@ -1474,6 +1518,12 @@ bool SkiPreparation::ParseTerrainCoreManifest(const FString& Json,
     if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Root) || !Root)
     {
         OutError = TEXT("TerrainCore manifest is not valid JSON.");
+        return false;
+    }
+    const bool HasProvenanceSidecars = Root->HasField(TEXT("provenanceSidecars"));
+    if (HasProvenanceSidecars && !OutSidecars)
+    {
+        OutError = TEXT("TerrainCore package sidecars require the package-aware parser.");
         return false;
     }
     uint64 Number = 0;
@@ -1613,13 +1663,44 @@ bool SkiPreparation::ParseTerrainCoreManifest(const FString& Json,
             OutManifest.Tiles.push_back(std::move(Tile));
         }
     }
+    if (HasProvenanceSidecars)
+    {
+        const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+        if (!Root->TryGetArrayField(TEXT("provenanceSidecars"), Values) || !Values
+            || Values->Num() <= 0
+            || Values->Num() > static_cast<int32>(TerrainCorePackageMaxProvenanceSidecars))
+            goto Invalid;
+        OutSidecars->reserve(static_cast<std::size_t>(Values->Num()));
+        TSet<FString> SeenPaths;
+        for (const TSharedPtr<FJsonValue>& Value : *Values)
+        {
+            const TSharedPtr<FJsonObject> Object = Value ? Value->AsObject() : nullptr;
+            SkiPreparation::TerrainCoreProvenanceSidecarDescriptor Sidecar;
+            if (!ReadString(Object, TEXT("path"), Sidecar.Path)
+                || !ReadString(Object, TEXT("sha256"), Sidecar.Sha256)
+                || !ReadString(Object, TEXT("semanticSha256"), Sidecar.SemanticSha256)
+                || !ReadUint(Object, TEXT("bytes"),
+                    SkiApplication::TerrainCoreProvenanceSidecarMaxBytes, Number)
+                || Number < 265U
+                || !IsCanonicalId(UTF8_TO_TCHAR(Sidecar.Sha256.c_str()))
+                || !IsCanonicalId(UTF8_TO_TCHAR(Sidecar.SemanticSha256.c_str()))) goto Invalid;
+            Sidecar.Bytes = Number;
+            FString NormalizedPath = UTF8_TO_TCHAR(Sidecar.Path.c_str());
+            NormalizedPath.ToLowerInline();
+            if (SeenPaths.Contains(NormalizedPath)) goto Invalid;
+            SeenPaths.Add(NormalizedPath);
+            OutSidecars->push_back(std::move(Sidecar));
+        }
+    }
     if (!SkiDomain::ValidateTerrainCore(OutManifest,
         static_cast<uint64>(FTCHARToUTF8(Json).Length())).Ok())
     {
         OutError = TEXT("TerrainCore manifest failed domain validation.");
         return false;
     }
-    if (SerializeTerrainCoreManifest(OutManifest, true) != Json)
+    if ((HasProvenanceSidecars
+            ? SerializeTerrainCorePackageManifest(OutManifest, *OutSidecars, true, true)
+            : SkiPreparation::SerializeTerrainCoreManifest(OutManifest, true)) != Json)
     {
         OutError = TEXT("TerrainCore manifest is not canonical.");
         return false;
@@ -1631,9 +1712,20 @@ Invalid:
     OutError = TEXT("TerrainCore manifest has missing or invalid fields.");
     return false;
 }
+}
+
+bool SkiPreparation::ParseTerrainCoreManifest(const FString& Json,
+    SkiDomain::TerrainCoreManifest& OutManifest, FString& OutError)
+{
+    return ParseTerrainCoreManifestInternal(Json, OutManifest, nullptr, OutError);
+}
 
 namespace
 {
+bool ValidateProvenanceAtDirectory(const FString& StoreRoot,
+    const SkiPreparation::TerrainCorePackageIndex& Index, FString& Error,
+    SkiApplication::TerrainCoreProvenanceSummary* OutSummary = nullptr);
+
 bool OpenAtDirectory(const FString& StoreRoot, const FString& Directory, const FString& ContentId,
     SkiPreparation::TerrainCorePackageIndex& OutIndex, FString& Error)
 {
@@ -1650,9 +1742,13 @@ bool OpenAtDirectory(const FString& StoreRoot, const FString& Directory, const F
     uint64 ManifestBytes = 0;
     if (!SecureReadUtf8(StoreRoot, Directory, TEXT("terraincore.json"),
             SkiDomain::TerrainCoreMaxManifestBytes, Json, ManifestBytes, Error)
-        || !SkiPreparation::ParseTerrainCoreManifest(Json, OutIndex.Manifest, Error)
+        || !ParseTerrainCoreManifestInternal(Json, OutIndex.Manifest,
+            &OutIndex.ProvenanceSidecars, Error)
         || UTF8_TO_TCHAR(OutIndex.Manifest.ContentId.c_str()) != ContentId
-        || HashUtf8(SkiPreparation::SerializeTerrainCoreManifest(OutIndex.Manifest, false)) != ContentId)
+        || HashUtf8(OutIndex.ProvenanceSidecars.empty()
+            ? SkiPreparation::SerializeTerrainCoreManifest(OutIndex.Manifest, false)
+            : SerializeTerrainCorePackageManifest(OutIndex.Manifest,
+                OutIndex.ProvenanceSidecars, false, false)) != ContentId)
     {
         if (Error.IsEmpty()) Error = TEXT("TerrainCore content identity is invalid.");
         OutIndex = {};
@@ -1666,6 +1762,18 @@ bool OpenAtDirectory(const FString& StoreRoot, const FString& Directory, const F
         return false;
     }
     TArray<FString> Declared{TEXT("terraincore.json")};
+    uint64 SidecarBytes = 0;
+    uint64 ExpectedSidecars = 0;
+    for (const SkiDomain::TerrainCoreTileDescriptor& Tile : OutIndex.Manifest.Tiles)
+        if (Tile.LodIndex == 0U) ++ExpectedSidecars;
+    if (!OutIndex.ProvenanceSidecars.empty()
+        && (OutIndex.ProvenanceSidecars.size() != ExpectedSidecars
+            || OutIndex.ProvenanceSidecars.size() > TerrainCorePackageMaxProvenanceSidecars))
+    {
+        Error = TEXT("TerrainCore provenance sidecar inventory is incomplete or excessive.");
+        OutIndex = {};
+        return false;
+    }
     for (const SkiDomain::TerrainCoreShardDescriptor& Shard : OutIndex.Manifest.Shards)
     {
         if (!SecureShardLength(StoreRoot, Directory, Shard.Path, Shard.Bytes, Error))
@@ -1676,12 +1784,72 @@ bool OpenAtDirectory(const FString& StoreRoot, const FString& Directory, const F
         }
         Declared.Add(UTF8_TO_TCHAR(Shard.Path.c_str()));
     }
+    for (const SkiPreparation::TerrainCoreProvenanceSidecarDescriptor& Sidecar :
+        OutIndex.ProvenanceSidecars)
+    {
+        const SkiDomain::TerrainCoreTileDescriptor* Tile = nullptr;
+        for (const SkiDomain::TerrainCoreTileDescriptor& Candidate : OutIndex.Manifest.Tiles)
+        {
+            if (Candidate.LodIndex == 0U
+                && SkiApplication::TerrainCoreProvenanceSidecarPath(
+                    {Candidate.LodIndex, Candidate.TileX, Candidate.TileY}) == Sidecar.Path)
+            {
+                Tile = &Candidate;
+                break;
+            }
+        }
+        const uint64 Samples = Tile ? SkiPreparation::TerrainCoreStoredSampleCount(*Tile) : 0;
+        const uint64 ExactBytes = 265ULL + Samples * 2ULL;
+        if (!Tile || Sidecar.Path != SkiApplication::TerrainCoreProvenanceSidecarPath(
+                {Tile->LodIndex, Tile->TileX, Tile->TileY})
+            || Samples == 0U || Samples > SkiDomain::TerrainCoreMaxStoredSamples
+            || Sidecar.Bytes != ExactBytes
+            || Sidecar.Bytes > SkiApplication::TerrainCoreProvenanceSidecarMaxBytes
+            || Sidecar.Bytes > SkiDomain::TerrainCoreMaxInstalledBytes - SidecarBytes)
+        {
+            Error = TEXT("TerrainCore provenance sidecar path or exact tile length is invalid.");
+            OutIndex = {};
+            return false;
+        }
+        SidecarBytes += Sidecar.Bytes;
+        SkiDomain::TerrainCoreShardDescriptor SidecarFile;
+        SidecarFile.Path = Sidecar.Path;
+        SidecarFile.Bytes = Sidecar.Bytes;
+        FString Hash;
+        if (!SecureShardLength(StoreRoot, Directory, Sidecar.Path, Sidecar.Bytes, Error)
+            || !SecureHashShard(StoreRoot, Directory, SidecarFile, Hash, Error)
+            || Hash != UTF8_TO_TCHAR(Sidecar.Sha256.c_str()))
+        {
+            if (Error.IsEmpty()) Error = TEXT("TerrainCore provenance sidecar full-file hash is invalid.");
+            OutIndex = {};
+            return false;
+        }
+        Declared.Add(UTF8_TO_TCHAR(Sidecar.Path.c_str()));
+    }
+    uint64 InstalledBytes = ManifestBytes + SidecarBytes;
+    for (const SkiDomain::TerrainCoreShardDescriptor& Shard : OutIndex.Manifest.Shards)
+    {
+        if (Shard.Bytes > SkiDomain::TerrainCoreMaxInstalledBytes - InstalledBytes)
+        {
+            Error = TEXT("TerrainCore package including provenance exceeds installed-size bounds.");
+            OutIndex = {};
+            return false;
+        }
+        InstalledBytes += Shard.Bytes;
+    }
     if (!ValidateDeclaredFiles(Directory, Declared, Error))
     {
         OutIndex = {};
         return false;
     }
     OutIndex.PackageDirectory = Directory;
+    OutIndex.PackageManifestSha256 = HashUtf8(Json);
+    if (!OutIndex.ProvenanceSidecars.empty()
+        && !ValidateProvenanceAtDirectory(StoreRoot, OutIndex, Error))
+    {
+        OutIndex = {};
+        return false;
+    }
     return true;
 }
 
@@ -1793,13 +1961,147 @@ bool VerifyTileSemantics(const FString& StoreRoot,
     return true;
 }
 
+bool ValidateProvenanceAtDirectory(const FString& StoreRoot,
+    const SkiPreparation::TerrainCorePackageIndex& Index, FString& Error,
+    SkiApplication::TerrainCoreProvenanceSummary* OutSummary)
+{
+    if (OutSummary) *OutSummary = {};
+    if (Index.ProvenanceSidecars.empty()) return true;
+
+    const auto TileReader = [&StoreRoot, &Index](
+        const SkiDomain::TerrainCoreTileDescriptor& Descriptor,
+        SkiApplication::TerrainCoreTilePayload& OutTile, std::string& OutError)
+    {
+        OutTile = {};
+        FString ReadError;
+        SkiPreparation::TerrainCoreDecodedTile Decoded;
+        if (!ReadSelectedTile(StoreRoot, Index, Descriptor, Decoded, ReadError))
+        {
+            OutError = TCHAR_TO_UTF8(*ReadError);
+            return false;
+        }
+        OutTile.Key = {Descriptor.LodIndex, Descriptor.TileX, Descriptor.TileY};
+        OutTile.Descriptor = Descriptor;
+        OutTile.Heights.assign(Decoded.Heights.GetData(),
+            Decoded.Heights.GetData() + Decoded.Heights.Num());
+        OutTile.Validity.assign(Decoded.Validity.GetData(),
+            Decoded.Validity.GetData() + Decoded.Validity.Num());
+        return true;
+    };
+    const auto SidecarReader = [&StoreRoot, &Index](
+        const SkiDomain::TerrainCoreTileDescriptor& Descriptor,
+        const std::uint64_t MaximumBytes, std::vector<std::uint8_t>& OutBytes,
+        std::string& OutError, const SkiApplication::TerrainCoreReadCancellation& Cancellation)
+    {
+        OutBytes.clear();
+        if (Cancellation.IsCancellationRequested())
+        {
+            OutError = "TerrainCore provenance read cancelled";
+            return false;
+        }
+        const SkiApplication::TerrainCoreTileKey Key{
+            Descriptor.LodIndex, Descriptor.TileX, Descriptor.TileY};
+        const std::string ExpectedPath = SkiApplication::TerrainCoreProvenanceSidecarPath(Key);
+        const auto Found = std::find_if(Index.ProvenanceSidecars.begin(),
+            Index.ProvenanceSidecars.end(), [&ExpectedPath](const auto& Sidecar)
+            {
+                return Sidecar.Path == ExpectedPath;
+            });
+        if (Found == Index.ProvenanceSidecars.end() || Found->Bytes > MaximumBytes
+            || Found->Bytes > MAX_int32)
+        {
+            OutError = "TerrainCore provenance sidecar is undeclared or exceeds its tile bound";
+            return false;
+        }
+        TArray<uint8> Bytes;
+        FString ReadError;
+        if (!SecureReadShardRange(StoreRoot, Index.PackageDirectory, Found->Path,
+                0, Found->Bytes, Bytes, ReadError)
+            || SkiPreparation::Sha256(Bytes) != UTF8_TO_TCHAR(Found->Sha256.c_str()))
+        {
+            OutError = ReadError.IsEmpty()
+                ? "TerrainCore provenance sidecar full-file hash mismatch"
+                : TCHAR_TO_UTF8(*ReadError);
+            return false;
+        }
+        const uint64 Samples = SkiPreparation::TerrainCoreStoredSampleCount(Descriptor);
+        const uint64 PlaneBytes = Samples * 2ULL;
+        constexpr uint64 PlaneOffset = 233ULL;
+        if (Samples == 0U || PlaneOffset + PlaneBytes + 32ULL != Found->Bytes
+            || Bytes.Num() != static_cast<int32>(Found->Bytes))
+        {
+            OutError = "TerrainCore provenance sidecar plane size is malformed";
+            return false;
+        }
+        const FString SemanticSha = SkiPreparation::Sha256(TArrayView<const uint8>(
+            Bytes.GetData() + PlaneOffset, static_cast<int32>(PlaneBytes)));
+        if (SemanticSha != UTF8_TO_TCHAR(Found->SemanticSha256.c_str()))
+        {
+            OutError = "TerrainCore provenance semantic plane hash mismatch";
+            return false;
+        }
+        OutBytes.assign(Bytes.GetData(), Bytes.GetData() + Bytes.Num());
+        return true;
+    };
+
+    std::string RepositoryError;
+    const std::shared_ptr<SkiApplication::TerrainCoreRepository> Repository =
+        SkiApplication::TerrainCoreRepository::Create(Index.Manifest, TileReader,
+            SidecarReader, RepositoryError);
+    if (!Repository)
+    {
+        Error = FString(TEXT("TerrainCore provenance repository could not be created: "))
+            + UTF8_TO_TCHAR(RepositoryError.c_str());
+        return false;
+    }
+    SkiApplication::TerrainCoreProvenanceSummary Summary;
+    if (!Repository->ReadVerifiedProvenanceSummary(Summary, RepositoryError))
+    {
+        Error = FString(TEXT("TerrainCore provenance verification failed: "))
+            + UTF8_TO_TCHAR(RepositoryError.c_str());
+        return false;
+    }
+    if (OutSummary) *OutSummary = std::move(Summary);
+    return true;
+}
+
+bool ValidatePackageManifestFile(const FString& StoreRoot,
+    const SkiPreparation::TerrainCorePackageIndex& Index, FString& Error)
+{
+    FString Json;
+    uint64 Bytes = 0;
+    if (!SecureReadUtf8(StoreRoot, Index.PackageDirectory, TEXT("terraincore.json"),
+            SkiDomain::TerrainCoreMaxManifestBytes, Json, Bytes, Error)) return false;
+    const FString Canonical = Index.ProvenanceSidecars.empty()
+        ? SkiPreparation::SerializeTerrainCoreManifest(Index.Manifest, true)
+        : SerializeTerrainCorePackageManifest(Index.Manifest, Index.ProvenanceSidecars,
+            true, true);
+    const FString Unsigned = Index.ProvenanceSidecars.empty()
+        ? SkiPreparation::SerializeTerrainCoreManifest(Index.Manifest, false)
+        : SerializeTerrainCorePackageManifest(Index.Manifest, Index.ProvenanceSidecars,
+            false, false);
+    if (Bytes > SkiDomain::TerrainCoreMaxManifestBytes || Canonical != Json
+        || HashUtf8(Json) != Index.PackageManifestSha256
+        || Unsigned.IsEmpty()
+        || HashUtf8(Unsigned) != UTF8_TO_TCHAR(Index.Manifest.ContentId.c_str()))
+    {
+        Error = TEXT("TerrainCore canonical package manifest or content identity changed.");
+        return false;
+    }
+    return true;
+}
+
 bool VerifyAtDirectory(const FString& StoreRoot,
     const SkiPreparation::TerrainCorePackageIndex& Index, FString& Error)
 {
     Error.Reset();
+    if (!ValidatePackageManifestFile(StoreRoot, Index, Error)) return false;
     TArray<FString> Declared{TEXT("terraincore.json")};
     for (const SkiDomain::TerrainCoreShardDescriptor& Shard : Index.Manifest.Shards)
         Declared.Add(UTF8_TO_TCHAR(Shard.Path.c_str()));
+    for (const SkiPreparation::TerrainCoreProvenanceSidecarDescriptor& Sidecar :
+        Index.ProvenanceSidecars)
+        Declared.Add(UTF8_TO_TCHAR(Sidecar.Path.c_str()));
     if (!ValidateDeclaredFiles(Index.PackageDirectory, Declared, Error)) return false;
     for (const SkiDomain::TerrainCoreShardDescriptor& Shard : Index.Manifest.Shards)
     {
@@ -1811,13 +2113,28 @@ bool VerifyAtDirectory(const FString& StoreRoot,
             return false;
         }
     }
+    for (const SkiPreparation::TerrainCoreProvenanceSidecarDescriptor& Sidecar :
+        Index.ProvenanceSidecars)
+    {
+        SkiDomain::TerrainCoreShardDescriptor SidecarFile;
+        SidecarFile.Path = Sidecar.Path;
+        SidecarFile.Bytes = Sidecar.Bytes;
+        FString Hash;
+        if (!SecureHashShard(StoreRoot, Index.PackageDirectory, SidecarFile, Hash, Error)
+            || Hash != UTF8_TO_TCHAR(Sidecar.Sha256.c_str()))
+        {
+            if (Error.IsEmpty()) Error = TEXT("TerrainCore provenance full-file hash is invalid.");
+            return false;
+        }
+    }
     for (const SkiDomain::TerrainCoreTileDescriptor& Tile : Index.Manifest.Tiles)
     {
         SkiPreparation::TerrainCoreDecodedTile Decoded;
         if (!ReadSelectedTile(StoreRoot, Index, Tile, Decoded, Error)
             || !VerifyTileSemantics(StoreRoot, Index, Tile, Decoded, Error)) return false;
     }
-    if (!ValidateDeclaredFiles(Index.PackageDirectory, Declared, Error)) return false;
+    if (!ValidateDeclaredFiles(Index.PackageDirectory, Declared, Error)
+        || !ValidateProvenanceAtDirectory(StoreRoot, Index, Error)) return false;
     return true;
 }
 }
@@ -1832,7 +2149,8 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivate(
     FString& OutPackageDirectory, SkiDomain::TerrainCoreManifest& OutManifest,
     FString& OutError,
     const TSharedPtr<PreparationOperationLease, ESPMode::ThreadSafe>& Lease,
-    const uint64 SessionGeneration, const uint64 OperationGeneration) const
+    const uint64 SessionGeneration, const uint64 OperationGeneration,
+    TerrainCoreProvenanceTileSource ProvenanceSource) const
 {
     OutPackageDirectory.Reset();
     OutManifest = {};
@@ -1868,7 +2186,8 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivate(
         return DeriveTerrainCoreTile(Finest, Planned, OutTile, Error);
     };
     return WriteAndActivateFromTiles(std::move(Manifest), Source, OutPackageDirectory,
-        OutManifest, OutError, Lease, SessionGeneration, OperationGeneration);
+        OutManifest, OutError, Lease, SessionGeneration, OperationGeneration,
+        std::move(ProvenanceSource));
 }
 
 bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
@@ -1876,7 +2195,8 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
     FString& OutPackageDirectory, SkiDomain::TerrainCoreManifest& OutManifest,
     FString& OutError,
     const TSharedPtr<PreparationOperationLease, ESPMode::ThreadSafe>& Lease,
-    const uint64 SessionGeneration, const uint64 OperationGeneration) const
+    const uint64 SessionGeneration, const uint64 OperationGeneration,
+    TerrainCoreProvenanceTileSource ProvenanceSource) const
 {
     OutPackageDirectory.Reset();
     OutManifest = {};
@@ -1912,6 +2232,14 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
     Manifest.Tiles.clear();
     Manifest.Shards.clear();
 
+    struct FStagedProvenancePlanes
+    {
+        SkiPreparation::TerrainCoreProvenanceSidecarDescriptor Descriptor;
+        FString StagingPath;
+        uint64 SampleCount = 0;
+    };
+    std::vector<FStagedProvenancePlanes> StagedProvenance;
+
     const FString StagingParent = FPaths::Combine(Root, TEXT(".terraincore-staging"));
     const FString Stage = FPaths::Combine(StagingParent,
         FGuid::NewGuid().ToString(EGuidFormats::Digits));
@@ -1924,6 +2252,7 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
         return false;
     }
     const auto Cleanup = [&]() { DeleteSecureTree(StagingParent, Stage); };
+    const FString ProvenanceStagingDirectory = FPaths::Combine(Stage, TEXT("provenance-staging"));
     FSecureTerrainWriter ShardHandle;
     FString ShardPath;
     uint64 ShardBytes = 0;
@@ -2009,6 +2338,80 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
             OutError = TEXT("TerrainCore encoded tile exceeds its codec or tile limit.");
             ShardHandle.Close(); Cleanup(); return false;
         }
+        if (ProvenanceSource && Geometry.LodIndex == 0U)
+        {
+            if (StagedProvenance.size() >= TerrainCorePackageMaxProvenanceSidecars)
+            {
+                OutError = TEXT("TerrainCore provenance sidecar count exceeds its bounded package limit.");
+                ShardHandle.Close(); Cleanup(); return false;
+            }
+            TerrainCoreDecodedTile Decoded;
+            if (!DecodeTerrainCoreTile(Encoded.Descriptor,
+                    MakeArrayView(Encoded.CompressedHeights),
+                    MakeArrayView(Encoded.CompressedValidity), Decoded, OutError))
+            {
+                ShardHandle.Close(); Cleanup(); return false;
+            }
+            TArray<uint8> Provenance, SourceIndices;
+            if (!ProvenanceSource(Geometry,
+                    TArrayView<const uint8>(Decoded.Validity.GetData(), Decoded.Validity.Num()),
+                    Provenance, SourceIndices, OutError))
+            {
+                if (OutError.IsEmpty()) OutError = TEXT("TerrainCore provenance sampler failed.");
+                ShardHandle.Close(); Cleanup(); return false;
+            }
+            const uint64 Samples = TerrainCoreStoredSampleCount(Geometry);
+            const uint64 SourceCount = 1ULL + Manifest.AdditionalSources.size();
+            if (Samples == 0U || Samples > SkiDomain::TerrainCoreMaxStoredSamples
+                || Provenance.Num() != static_cast<int32>(Samples)
+                || SourceIndices.Num() != static_cast<int32>(Samples))
+            {
+                OutError = TEXT("TerrainCore provenance planes do not match the stored tile sample count.");
+                ShardHandle.Close(); Cleanup(); return false;
+            }
+            for (int32 Index = 0; Index < Decoded.Validity.Num(); ++Index)
+            {
+                const bool Valid = Decoded.Validity[Index] == 1U;
+                const bool WellFormed = Decoded.Validity[Index] <= 1U
+                    && (Valid
+                        ? Provenance[Index] <= static_cast<uint8>(
+                            SkiApplication::TerrainSampleProvenance::ArcSec13)
+                            && SourceIndices[Index] < SourceCount
+                        : Provenance[Index] == static_cast<uint8>(
+                            SkiApplication::TerrainSampleProvenance::NoData)
+                            && SourceIndices[Index] == SkiApplication::TerrainCoreNoSourceIndex);
+                if (!WellFormed)
+                {
+                    OutError = TEXT("TerrainCore provenance planes contain invalid sample identities.");
+                    ShardHandle.Close(); Cleanup(); return false;
+                }
+            }
+            TArray<uint8> CanonicalPlanes;
+            CanonicalPlanes.Reserve(Provenance.Num() + SourceIndices.Num());
+            CanonicalPlanes.Append(Provenance);
+            CanonicalPlanes.Append(SourceIndices);
+            if (!EnsureSecureDirectory(ProvenanceStagingDirectory, OutError))
+            {
+                ShardHandle.Close(); Cleanup(); return false;
+            }
+            FStagedProvenancePlanes Staged;
+            Staged.SampleCount = Samples;
+            Staged.Descriptor.Path = SkiApplication::TerrainCoreProvenanceSidecarPath(
+                {Geometry.LodIndex, Geometry.TileX, Geometry.TileY});
+            Staged.Descriptor.Bytes = 265ULL + Samples * 2ULL;
+            Staged.Descriptor.SemanticSha256 = TCHAR_TO_UTF8(*SkiPreparation::Sha256(CanonicalPlanes));
+            Staged.StagingPath = FPaths::Combine(ProvenanceStagingDirectory,
+                FString::Printf(TEXT("%08u.planes"), static_cast<uint32>(StagedProvenance.size())));
+            FSecureTerrainWriter PlaneWriter;
+            if (!PlaneWriter.Open(Root, Staged.StagingPath, OutError)
+                || !PlaneWriter.Write(CanonicalPlanes.GetData(), CanonicalPlanes.Num()))
+            {
+                if (OutError.IsEmpty()) OutError = TEXT("Unable to stage bounded TerrainCore provenance planes.");
+                PlaneWriter.Close(); ShardHandle.Close(); Cleanup(); return false;
+            }
+            PlaneWriter.Close();
+            StagedProvenance.push_back(std::move(Staged));
+        }
         if (ShardBytes > 0 && (ShardBytes >= TerrainCoreShardTargetBytes
             || Combined > TerrainCoreShardTargetBytes - ShardBytes))
         {
@@ -2047,7 +2450,26 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
         ObserveMemory();
     }
     if (!FinishShard()) { Cleanup(); return false; }
-    const FString Unsigned = SerializeTerrainCoreManifest(Manifest, false);
+    uint64 PlannedLod0Sidecars = 0;
+    for (const SkiDomain::TerrainCoreTileDescriptor& Tile : Plan.Tiles)
+        if (Tile.LodIndex == 0U) ++PlannedLod0Sidecars;
+    if (ProvenanceSource && StagedProvenance.size() != PlannedLod0Sidecars)
+    {
+        OutError = TEXT("TerrainCore provenance sampler did not supply every LOD0 tile.");
+        Cleanup(); return false;
+    }
+    std::vector<TerrainCoreProvenanceSidecarDescriptor> Sidecars;
+    Sidecars.reserve(StagedProvenance.size());
+    for (const FStagedProvenancePlanes& Staged : StagedProvenance)
+        Sidecars.push_back(Staged.Descriptor);
+    const FString Unsigned = Sidecars.empty()
+        ? SerializeTerrainCoreManifest(Manifest, false)
+        : SerializeTerrainCorePackageManifest(Manifest, Sidecars, false, false);
+    if (Unsigned.IsEmpty())
+    {
+        OutError = TEXT("TerrainCore package identity preimage could not be serialized.");
+        Cleanup(); return false;
+    }
     Manifest.ContentId = TCHAR_TO_UTF8(*HashUtf8(Unsigned));
     const SkiDomain::TerrainCoreValidation Validation = SkiDomain::ValidateTerrainCore(Manifest);
     if (!Validation.Ok())
@@ -2056,7 +2478,92 @@ bool SkiPreparation::TerrainCorePackageStore::WriteAndActivateFromTiles(
             static_cast<int32>(Validation.Error), static_cast<uint64>(Validation.Index));
         Cleanup(); return false;
     }
-    const FString Json = SerializeTerrainCoreManifest(Manifest, true);
+
+    if (!Sidecars.empty())
+    {
+        TerrainCorePackageIndex StagedTileIndex;
+        StagedTileIndex.Manifest = Manifest;
+        StagedTileIndex.PackageDirectory = Stage;
+        for (uint32 SidecarIndex = 0; SidecarIndex < StagedProvenance.size(); ++SidecarIndex)
+        {
+            const FStagedProvenancePlanes& Staged = StagedProvenance[SidecarIndex];
+            const uint64 PlaneBytes = Staged.SampleCount * 2ULL;
+            const FString RelativePlanePath = FString::Printf(TEXT("provenance-staging/%08u.planes"),
+                SidecarIndex);
+            TArray<uint8> Planes;
+            if (!SecureReadShardRange(Root, Stage, TCHAR_TO_UTF8(*RelativePlanePath),
+                    0, PlaneBytes, Planes, OutError)
+                || Planes.Num() != static_cast<int32>(PlaneBytes))
+            {
+                if (OutError.IsEmpty()) OutError = TEXT("Staged TerrainCore provenance planes are truncated.");
+                Cleanup(); return false;
+            }
+            const auto TileIt = std::find_if(Manifest.Tiles.begin(), Manifest.Tiles.end(),
+                [&Staged](const SkiDomain::TerrainCoreTileDescriptor& Tile)
+                {
+                    return Tile.LodIndex == 0U
+                        && SkiApplication::TerrainCoreProvenanceSidecarPath(
+                            {Tile.LodIndex, Tile.TileX, Tile.TileY}) == Staged.Descriptor.Path;
+                });
+            if (TileIt == Manifest.Tiles.end())
+            {
+                OutError = TEXT("Staged TerrainCore provenance sidecar does not map to a canonical tile.");
+                Cleanup(); return false;
+            }
+            TerrainCoreDecodedTile Decoded;
+            if (!ReadSelectedTile(Root, StagedTileIndex, *TileIt, Decoded, OutError))
+            {
+                Cleanup(); return false;
+            }
+            std::vector<uint8> Provenance(Planes.GetData(),
+                Planes.GetData() + Staged.SampleCount);
+            std::vector<uint8> SourceIndices(Planes.GetData() + Staged.SampleCount,
+                Planes.GetData() + PlaneBytes);
+            std::vector<uint8> Validity(Decoded.Validity.GetData(),
+                Decoded.Validity.GetData() + Decoded.Validity.Num());
+            std::vector<uint8> EncodedSidecar;
+            std::string SidecarError;
+            if (!SkiApplication::EncodeTerrainCoreTileProvenanceSidecar(Manifest,
+                    {TileIt->LodIndex, TileIt->TileX, TileIt->TileY}, Validity,
+                    Provenance, SourceIndices, EncodedSidecar, SidecarError))
+            {
+                OutError = FString(TEXT("Unable to encode TCP1 TerrainCore provenance: "))
+                    + UTF8_TO_TCHAR(SidecarError.c_str());
+                Cleanup(); return false;
+            }
+            const FString SidecarPath = FPaths::Combine(Stage,
+                UTF8_TO_TCHAR(Staged.Descriptor.Path.c_str()));
+            if (!EnsureSecureDirectory(FPaths::GetPath(SidecarPath), OutError)
+                || !ValidateNoReparsePath(SidecarPath, false, &OutError))
+            {
+                Cleanup(); return false;
+            }
+            FSecureTerrainWriter SidecarWriter;
+            if (!SidecarWriter.Open(Root, SidecarPath, OutError)
+                || !SidecarWriter.Write(EncodedSidecar.data(),
+                    static_cast<int64>(EncodedSidecar.size())))
+            {
+                if (OutError.IsEmpty()) OutError = TEXT("Unable to persist a TCP1 TerrainCore sidecar.");
+                SidecarWriter.Close(); Cleanup(); return false;
+            }
+            SidecarWriter.Close();
+            TerrainCoreProvenanceSidecarDescriptor& Sidecar = Sidecars[SidecarIndex];
+            Sidecar.Bytes = EncodedSidecar.size();
+            Sidecar.Sha256 = TCHAR_TO_UTF8(*SkiPreparation::Sha256(
+                TArrayView<const uint8>(EncodedSidecar.data(),
+                    static_cast<int32>(EncodedSidecar.size()))));
+        }
+        DeleteSecureTree(Stage, ProvenanceStagingDirectory);
+    }
+
+    const FString Json = Sidecars.empty()
+        ? SerializeTerrainCoreManifest(Manifest, true)
+        : SerializeTerrainCorePackageManifest(Manifest, Sidecars, true, true);
+    if (Json.IsEmpty())
+    {
+        OutError = TEXT("TerrainCore package manifest could not be serialized.");
+        Cleanup(); return false;
+    }
     const uint64 JsonBytes = static_cast<uint64>(FTCHARToUTF8(Json).Length());
     const FString ManifestPath = FPaths::Combine(Stage, TEXT("terraincore.json"));
     if (!SkiDomain::ValidateTerrainCore(Manifest, JsonBytes).Ok()
@@ -2190,6 +2697,67 @@ bool SkiPreparation::TerrainCorePackageStore::ReadTile(
         return false;
     }
     return ReadSelectedTile(Root, Index, *Tile, OutTile, OutError);
+}
+
+bool SkiPreparation::TerrainCorePackageStore::ReadProvenanceSidecar(
+    const TerrainCorePackageIndex& Index, const uint8 LodIndex, const uint32 TileX,
+    const uint32 TileY, TArray<uint8>& OutBytes, FString& OutError) const
+{
+    OutBytes.Reset();
+    OutError.Reset();
+    if (Index.ProvenanceSidecars.empty())
+    {
+        OutError = TEXT("TerrainCore provenance sidecars are unavailable for this legacy package.");
+        return false;
+    }
+    if (LodIndex != 0U || !ValidatePackageManifestFile(Root, Index, OutError))
+    {
+        if (OutError.IsEmpty()) OutError = TEXT("TerrainCore provenance sidecars are only defined for LOD0.");
+        return false;
+    }
+    const std::string Relative = SkiApplication::TerrainCoreProvenanceSidecarPath(
+        {LodIndex, TileX, TileY});
+    const auto Found = std::find_if(Index.ProvenanceSidecars.begin(),
+        Index.ProvenanceSidecars.end(), [&Relative](const TerrainCoreProvenanceSidecarDescriptor& Sidecar)
+        {
+            return Sidecar.Path == Relative;
+        });
+    if (Found == Index.ProvenanceSidecars.end()
+        || !FindTile(Index.Manifest, LodIndex, TileX, TileY))
+    {
+        OutError = TEXT("Declared TerrainCore provenance sidecar does not exist.");
+        return false;
+    }
+    if (!SecureReadShardRange(Root, Index.PackageDirectory, Found->Path,
+            0, Found->Bytes, OutBytes, OutError)
+        || SkiPreparation::Sha256(OutBytes) != UTF8_TO_TCHAR(Found->Sha256.c_str()))
+    {
+        OutBytes.Reset();
+        if (OutError.IsEmpty()) OutError = TEXT("TerrainCore provenance sidecar hash is invalid.");
+        return false;
+    }
+    SkiApplication::TerrainCoreProvenanceSummary Verified;
+    if (!ValidateProvenanceAtDirectory(Root, Index, OutError, &Verified))
+    {
+        OutBytes.Reset();
+        return false;
+    }
+    return true;
+}
+
+bool SkiPreparation::TerrainCorePackageStore::ReadVerifiedProvenanceSummary(
+    const TerrainCorePackageIndex& Index,
+    SkiApplication::TerrainCoreProvenanceSummary& OutSummary, FString& OutError) const
+{
+    OutSummary = {};
+    OutError.Reset();
+    if (Index.ProvenanceSidecars.empty())
+    {
+        OutError = TEXT("TerrainCore provenance sidecars are unavailable for this legacy package.");
+        return false;
+    }
+    return ValidatePackageManifestFile(Root, Index, OutError)
+        && ValidateProvenanceAtDirectory(Root, Index, OutError, &OutSummary);
 }
 
 bool SkiPreparation::TerrainCorePackageStore::Verify(

@@ -3,6 +3,7 @@
 #include "SkiDomain/TerrainCore.h"
 
 #include <functional>
+#include <array>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -60,6 +61,64 @@ struct SKIAPPLICATION_API TerrainCoreTilePayload
     }
 };
 
+/** Stable sample-class IDs written by the canonical elevation sampler. */
+enum class TerrainSampleProvenance : std::uint8_t
+{
+    S1MNative = 0,
+    S1MBlend = 1,
+    S1MBackfill = 2,
+    S1MInterpolated = 3,
+    Project1m = 4,
+    ArcSec13 = 5,
+    NoData = 255,
+};
+
+inline constexpr std::uint8_t TerrainCoreNoSourceIndex = 0xffU;
+inline constexpr std::uint32_t TerrainCoreProvenanceSidecarSchema = 1U;
+inline constexpr std::uint64_t TerrainCoreProvenanceSidecarMaxBytes =
+    265ULL + SkiDomain::TerrainCoreMaxStoredSamples * 2ULL;
+
+struct SKIAPPLICATION_API TerrainCoreProvenanceSourceCount
+{
+    std::string SourceId;
+    std::uint64_t SampleCount = 0;
+    std::array<std::uint64_t, 6> SamplesByProvenance{};
+};
+
+/**
+ * Verified counts from each LOD0 tile's unique core samples. Halo samples are
+ * validated but excluded so a shared border is never counted twice. Source
+ * entries remain in manifest order and refer to TerrainCore source-table IDs.
+ */
+struct SKIAPPLICATION_API TerrainCoreProvenanceSummary
+{
+    std::string TerrainCoreId;
+    std::string GridSha256;
+    std::string SourceDictionarySha256;
+    std::uint32_t Width = 0;
+    std::uint32_t Height = 0;
+    std::uint64_t TotalSamples = 0;
+    std::uint64_t ValidSamples = 0;
+    std::uint64_t NoDataSamples = 0;
+    std::array<std::uint64_t, 6> SamplesByProvenance{};
+    std::vector<TerrainCoreProvenanceSourceCount> Sources;
+};
+
+/** Deterministic path for the persisted LOD0 provenance record associated with a tile. */
+SKIAPPLICATION_API std::string TerrainCoreProvenanceSidecarPath(
+    const TerrainCoreTileKey& Key);
+
+/**
+ * Encodes one durable, content/grid-bound LOD0 provenance record. The source
+ * index plane uses the TerrainCore manifest source order (primary, then extras).
+ */
+SKIAPPLICATION_API bool EncodeTerrainCoreTileProvenanceSidecar(
+    const SkiDomain::TerrainCoreManifest& Manifest, const TerrainCoreTileKey& Key,
+    const std::vector<std::uint8_t>& Validity,
+    const std::vector<std::uint8_t>& Provenance,
+    const std::vector<std::uint8_t>& SourceIndices,
+    std::vector<std::uint8_t>& OutBytes, std::string& OutError);
+
 class SKIAPPLICATION_API ITerrainCoreRepository
 {
 public:
@@ -103,6 +162,18 @@ public:
         }
         return Result;
     }
+    // Legacy TerrainCore repositories remain readable but cannot report
+    // provenance as verified. Concrete repositories override this when they
+    // were opened with a durable sidecar reader.
+    virtual bool ReadVerifiedProvenanceSummary(TerrainCoreProvenanceSummary& OutSummary,
+        std::string& OutError,
+        const TerrainCoreReadCancellation& Cancellation = {}) const
+    {
+        OutSummary = {};
+        OutError = "TerrainCore provenance sidecars are unavailable";
+        (void)Cancellation;
+        return false;
+    }
 };
 
 // A validated repository port. Storage adapters supply the reader; callers cannot mutate
@@ -113,22 +184,33 @@ class SKIAPPLICATION_API TerrainCoreRepository final : public ITerrainCoreReposi
 public:
     using TileReader = std::function<bool(const SkiDomain::TerrainCoreTileDescriptor&,
         TerrainCoreTilePayload&, std::string&)>;
+    using ProvenanceSidecarReader = std::function<bool(
+        const SkiDomain::TerrainCoreTileDescriptor&, std::uint64_t MaximumBytes,
+        std::vector<std::uint8_t>&, std::string&,
+        const TerrainCoreReadCancellation&)>;
 
     static std::shared_ptr<TerrainCoreRepository> Create(
         SkiDomain::TerrainCoreManifest Manifest, TileReader Reader,
         std::string& OutError);
+    static std::shared_ptr<TerrainCoreRepository> Create(
+        SkiDomain::TerrainCoreManifest Manifest, TileReader Reader,
+        ProvenanceSidecarReader ProvenanceReader, std::string& OutError);
 
     std::shared_ptr<const SkiDomain::TerrainCoreManifest> Metadata() const override;
     bool ReadTile(const TerrainCoreTileKey& Key, TerrainCoreTilePayload& OutTile,
         std::string& OutError) const override;
     bool ReadTile(const TerrainCoreTileKey& Key, TerrainCoreTilePayload& OutTile,
         std::string& OutError, const TerrainCoreReadCancellation& Cancellation) const override;
+    bool ReadVerifiedProvenanceSummary(TerrainCoreProvenanceSummary& OutSummary,
+        std::string& OutError,
+        const TerrainCoreReadCancellation& Cancellation = {}) const override;
 
 private:
     TerrainCoreRepository(std::shared_ptr<const SkiDomain::TerrainCoreManifest> InManifest,
-        TileReader InReader);
+        TileReader InReader, ProvenanceSidecarReader InProvenanceReader);
 
     std::shared_ptr<const SkiDomain::TerrainCoreManifest> Manifest;
     TileReader Reader;
+    ProvenanceSidecarReader ProvenanceReader;
 };
 }

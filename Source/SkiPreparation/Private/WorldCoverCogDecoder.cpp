@@ -8,9 +8,9 @@
 
 namespace
 {
-constexpr uint32 ModelPixelScaleTag = 33550;
-constexpr uint32 ModelTiepointTag = 33922;
-constexpr uint32 GeoKeyDirectoryTag = 34735;
+constexpr uint32 WorldCoverModelPixelScaleTag = 33550;
+constexpr uint32 WorldCoverModelTiepointTag = 33922;
+constexpr uint32 WorldCoverGeoKeyDirectoryTag = 34735;
 constexpr uint64 MaxCoverCells = 16000000ULL; // matches SkiDomain CoverEcologyMaxCells
 constexpr uint64 MaxCogBytes = 512ULL * 1024ULL * 1024ULL;
 constexpr uint64 MaxDecodedTileBytes = 64ULL * 1024ULL * 1024ULL;
@@ -37,7 +37,7 @@ tmsize_t ReadCog(thandle_t Handle, void* Destination, const tmsize_t Requested)
     return static_cast<tmsize_t>(Length);
 }
 
-tmsize_t RejectWrite(thandle_t, void*, tmsize_t) { return 0; }
+tmsize_t RejectCogWrite(thandle_t, void*, tmsize_t) { return 0; }
 toff_t SeekCog(thandle_t Handle, const toff_t Offset, const int Origin)
 {
     CogHandle& Reader = *static_cast<CogHandle*>(Handle);
@@ -59,10 +59,10 @@ toff_t SizeCog(thandle_t Handle)
     const CogHandle& Reader = *static_cast<CogHandle*>(Handle);
     return Reader.Source ? static_cast<toff_t>(Reader.Source->Size()) : 0;
 }
-int RejectMap(thandle_t, void**, toff_t*) { return 0; }
+int RejectCogMap(thandle_t, void**, toff_t*) { return 0; }
 void RejectUnmap(thandle_t, void*, toff_t) {}
 
-void Fail(SkiPreparation::ProviderFailure& Failure, const TCHAR* Code, const TCHAR* Summary)
+void FailWorldCover(SkiPreparation::ProviderFailure& Failure, const TCHAR* Code, const TCHAR* Summary)
 {
     Failure.Code = Code;
     Failure.Stage = SkiPreparation::FailureStage::Decoding;
@@ -85,7 +85,7 @@ bool HasEpsg4326(TIFF* Image)
 {
     uint32 Count = 0;
     uint16* Keys = nullptr;
-    if (!TIFFGetField(Image, GeoKeyDirectoryTag, &Count, &Keys) || !Keys || Count < 4
+    if (!TIFFGetField(Image, WorldCoverGeoKeyDirectoryTag, &Count, &Keys) || !Keys || Count < 4
         || Keys[3] > (Count - 4) / 4) return false;
     bool Geographic = false;
     bool Epsg4326 = false;
@@ -114,7 +114,7 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
     OutFailure.Product = ProviderProduct::WorldCover;
     if (Source.Size() < 16 || Source.Size() > MaxCogBytes)
     {
-        Fail(OutFailure, TEXT("WORLDCOVER_COG_SIZE_INVALID"),
+        FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_SIZE_INVALID"),
             TEXT("WorldCover COG size is outside the bounded reader envelope."));
         return false;
     }
@@ -123,16 +123,16 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
         || RequestedBounds.WestDeg >= RequestedBounds.EastDeg
         || RequestedBounds.SouthDeg >= RequestedBounds.NorthDeg)
     {
-        Fail(OutFailure, TEXT("WORLDCOVER_WINDOW_INVALID"), TEXT("WorldCover window bounds are invalid."));
+        FailWorldCover(OutFailure, TEXT("WORLDCOVER_WINDOW_INVALID"), TEXT("WorldCover window bounds are invalid."));
         return false;
     }
     EnsureGeoTiffTagsRegistered();
     CogHandle Reader{&Source};
     std::unique_ptr<TIFF, decltype(&TIFFClose)> Image(TIFFClientOpen("MountainPlannerWorldCover", "r",
-        &Reader, ReadCog, RejectWrite, SeekCog, CloseCog, SizeCog, RejectMap, RejectUnmap), &TIFFClose);
+        &Reader, ReadCog, RejectCogWrite, SeekCog, CloseCog, SizeCog, RejectCogMap, RejectUnmap), &TIFFClose);
     if (!Image)
     {
-        Fail(OutFailure, TEXT("WORLDCOVER_COG_OPEN_FAILED"),
+        FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_OPEN_FAILED"),
             Reader.Error.IsEmpty() ? TEXT("WorldCover COG could not be opened.") : *Reader.Error);
         OutFailure.Retry = RetryClassification::Retryable;
         return false;
@@ -151,7 +151,7 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
         || !TIFFGetField(Image.get(), TIFFTAG_TILEWIDTH, &TileWidth)
         || !TIFFGetField(Image.get(), TIFFTAG_TILELENGTH, &TileHeight))
     {
-        Fail(OutFailure, TEXT("WORLDCOVER_COG_TAG_INVALID"),
+        FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_TAG_INVALID"),
             TEXT("WorldCover COG omits required tiled-image metadata."));
         return false;
     }
@@ -162,14 +162,14 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
         || Bits != 8 || Samples != 1 || (Format != SAMPLEFORMAT_UINT && Format != SAMPLEFORMAT_VOID)
         || Planar != PLANARCONFIG_CONTIG || Orientation != ORIENTATION_TOPLEFT)
     {
-        Fail(OutFailure, TEXT("WORLDCOVER_COG_ENCODING_UNSUPPORTED"),
+        FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_ENCODING_UNSUPPORTED"),
             TEXT("WorldCover must be a north-up tiled one-band uint8 class COG."));
         return false;
     }
     if (Compression != COMPRESSION_NONE && Compression != COMPRESSION_LZW
         && Compression != COMPRESSION_ADOBE_DEFLATE && Compression != COMPRESSION_DEFLATE)
     {
-        Fail(OutFailure, TEXT("WORLDCOVER_COG_CODEC_UNSUPPORTED"),
+        FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_CODEC_UNSUPPORTED"),
             TEXT("WorldCover COG uses a compression codec outside NONE/LZW/DEFLATE."));
         return false;
     }
@@ -184,7 +184,7 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
             const int32 Parsed = FCString::Atoi(*Text);
             if (Text.IsEmpty() || !Text.IsNumeric() || Parsed < 0 || Parsed > 255)
             {
-                Fail(OutFailure, TEXT("WORLDCOVER_COG_NODATA_INVALID"),
+                FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_NODATA_INVALID"),
                     TEXT("WorldCover GDAL_NODATA is not a uint8 value."));
                 return false;
             }
@@ -195,20 +195,20 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
     const uint64 DecodedTileBytes = static_cast<uint64>(TileWidth) * TileHeight;
     if (DecodedTileBytes == 0 || DecodedTileBytes > MaxDecodedTileBytes)
     {
-        Fail(OutFailure, TEXT("WORLDCOVER_COG_TILE_INVALID"), TEXT("WorldCover tile dimensions are unsafe."));
+        FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_TILE_INVALID"), TEXT("WorldCover tile dimensions are unsafe."));
         return false;
     }
     uint32 ScaleCount = 0, TieCount = 0;
     double* Scale = nullptr;
     double* Tie = nullptr;
-    if (!TIFFGetField(Image.get(), ModelPixelScaleTag, &ScaleCount, &Scale) || ScaleCount < 2 || !Scale
-        || !TIFFGetField(Image.get(), ModelTiepointTag, &TieCount, &Tie) || TieCount < 6 || !Tie
+    if (!TIFFGetField(Image.get(), WorldCoverModelPixelScaleTag, &ScaleCount, &Scale) || ScaleCount < 2 || !Scale
+        || !TIFFGetField(Image.get(), WorldCoverModelTiepointTag, &TieCount, &Tie) || TieCount < 6 || !Tie
         || !HasEpsg4326(Image.get()) || !std::isfinite(Scale[0]) || !std::isfinite(Scale[1])
         || Scale[0] <= 0.0 || Scale[1] <= 0.0
         || !std::isfinite(Tie[0]) || !std::isfinite(Tie[1])
         || !std::isfinite(Tie[3]) || !std::isfinite(Tie[4]))
     {
-        Fail(OutFailure, TEXT("WORLDCOVER_COG_GEOREFERENCE_INVALID"),
+        FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_GEOREFERENCE_INVALID"),
             TEXT("WorldCover COG georeferencing is missing, malformed, or not EPSG:4326."));
         OutFailure.GeoreferenceStatus = TEXT("invalid-or-non-epsg4326");
         return false;
@@ -229,7 +229,7 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
         (CenterNorth - RequestedBounds.SouthDeg) / Scale[1] + 1.0e-9), 0, Height - 1);
     if (MaxColumn < MinColumn || MaxRow < MinRow)
     {
-        Fail(OutFailure, TEXT("WORLDCOVER_COG_NO_INTERSECTION"),
+        FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_NO_INTERSECTION"),
             TEXT("WorldCover COG does not intersect the selected terrain."));
         return false;
     }
@@ -238,7 +238,7 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
     if (WindowWidth > MAX_uint32 || WindowHeight > MAX_uint32
         || WindowWidth * WindowHeight > MaxCoverCells)
     {
-        Fail(OutFailure, TEXT("WORLDCOVER_COG_WINDOW_TOO_LARGE"),
+        FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_WINDOW_TOO_LARGE"),
             TEXT("WorldCover class window exceeds the sixteen-million-cell limit."));
         return false;
     }
@@ -271,7 +271,7 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
         {
             if (IsCancelled && IsCancelled())
             {
-                Fail(OutFailure, TEXT("PREPARATION_CANCELLED"), TEXT("WorldCover COG decode was cancelled."));
+                FailWorldCover(OutFailure, TEXT("PREPARATION_CANCELLED"), TEXT("WorldCover COG decode was cancelled."));
                 OutFailure.Retry = RetryClassification::Retryable;
                 OutWindow = {};
                 return false;
@@ -281,7 +281,7 @@ bool SkiPreparation::DecodeWorldCoverCogWindow(ICogByteSource& Source,
                 static_cast<tmsize_t>(DecodedTileBytes));
             if (Decoded < 0 || static_cast<uint64>(Decoded) != DecodedTileBytes)
             {
-                Fail(OutFailure, TEXT("WORLDCOVER_COG_TILE_DECODE_FAILED"),
+                FailWorldCover(OutFailure, TEXT("WORLDCOVER_COG_TILE_DECODE_FAILED"),
                     TEXT("WorldCover COG tile is truncated or could not be decoded."));
                 OutFailure.Retry = RetryClassification::Retryable;
                 OutWindow = {};

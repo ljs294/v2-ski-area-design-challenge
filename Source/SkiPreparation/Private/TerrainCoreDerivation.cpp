@@ -75,7 +75,7 @@ uint64 SkiPreparation::TerrainCoreStoredSampleCount(
         + Descriptor.HaloNorth + Descriptor.HaloSouth;
     if (Width == 0 || Height == 0 || Width > SkiDomain::TerrainCoreTileSamples + 2ULL
         || Height > SkiDomain::TerrainCoreTileSamples + 2ULL
-        || Width > std::numeric_limits<uint64>::max() / Height)
+        || Width > (std::numeric_limits<uint64>::max)() / Height)
     {
         return 0;
     }

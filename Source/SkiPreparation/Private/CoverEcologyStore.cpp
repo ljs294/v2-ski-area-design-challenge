@@ -407,9 +407,148 @@ bool OpenReceiptAt(const FString& Root, const FString& Directory,
     }
     const TSet<FString> ExpectedFiles{TEXT("receipt.json")};
     if (!TreeContainsExactly(Directory, ExpectedFiles, Error)) return false;
+    Out.SchemaVersion = Receipt.SchemaVersion;
     Out.Receipt = std::move(Receipt);
     Out.ReceiptDirectory = Directory;
     return true;
+}
+
+bool OpenCompositeReceiptAt(const FString& Root, const FString& Directory,
+    const FString& ExpectedId, InstalledTerrainIndex& Out, FString& Error)
+{
+    Out = {};
+    TArray<uint8> Bytes;
+    if (!IsCanonicalId(ExpectedId) || !IsWithin(Root, Directory)
+        || !LoadBoundedFile(Root, FPaths::Combine(Directory, TEXT("receipt.json")),
+            CompositeInstallReceiptMaxBytes, Bytes, Error)) return false;
+    Bytes.Add(0);
+    const FString Json = UTF8_TO_TCHAR(reinterpret_cast<const char*>(Bytes.GetData()));
+    CompositeInstallReceipt Receipt;
+    if (!ParseCompositeInstallReceipt(Json, Receipt, Error)
+        || UTF8_TO_TCHAR(Receipt.ContentId.c_str()) != ExpectedId)
+    {
+        if (Error.IsEmpty()) Error = TEXT("Composite install identity does not match its directory.");
+        return false;
+    }
+    const TArray<uint8> Canonical = Utf8Bytes(SerializeCompositeInstallReceipt(Receipt, true));
+    const FString DerivedId = Sha256(Utf8Bytes(
+        SerializeCompositeInstallReceipt(Receipt, false)));
+    if (DerivedId != ExpectedId || Canonical.Num() + 1 != Bytes.Num()
+        || FMemory::Memcmp(Canonical.GetData(), Bytes.GetData(), Canonical.Num()) != 0)
+    {
+        Error = TEXT("Composite install receipt is not canonical.");
+        return false;
+    }
+    const TSet<FString> ExpectedFiles{TEXT("receipt.json")};
+    if (!TreeContainsExactly(Directory, ExpectedFiles, Error)) return false;
+    Out.SchemaVersion = Receipt.SchemaVersion;
+    Out.CompositeReceipt = std::move(Receipt);
+    Out.ReceiptDirectory = Directory;
+    return true;
+}
+
+bool OpenAnyReceiptAt(const FString& Root, const FString& Directory,
+    const FString& ExpectedId, InstalledTerrainIndex& Out, FString& Error)
+{
+    TArray<uint8> Bytes;
+    if (!IsCanonicalId(ExpectedId) || !IsWithin(Root, Directory)
+        || !LoadBoundedFile(Root, FPaths::Combine(Directory, TEXT("receipt.json")),
+            CompositeInstallReceiptMaxBytes, Bytes, Error)) return false;
+    Bytes.Add(0);
+    TSharedPtr<FJsonObject> Object;
+    uint32 SchemaVersion = 0;
+    if (!ParseJsonObject(UTF8_TO_TCHAR(reinterpret_cast<const char*>(Bytes.GetData())),
+            Object, Error)
+        || !ReadUint32(Object, TEXT("schemaVersion"), SchemaVersion))
+    {
+        if (Error.IsEmpty()) Error = TEXT("Installed receipt schema is missing or invalid.");
+        return false;
+    }
+    if (SchemaVersion == SkiDomain::InstalledTerrainSchema)
+        return OpenReceiptAt(Root, Directory, ExpectedId, Out, Error);
+    if (SchemaVersion == CompositeInstallReceiptSchema)
+        return OpenCompositeReceiptAt(Root, Directory, ExpectedId, Out, Error);
+    Error = TEXT("Installed receipt schema is unsupported.");
+    return false;
+}
+
+const CompositeInstallComponent* FindCompositeComponent(
+    const CompositeInstallReceipt& Receipt, const CompositeInstallComponentKind Kind)
+{
+    const auto Found = std::find_if(Receipt.Components.begin(), Receipt.Components.end(),
+        [Kind](const CompositeInstallComponent& Component) { return Component.Kind == Kind; });
+    return Found == Receipt.Components.end() ? nullptr : &*Found;
+}
+
+bool MatchesManifestHash(const FString& ManifestJson, const std::string& ExpectedHash)
+{
+    return Sha256(Utf8Bytes(ManifestJson)).Equals(
+        UTF8_TO_TCHAR(ExpectedHash.c_str()), ESearchCase::CaseSensitive);
+}
+
+bool VerifyCompositeComponents(const FString& Root, const CompositeInstallReceipt& Receipt,
+    FString& Error)
+{
+    const CompositeInstallComponent* CoreComponent = FindCompositeComponent(Receipt,
+        CompositeInstallComponentKind::TerrainCore);
+    if (!CoreComponent)
+    {
+        Error = TEXT("Composite install is missing its TerrainCore reference.");
+        return false;
+    }
+
+    TerrainCorePackageStore CoreStore(Root);
+    TerrainCorePackageIndex Core;
+    if (!CoreStore.Open(UTF8_TO_TCHAR(CoreComponent->ContentId.c_str()), Core, Error)
+        || !CoreStore.Verify(Core, Error)
+        || Core.Manifest.ContentId != CoreComponent->ContentId
+        || !MatchesManifestHash(SerializeTerrainCoreManifest(Core.Manifest, true),
+            CoreComponent->ManifestSha256))
+    {
+        if (Error.IsEmpty()) Error = TEXT("Composite TerrainCore identity or manifest hash failed verification.");
+        return false;
+    }
+
+    CoverEcologyStore CoverStore(Root);
+    SiteContextStore SiteContextPackages(Root);
+    const CompositeComponentVerifier VerifyComponent = [&](const CompositeInstallReceipt&,
+        const CompositeInstallComponent& Component, FString& ComponentError)
+    {
+        if (Component.Kind == CompositeInstallComponentKind::TerrainCore)
+        {
+            if (Core.Manifest.ContentId == Component.ContentId
+                && MatchesManifestHash(SerializeTerrainCoreManifest(Core.Manifest, true),
+                    Component.ManifestSha256)) return true;
+            ComponentError = TEXT("Composite TerrainCore identity or manifest hash failed verification.");
+            return false;
+        }
+        if (Component.Kind == CompositeInstallComponentKind::CoverEcology)
+        {
+            CoverEcologyPackageIndex Cover;
+            if (!CoverStore.Open(UTF8_TO_TCHAR(Component.ContentId.c_str()), Cover, ComponentError)
+                || !CoverStore.Verify(Cover, ComponentError)) return false;
+            if (Cover.Manifest.ContentId == Component.ContentId
+                && MatchesManifestHash(SerializeCoverEcologyManifest(Cover.Manifest, true),
+                    Component.ManifestSha256)) return true;
+            ComponentError = TEXT("Composite CoverEcology identity or manifest hash failed verification.");
+            return false;
+        }
+        if (Component.Kind == CompositeInstallComponentKind::SiteContext)
+        {
+            SiteContextPackageIndex SiteContext;
+            if (!SiteContextPackages.Open(UTF8_TO_TCHAR(Component.ContentId.c_str()),
+                    Core.Manifest, SiteContext, ComponentError)
+                || !SiteContextPackages.Verify(SiteContext, ComponentError)) return false;
+            if (SiteContext.Manifest.ContentId == Component.ContentId
+                && MatchesManifestHash(SerializeSiteContextManifest(SiteContext.Manifest, true),
+                    Component.ManifestSha256)) return true;
+            ComponentError = TEXT("Composite SiteContext identity or manifest hash failed verification.");
+            return false;
+        }
+        ComponentError = TEXT("Composite receipt contains an unexpected storage component.");
+        return false;
+    };
+    return VerifyCompositeInstallReceiptForActivation(Receipt, VerifyComponent, Error);
 }
 }
 
@@ -942,28 +1081,197 @@ bool SkiPreparation::InstalledTerrainStore::WriteAndActivate(InstalledTerrainRec
     return true;
 }
 
+bool SkiPreparation::InstalledTerrainStore::WriteAndActivate(CompositeInstallReceipt Receipt,
+    FString& OutReceiptDirectory, CompositeInstallReceipt& OutReceipt, FString& OutError,
+    const TSharedPtr<PreparationOperationLease, ESPMode::ThreadSafe>& Lease,
+    const uint64 SessionGeneration, const uint64 OperationGeneration) const
+{
+    OutReceiptDirectory.Reset();
+    OutReceipt = {};
+    OutError.Reset();
+    if (!LeaseCurrent(Lease, SessionGeneration, OperationGeneration))
+    {
+        OutError = TEXT("Composite install operation is no longer current.");
+        return false;
+    }
+
+    Receipt.ContentId = TCHAR_TO_UTF8(*ComputeCompositeInstallReceiptId(Receipt));
+    const FString Json = SerializeCompositeInstallReceipt(Receipt, true);
+    const FTCHARToUTF8 Encoded(*Json);
+    if (!ValidateCompositeInstallReceipt(Receipt, static_cast<std::uint64_t>(Encoded.Length())).Ok()
+        || !VerifyCompositeComponents(Root, Receipt, OutError))
+    {
+        if (OutError.IsEmpty()) OutError = TEXT("Composite install receipt or a required component is invalid.");
+        return false;
+    }
+
+    const FString StagingParent = FPaths::Combine(Root, TEXT(".installedterrain-staging"));
+    const FString Stage = FPaths::Combine(StagingParent,
+        FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT(".work"));
+    if (!EnsureDirectory(Root, StagingParent, OutError)
+        || !EnsureDirectory(Root, Stage, OutError))
+    {
+        SafeCleanup(StagingParent, Stage);
+        return false;
+    }
+    const auto Cleanup = [&]() { SafeCleanup(StagingParent, Stage); };
+    if (!FFileHelper::SaveStringToFile(Json, *FPaths::Combine(Stage, TEXT("receipt.json")),
+        FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+    {
+        OutError = TEXT("Unable to write composite install staging receipt.");
+        Cleanup();
+        return false;
+    }
+
+    const FString Id = UTF8_TO_TCHAR(Receipt.ContentId.c_str());
+    InstalledTerrainIndex Staged;
+    if (!OpenCompositeReceiptAt(Root, Stage, Id, Staged, OutError)
+        || !LeaseCurrent(Lease, SessionGeneration, OperationGeneration)
+        || !VerifyCompositeComponents(Root, Receipt, OutError))
+    {
+        if (OutError.IsEmpty()) OutError = TEXT("Composite install operation became stale or a component changed.");
+        Cleanup();
+        return false;
+    }
+
+    const FString Receipts = FPaths::Combine(Root, TEXT("InstalledTerrain"));
+    const FString Target = FPaths::Combine(Receipts, Id);
+    if (!EnsureDirectory(Root, Receipts, OutError))
+    {
+        Cleanup();
+        return false;
+    }
+    if (IFileManager::Get().DirectoryExists(*Target))
+    {
+        InstalledTerrainIndex Existing;
+        if (!Open(Id, Existing, OutError)
+            || Existing.SchemaVersion != CompositeInstallReceiptSchema
+            || !LeaseCurrent(Lease, SessionGeneration, OperationGeneration))
+        {
+            if (OutError.IsEmpty()) OutError = TEXT("Existing composite receipt failed verification.");
+            Cleanup();
+            return false;
+        }
+        Cleanup();
+    }
+    else
+    {
+        if (!NoReparsePath(Receipts, true, OutError))
+        {
+            Cleanup();
+            return false;
+        }
+        bool Moved = false;
+        const auto Activate = [&]()
+        {
+            Moved = IFileManager::Get().Move(*Target, *Stage, false, false, true, true);
+        };
+        const bool ActivationAuthorized = Lease
+            ? Lease->RunIfCurrent(SessionGeneration, OperationGeneration, Activate)
+            : (Activate(), true);
+        if (!ActivationAuthorized || !Moved)
+        {
+            if (OutError.IsEmpty()) OutError = TEXT("Unable to atomically activate composite install receipt.");
+            Cleanup();
+            return false;
+        }
+    }
+
+    InstalledTerrainIndex Final;
+    if (!Open(Id, Final, OutError)
+        || Final.SchemaVersion != CompositeInstallReceiptSchema
+        || !LeaseCurrent(Lease, SessionGeneration, OperationGeneration))
+    {
+        if (OutError.IsEmpty()) OutError = TEXT("Composite install operation became stale before publication.");
+        return false;
+    }
+    OutReceiptDirectory = Target;
+    OutReceipt = std::move(Final.CompositeReceipt);
+    return true;
+}
+
 bool SkiPreparation::InstalledTerrainStore::Open(const FString& ContentId,
     InstalledTerrainIndex& OutIndex, FString& OutError) const
 {
     OutIndex = {};
+    OutError.Reset();
     InstalledTerrainIndex Candidate;
-    if (!OpenReceiptAt(Root, FPaths::Combine(Root, TEXT("InstalledTerrain"), ContentId),
+    if (!OpenAnyReceiptAt(Root, FPaths::Combine(Root, TEXT("InstalledTerrain"), ContentId),
         ContentId, Candidate, OutError)) return false;
-    TerrainCorePackageStore CoreStore(Root);
-    CoverEcologyStore CoverStore(Root);
-    TerrainCorePackageIndex Core;
-    TerrainCorePackageIndex Surround;
-    CoverEcologyPackageIndex Cover;
-    if (!CoreStore.Open(UTF8_TO_TCHAR(Candidate.Receipt.TerrainCoreId.c_str()), Core, OutError)
-        || !CoreStore.Verify(Core, OutError)
-        || !CoreStore.Open(UTF8_TO_TCHAR(Candidate.Receipt.SurroundTerrainCoreId.c_str()), Surround, OutError)
-        || !CoreStore.Verify(Surround, OutError)
-        || !CoverStore.Open(UTF8_TO_TCHAR(Candidate.Receipt.CoverEcologyId.c_str()), Cover, OutError)
-        || !CoverStore.Verify(Cover, OutError))
+    if (Candidate.SchemaVersion == SkiDomain::InstalledTerrainSchema)
     {
-        if (OutError.IsEmpty()) OutError = TEXT("Installed-terrain component verification failed.");
+        TerrainCorePackageStore CoreStore(Root);
+        CoverEcologyStore CoverStore(Root);
+        TerrainCorePackageIndex Core;
+        TerrainCorePackageIndex Surround;
+        CoverEcologyPackageIndex Cover;
+        if (!CoreStore.Open(UTF8_TO_TCHAR(Candidate.Receipt.TerrainCoreId.c_str()), Core, OutError)
+            || !CoreStore.Verify(Core, OutError)
+            || !CoreStore.Open(UTF8_TO_TCHAR(Candidate.Receipt.SurroundTerrainCoreId.c_str()), Surround, OutError)
+            || !CoreStore.Verify(Surround, OutError)
+            || !CoverStore.Open(UTF8_TO_TCHAR(Candidate.Receipt.CoverEcologyId.c_str()), Cover, OutError)
+            || !CoverStore.Verify(Cover, OutError))
+        {
+            if (OutError.IsEmpty()) OutError = TEXT("Installed-terrain component verification failed.");
+            return false;
+        }
+    }
+    else if (Candidate.SchemaVersion == CompositeInstallReceiptSchema)
+    {
+        if (!VerifyCompositeComponents(Root, Candidate.CompositeReceipt, OutError)) return false;
+    }
+    else
+    {
+        OutError = TEXT("Installed receipt schema is unsupported.");
         return false;
     }
     OutIndex = std::move(Candidate);
+    return true;
+}
+
+bool SkiPreparation::InstalledTerrainStore::ListVerified(
+    TArray<InstalledTerrainLibraryEntry>& OutEntries, FString& OutError) const
+{
+    OutEntries.Reset();
+    OutError.Reset();
+    const FString Receipts = FPaths::Combine(Root, TEXT("InstalledTerrain"));
+    IFileManager& Files = IFileManager::Get();
+    if (!Files.DirectoryExists(*Receipts)) return true;
+    if (!NoReparsePath(Receipts, true, OutError)) return false;
+
+    TArray<FString> Candidates;
+    Files.FindFiles(Candidates, *FPaths::Combine(Receipts, TEXT("*")), false, true);
+    Candidates.Sort();
+    TerrainCorePackageStore CoreStore(Root);
+    for (const FString& Id : Candidates)
+    {
+        if (!IsCanonicalId(Id)) continue;
+        InstalledTerrainIndex Verified;
+        FString CandidateError;
+        if (!Open(Id, Verified, CandidateError)) continue;
+        FString TerrainCoreId;
+        FString GeneratorVersion;
+        if (Verified.SchemaVersion == SkiDomain::InstalledTerrainSchema)
+        {
+            TerrainCoreId = UTF8_TO_TCHAR(Verified.Receipt.TerrainCoreId.c_str());
+            GeneratorVersion = UTF8_TO_TCHAR(Verified.Receipt.GeneratorVersion.c_str());
+        }
+        else if (Verified.SchemaVersion == CompositeInstallReceiptSchema)
+        {
+            const CompositeInstallComponent* CoreComponent = FindCompositeComponent(
+                Verified.CompositeReceipt, CompositeInstallComponentKind::TerrainCore);
+            if (!CoreComponent) continue;
+            TerrainCoreId = UTF8_TO_TCHAR(CoreComponent->ContentId.c_str());
+            GeneratorVersion = UTF8_TO_TCHAR(Verified.CompositeReceipt.GeneratorVersion.c_str());
+        }
+        else continue;
+        TerrainCorePackageIndex Core;
+        if (!CoreStore.Open(TerrainCoreId, Core, CandidateError)) continue;
+        InstalledTerrainLibraryEntry& Entry = OutEntries.AddDefaulted_GetRef();
+        Entry.ContentId = Id;
+        Entry.SourceId = UTF8_TO_TCHAR(Core.Manifest.Source.SourceId.c_str());
+        Entry.AcquisitionEpoch = UTF8_TO_TCHAR(Core.Manifest.Source.AcquisitionEpoch.c_str());
+        Entry.GeneratorVersion = GeneratorVersion;
+    }
     return true;
 }

@@ -70,6 +70,30 @@ def material(tools, receipt, name, low, high, roughness, role):
         "altitude_aware": True, "cover_aware": True, "topology_profile_independent": True})
 
 
+def photo_material(tools, receipt):
+    relative = "Content/P1Generated/M_Photo.uasset"
+    if relative in receipt["assets"]:
+        return
+    asset = tools.create_asset("M_Photo", "/Game/P1Generated", unreal.Material,
+                               unreal.MaterialFactoryNew())
+    if not asset:
+        raise RuntimeError("Could not create M_Photo")
+    asset.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    vertex_color = unreal.MaterialEditingLibrary.create_material_expression(
+        asset, unreal.MaterialExpressionVertexColor, 0, 0)
+    unreal.MaterialEditingLibrary.connect_material_property(
+        vertex_color, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    unreal.MaterialEditingLibrary.recompile_material(asset)
+    if not unreal.EditorAssetLibrary.save_loaded_asset(asset, only_if_is_dirty=False):
+        raise RuntimeError("Could not save M_Photo")
+    record_asset(ROOT, receipt, relative, {
+        "role": "photo imagery vertex-color passthrough",
+        "shading_model": "Unlit",
+        "vertex_color_passthrough": True,
+        "surface_tint": False,
+    })
+
+
 def main():
     receipt = preflight(ROOT, recipe_digest(ROOT))
     dirty = list(unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages())
@@ -81,6 +105,7 @@ def main():
     material(tools, receipt, "M_Terrain_LowAngle", (0.12, 0.20, 0.11), (0.48, 0.31, 0.22), 0.88, "low-angle terrain")
     material(tools, receipt, "M_Terrain_Overcast", (0.15, 0.23, 0.18), (0.46, 0.49, 0.50), 0.94, "overcast terrain")
     material(tools, receipt, "M_Overlay", (0.90, 0.22, 0.08), (1.0, 0.74, 0.20), 0.55, "batched overlay and guest dots")
+    photo_material(tools, receipt)
     map_file = "Content/P1Generated/P1Terrain.umap"
     if map_file not in receipt["assets"]:
         levels = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
@@ -90,7 +115,7 @@ def main():
             "game_mode": "/Script/SkiPresentation.SkiBootstrapGameMode"})
     if set(receipt["assets"]) != set(ASSETS):
         raise RuntimeError("P1 asset recipe is incomplete")
-    unreal.log("SKI_P1_ASSETS_READY: five owned P1 assets; repeated run is a no-op")
+    unreal.log("SKI_P1_ASSETS_READY: six owned P1 assets; repeated run is a no-op")
 
 
 if __name__ == "__main__":

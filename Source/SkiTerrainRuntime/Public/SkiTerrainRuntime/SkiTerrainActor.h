@@ -30,7 +30,31 @@ enum class ESkiTerrainViewMode : uint8
     Slope,
     Cover,
     TileLod,
+    Photo,
 };
+
+namespace SkiTerrainRuntime
+{
+inline constexpr uint32 TerrainCorePhotoTileSide = 256;
+
+/** One verified, already-decoded SiteContext photo tile. Pixels are row-major BGRA. */
+struct FSkiTerrainPhotoTile
+{
+    uint64 Generation = 0;
+    SkiApplication::TerrainCoreTileKey Key{};
+    TArray<FColor> BgraPixels;
+};
+
+/** Samples a tile-local UV only when generation, exact key, and 256x256 payload match. */
+SKITERRAINRUNTIME_API bool TrySampleTerrainCorePhotoVertexColor(
+    const FSkiTerrainPhotoTile* PhotoTile, uint64 ExpectedGeneration,
+    const SkiApplication::TerrainCoreTileKey& ExpectedKey,
+    double TileLocalU, double TileLocalV, FVector3f& OutLinearColor) noexcept;
+
+/** Keeps Photo on its cooked vertex-color fallback independently of lighting preset. */
+SKITERRAINRUNTIME_API const TCHAR* TerrainMaterialAssetPathForMode(
+    ESkiTerrainViewMode Mode, FName LightingPreset) noexcept;
+}
 
 UCLASS()
 class SKITERRAINRUNTIME_API ASkiTerrainActor : public AActor
@@ -48,6 +72,12 @@ public:
         uint8 Lod = 4, double TimeoutSeconds = 30.0);
     bool BeginTerrainCoreStreaming(TSharedPtr<SkiApplication::TerrainCoreSession> InSession,
         uint8 Lod = 4);
+    /** Supplies one exact-key photo tile decoded from an already verified SiteContext. Game-thread only. */
+    bool SetTerrainCorePhotoTile(uint64 ExpectedGeneration,
+        const SkiApplication::TerrainCoreTileKey& Key, TArray<FColor> BgraPixels);
+    /** Copies the bounded current Photo selection and its cache generation; game-thread only. */
+    bool GetTerrainCorePhotoRequestSnapshot(uint64& OutGeneration,
+        TArray<SkiApplication::TerrainCoreTileKey>& OutDesiredKeys) const;
     void SetTerrainCoreCover(std::shared_ptr<const std::vector<std::uint8_t>> Cover,
         std::shared_ptr<const std::vector<std::uint8_t>> PackedValidity,
         const SkiDomain::CoverEcologyGridTransform& Transform);
@@ -106,6 +136,10 @@ private:
     void RebuildDots(const SkiDomain::Heightfield& Field, double OriginHeightM);
     void RebuildContourOverlay(const SkiDomain::Heightfield& Field, double OriginHeightM);
     void RebuildTerrainCoreOverviewDiagnostics();
+    void ClearTerrainCorePhotoTiles(uint64 Generation = 0);
+    void PruneTerrainCorePhotoTiles(uint64 Generation, const TSet<uint64>& DesiredKeys);
+    bool RebuildPresentedTerrainCorePhotoTile(
+        const SkiApplication::TerrainCoreTileKey& Key);
 
     UPROPERTY()
     TObjectPtr<USceneComponent> SceneRoot;
@@ -143,7 +177,9 @@ private:
     TMap<uint64, uint64> CoreMeshBuildsInFlight;
     TSet<uint64> CoreFailedMeshKeys;
     TArray<SkiApplication::TerrainCoreTileKey> CoreDesiredKeys;
+    TMap<uint64, SkiTerrainRuntime::FSkiTerrainPhotoTile> PresentedPhotoTiles;
     uint64 CoreCacheGeneration = 0;
+    uint64 PhotoTilesGeneration = 0;
     uint64 CorePresentationSerial = 0;
     uint64 RejectedCoreMeshBuilds = 0;
     bool bCoreBoundsHaveSamples = false;

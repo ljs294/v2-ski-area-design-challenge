@@ -2,20 +2,290 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import struct
 import tempfile
 import time
 import unittest
 from unittest import mock
 import warnings
 import zipfile
+import zlib
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "Tools/Build"))
 import p1
 import evidence_ledger
+
+
+class ReleaseProofContractTests(unittest.TestCase):
+    def test_p1_automation_manifest_includes_exact_slice_tests_but_not_m3(self):
+        declared = set(p1.PLACE_SEARCH_TESTS + p1.SITE_PICKER_TESTS + p1.UI_TESTS
+                       + p1.TERRAIN_SCRATCH_TESTS
+                       + p1.PRESENTATION_INSTALLED_TERRAIN_TESTS)
+        self.assertEqual(declared, {
+            "MountainPlanner.P1.Preparation.PlaceSearch.NormalizationCacheAndBounds",
+            "MountainPlanner.P1.Preparation.PlaceSearch.PacingCancellationAndBounds",
+            "MountainPlanner.P1.Presentation.SitePicker.CancellationToken",
+            "MountainPlanner.P1.Presentation.SitePicker.ZeroOverflowIsAlreadyAtEnd",
+            "MountainPlanner.P1.Presentation.UI.ResponsiveLayout",
+            "MountainPlanner.P1.Presentation.UI.SitePickerPanelLayout",
+            "MountainPlanner.P1.Presentation.InstalledTerrain.VerifiedMountainHandoff",
+            "MountainPlanner.P1.Presentation.InstalledTerrain.SiteContextSummary",
+            "MountainPlanner.P1.TerrainScratch.BitExactIndexedLodsAndProvenance",
+            "MountainPlanner.P1.TerrainScratch.BoundsAndMalformedInputs",
+            "MountainPlanner.P1.TerrainScratch.CancellationInvalidatesStore",
+            "MountainPlanner.P1.TerrainScratch.MultiBlockEdgesAndClamp",
+        })
+        self.assertTrue(declared.issubset(p1.P1_TESTS))
+        self.assertEqual(len(p1.P1_TESTS), len(set(p1.P1_TESTS)))
+        self.assertIn(
+            "MountainPlanner.P1.Presentation.InstalledTerrain.VerifiedMountainHandoff",
+            p1.P1_TESTS)
+        self.assertIn(
+            "MountainPlanner.P1.Presentation.InstalledTerrain.SiteContextSummary",
+            p1.P1_TESTS)
+        self.assertFalse(any(test.startswith("MountainPlanner.M5.")
+                             for test in p1.P1_TESTS))
+        self.assertFalse(any(test.startswith("MountainPlanner.M3.")
+                             for test in p1.P1_TESTS))
+
+        source_tests = []
+        for path in (ROOT / "Source").rglob("*Tests.cpp"):
+            source = path.read_text(encoding="utf-8")
+            source_tests.extend(re.findall(r'"(MountainPlanner\.P1\.[^"]+)"', source))
+        self.assertEqual(len(source_tests), len(set(source_tests)), "duplicate native P1 test identity")
+        self.assertCountEqual(p1.P1_TESTS, source_tests)
+
+    def test_focused_m3_s1m_xml_reader_filter_matches_source_and_stays_out_of_p1(self):
+        group = "MountainPlanner.M3.S1mXmlReader"
+        source = (ROOT / "Source/SkiPreparation/Private/Tests/S1mXmlReaderTests.cpp").read_text(
+            encoding="utf-8")
+        registered = re.findall(r'"(MountainPlanner\.M3\.S1mXmlReader\.[^"]+)"', source)
+        self.assertCountEqual(p1.FOCUSED_AUTOMATION_TESTS[group], registered)
+        self.assertEqual(len(registered), 2)
+        declared = [test for tests in p1.FOCUSED_AUTOMATION_TESTS.values() for test in tests]
+        self.assertEqual(len(declared), len(set(declared)), "duplicate focused test identity")
+        self.assertFalse(any(test.startswith("MountainPlanner.M3.S1mXmlReader")
+                             for test in p1.P1_TESTS))
+
+    def test_focused_m5_filters_match_registered_source_tests_and_stay_out_of_p1(self):
+        registered = []
+        for path in (ROOT / "Source").rglob("*Tests.cpp"):
+            source = path.read_text(encoding="utf-8")
+            registered.extend(re.findall(r'"(MountainPlanner\.M5\.[^"]+)"', source))
+
+        m5_groups = {group: tests for group, tests in p1.FOCUSED_AUTOMATION_TESTS.items()
+                     if group.startswith("MountainPlanner.M5.")}
+        declared = [test for tests in m5_groups.values() for test in tests]
+        self.assertEqual(len(registered), len(set(registered)), "duplicate native M5 test identity")
+        self.assertEqual(len(declared), len(set(declared)), "duplicate focused test identity")
+        self.assertCountEqual(declared, registered)
+
+        # SiteContext is an intentionally broad Unreal prefix: it also matches
+        # the sibling SiteContextCompositeAssembler test group.
+        for test in registered:
+            matching_groups = [group for group in m5_groups if test.startswith(group)]
+            self.assertEqual(len(matching_groups), 1, test)
+        self.assertCountEqual(m5_groups["MountainPlanner.M5.SiteContext"], [
+            "MountainPlanner.M5.SiteContext.CompositeReceiptGateAndLegacyRead",
+            "MountainPlanner.M5.SiteContext.PyramidStoreAndIntegrity",
+            "MountainPlanner.M5.SiteContext.VectorSchema2PartsAndLegacy",
+            "MountainPlanner.M5.SiteContextCompositeAssembler.AtomicInstallAndPathMapping",
+        ])
+        self.assertCountEqual(m5_groups["MountainPlanner.M5.TerrainCoreRepository"], [
+            "MountainPlanner.M5.TerrainCoreRepository.LegacyProvenanceUnavailable",
+            "MountainPlanner.M5.TerrainCoreRepository.VerifiedProvenanceSidecar",
+        ])
+        self.assertCountEqual(m5_groups["MountainPlanner.M5.ImageryAcquisition"], [
+            "MountainPlanner.M5.ImageryAcquisition.BudgetsCancellationAndNoData",
+            "MountainPlanner.M5.ImageryAcquisition.ProductionGatewayEntryPointCancellation",
+            "MountainPlanner.M5.ImageryAcquisition.ScriptedReprojectionAndHash",
+        ])
+        for group, tests in m5_groups.items():
+            with self.subTest(group=group):
+                expected = [test for test in registered if test.startswith(group)]
+                self.assertCountEqual(tests, expected)
+                self.assertTrue(all(test.startswith(group) for test in tests))
+
+    def test_focused_m4_staged_terrain_filter_matches_source_declarations(self):
+        group = "SkiPreparation.M4.StagedTerrain"
+        source = (ROOT / "Source/SkiPreparation/Private/Tests/StagedTerrainAcquisitionTests.cpp").read_text(
+            encoding="utf-8")
+        registered = re.findall(r'"(SkiPreparation\.M4\.StagedTerrain[^"]+)"', source)
+        self.assertCountEqual(p1.FOCUSED_AUTOMATION_TESTS[group], registered)
+        self.assertEqual(len(registered), 6)
+        self.assertFalse(any(test.startswith("SkiPreparation.M4.StagedTerrain")
+                             for test in p1.P1_TESTS))
+
+    def test_focused_m4_native_staged_adapter_matches_source_without_duplicates(self):
+        group = "SkiPreparation.M4.NativeStagedAdapter"
+        source = (ROOT / "Source/SkiPreparation/Private/Tests/NativeStagedTerrainAcquisitionAdapterTests.cpp").read_text(
+            encoding="utf-8")
+        registered = re.findall(r'"(SkiPreparation\.M4\.NativeStagedAdapter[^"]+)"', source)
+        self.assertCountEqual(p1.FOCUSED_AUTOMATION_TESTS[group], registered)
+        self.assertEqual(len(registered), 6)
+        declared = [test for tests in p1.FOCUSED_AUTOMATION_TESTS.values() for test in tests]
+        self.assertEqual(len(declared), len(set(declared)), "duplicate focused test identity")
+        self.assertFalse(any(test.startswith(group) for test in p1.P1_TESTS))
+
+    def test_focused_m6_ten_km_preflight_filter_matches_source_declarations(self):
+        group = "SkiPreparation.M6.TenKmResourcePreflight"
+        source = (ROOT / "Source/SkiPreparation/Private/Tests/TenKmResourcePreflightTests.cpp").read_text(
+            encoding="utf-8")
+        registered = re.findall(r'"(SkiPreparation\.M6\.TenKmResourcePreflight[^\"]+)"', source)
+        self.assertCountEqual(p1.FOCUSED_AUTOMATION_TESTS[group], registered)
+        self.assertEqual(len(registered), 4)
+        self.assertFalse(any(test.startswith("SkiPreparation.M6.TenKmResourcePreflight")
+                             for test in p1.P1_TESTS))
+
+    def test_p1_installed_terrain_handoff_name_is_registered_in_presentation_source(self):
+        source = (ROOT / "Source/SkiPresentation/Private/Tests/P1PresentationTests.cpp").read_text(
+            encoding="utf-8")
+        self.assertEqual(source.count(
+            '"MountainPlanner.P1.Presentation.InstalledTerrain.VerifiedMountainHandoff"'), 1)
+
+    def test_p1_picker_zero_overflow_name_is_registered_in_presentation_source(self):
+        source = (ROOT / "Source/SkiPresentation/Private/Tests/P1PresentationTests.cpp").read_text(
+            encoding="utf-8")
+        test_name = "MountainPlanner.P1.Presentation.SitePicker.ZeroOverflowIsAlreadyAtEnd"
+        self.assertEqual(source.count(f'"{test_name}"'), 1)
+        self.assertIn(test_name, p1.P1_TESTS)
+
+    def test_native_ctest_identities_match_all_release_consumers(self):
+        self.assertEqual(set(p1.TERRAINCORE_NATIVE_TESTS),
+                         set(evidence_ledger.TERRAINCORE_CTESTS))
+        script = (ROOT / "Tools/Build/assemble_p1_release.ps1").read_text(
+            encoding="utf-8")
+        declaration = re.search(r"\$expectedNativeTerrainCoreTests = @\(([^\n]+)\)",
+                                script)
+        self.assertIsNotNone(declaration)
+        self.assertEqual(set(re.findall(r"'([^']+)'", declaration.group(1))),
+                         set(p1.TERRAINCORE_NATIVE_TESTS))
+
+    def test_shipping_forbidden_plugin_count_matches_release_assembly(self):
+        script = (ROOT / "Tools/Build/assemble_p1_release.ps1").read_text(
+            encoding="utf-8")
+        expected = len(p1.FORBIDDEN_SHIPPING_PLUGINS)
+        self.assertIn(
+            f"@($shippingMcpProof.forbidden_plugins_absent).Count -ne {expected}",
+            script)
+
+class OfflineReopenSmokeArgumentTests(unittest.TestCase):
+    content_id = "403d307ec11a9c45d565c3a8f27b3e972193380a8bf8915e48fea953a978bc00"
+    edit_set_id = "1ec5f42c04a8fe3f6e9b471e65c796123563afa3fdc024476dbab5fc88bbd58c"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir=ROOT / "test-results/p1")
+        self.root = Path(self.temporary.name)
+        self.output = self.root / "output"
+        self.output.mkdir()
+        self.run_output = self.root / "run-output"
+        self.run_output.mkdir()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def run_smoke_and_capture_command(self, scenario, receipt_overrides=None,
+                                      omitted_fields=()):
+        commands = []
+
+        def run_child(command, **_kwargs):
+            commands.append(command)
+            value = lambda prefix: next(
+                part.split("=", 1)[1] for part in command if part.startswith(prefix))
+            receipt = Path(value("-SkiP1Receipt="))
+            receipt_values = {
+                "token": value("-SkiP1Token="), "scenario": scenario,
+                "ready": True, "picked": True, "reopened": True,
+            }
+            if scenario == "offline-reopen":
+                receipt_values.update({
+                    "contentId": self.content_id, "editSetId": self.edit_set_id,
+                    "offlineReopen": True, "editDeltaReconstructed": True,
+                    "acquisitionPortGuardInstalled": True,
+                    "acquisitionTransportCalls": 0,
+                })
+            receipt_values.update(receipt_overrides or {})
+            for field in omitted_fields:
+                receipt_values.pop(field, None)
+            receipt.write_text(json.dumps(receipt_values), encoding="utf-8")
+            return {"method": "fixture", "snapshots": 1}
+
+        with mock.patch.object(p1, "OUTPUT", self.output), \
+                mock.patch.object(p1, "verify_package_report",
+                                  return_value=({"invocation": "fixture"},
+                                                self.root / "launcher.exe")), \
+                mock.patch.object(p1, "checked_with_tcp_audit", side_effect=run_child), \
+                mock.patch.object(p1, "validate_tcp_audit"), \
+                mock.patch.object(p1, "require_no_browser_profile"):
+            p1.smoke("Development", "source-digest", scenario, self.content_id,
+                     self.run_output, edit_set_id=self.edit_set_id)
+        self.assertEqual(len(commands), 1)
+        return commands[0]
+
+    def test_offline_reopen_forwards_both_receipt_identities(self):
+        command = self.run_smoke_and_capture_command("offline-reopen")
+        self.assertIn(f"-SkiP1ContentId={self.content_id}", command)
+        self.assertIn(f"-SkiP1EditSetId={self.edit_set_id}", command)
+
+    def test_offline_reopen_receipt_binds_ids_reconstruction_and_acquisition_guard(self):
+        invalid_receipts = (
+            ({"contentId": "f" * 64}, ()),
+            ({}, ("contentId",)),
+            ({"editSetId": "e" * 64}, ()),
+            ({}, ("editSetId",)),
+            ({"offlineReopen": False}, ()),
+            ({}, ("offlineReopen",)),
+            ({"editDeltaReconstructed": False}, ()),
+            ({}, ("editDeltaReconstructed",)),
+            ({"acquisitionPortGuardInstalled": False}, ()),
+            ({}, ("acquisitionPortGuardInstalled",)),
+            ({"acquisitionTransportCalls": 1}, ()),
+            ({}, ("acquisitionTransportCalls",)),
+        )
+        for updates, omitted in invalid_receipts:
+            with self.subTest(updates=updates, omitted=omitted), \
+                    self.assertRaises(RuntimeError):
+                self.run_smoke_and_capture_command(
+                    "offline-reopen", receipt_overrides=updates,
+                    omitted_fields=omitted)
+
+    def test_edit_set_identity_is_not_forwarded_to_other_scenarios(self):
+        command = self.run_smoke_and_capture_command("import")
+        self.assertFalse(any(part.startswith("-SkiP1ContentId=") for part in command))
+        self.assertFalse(any(part.startswith("-SkiP1EditSetId=") for part in command))
+
+    def test_offline_reopen_rejects_missing_or_malformed_receipt_ids(self):
+        with mock.patch.object(p1, "OUTPUT", self.output), \
+                mock.patch.object(p1, "verify_package_report",
+                                  return_value=({"invocation": "fixture"},
+                                                self.root / "launcher.exe")):
+            with self.assertRaisesRegex(RuntimeError, "exact contentId"):
+                p1.smoke("Development", "source-digest", "offline-reopen",
+                         "not-a-content-id", self.run_output, edit_set_id=self.edit_set_id)
+            with self.assertRaisesRegex(RuntimeError, "exact editSetId"):
+                p1.smoke("Development", "source-digest", "offline-reopen",
+                         self.content_id, self.run_output, edit_set_id=None)
+            with self.assertRaisesRegex(RuntimeError, "exact editSetId"):
+                p1.smoke("Development", "source-digest", "offline-reopen",
+                         self.content_id, self.run_output, edit_set_id="f" * 63)
+
+    def test_cli_exposes_and_validates_edit_set_id(self):
+        script = ROOT / "Tools/Build/p1.py"
+        help_result = subprocess.run(
+            [sys.executable, str(script), "smoke", "--help"],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("--edit-set-id", help_result.stdout)
+        invalid = subprocess.run(
+            [sys.executable, str(script), "smoke", "--edit-set-id", "not-a-sha256"],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("64 lowercase hexadecimal characters", invalid.stderr)
 
 
 class ExactAutomationEvidenceTests(unittest.TestCase):
@@ -46,6 +316,99 @@ class ExactAutomationEvidenceTests(unittest.TestCase):
         for value in cases:
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 p1.require_exact_automation(value, self.expected, self.test_filter)
+
+
+class FocusedAutomationCommandTests(unittest.TestCase):
+    def test_named_m3_s1m_xml_reader_group_runs_with_its_exact_filter(self):
+        test_filter = "MountainPlanner.M3.S1mXmlReader"
+        expected = p1.FOCUSED_AUTOMATION_TESTS[test_filter]
+        engine = Path("C:/Unreal/Engine")
+        with mock.patch.object(p1.p0, "native_build", return_value={"status": "PASS"}), \
+                mock.patch.object(p1.p0, "engine_path", return_value=engine), \
+                mock.patch.object(p1.p0, "checked", return_value="fixture log") as checked, \
+                mock.patch.object(p1, "require_exact_automation") as exact:
+            result = p1.focused_automation({}, Path("unused"), test_filter)
+
+        self.assertIn(
+            f"-ExecCmds=Automation RunTests {test_filter};Quit",
+            checked.call_args.args[0])
+        exact.assert_called_once_with("fixture log", expected, test_filter)
+        self.assertEqual(result["tests"], list(expected))
+
+    def test_named_m5_group_runs_and_checks_its_exact_filter(self):
+        test_filter = "MountainPlanner.M5.SiteContext"
+        expected = p1.FOCUSED_AUTOMATION_TESTS[test_filter]
+        engine = Path("C:/Unreal/Engine")
+        output = "fixture automation log"
+        with mock.patch.object(p1.p0, "native_build", return_value={"status": "PASS"}) as build, \
+                mock.patch.object(p1.p0, "engine_path", return_value=engine), \
+                mock.patch.object(p1.p0, "checked", return_value=output) as checked, \
+                mock.patch.object(p1, "require_exact_automation") as exact:
+            result = p1.focused_automation({}, Path("unused"), test_filter)
+
+        build.assert_called_once_with({}, "Editor", "Development")
+        command = checked.call_args.args[0]
+        self.assertIn(
+            f"-ExecCmds=Automation RunTests {test_filter};Quit", command)
+        self.assertEqual(checked.call_args.kwargs["log"],
+                         "focused-sitecontext-automation.log")
+        exact.assert_called_once_with(output, expected, test_filter)
+        self.assertEqual(result["filter"], test_filter)
+        self.assertEqual(result["tests"], list(expected))
+
+    def test_m4_staged_terrain_group_runs_with_its_source_exact_filter(self):
+        test_filter = "SkiPreparation.M4.StagedTerrain"
+        expected = p1.FOCUSED_AUTOMATION_TESTS[test_filter]
+        engine = Path("C:/Unreal/Engine")
+        with mock.patch.object(p1.p0, "native_build", return_value={"status": "PASS"}), \
+                mock.patch.object(p1.p0, "engine_path", return_value=engine), \
+                mock.patch.object(p1.p0, "checked", return_value="fixture log") as checked, \
+                mock.patch.object(p1, "require_exact_automation") as exact:
+            result = p1.focused_automation({}, Path("unused"), test_filter)
+
+        self.assertIn(
+            f"-ExecCmds=Automation RunTests {test_filter};Quit",
+            checked.call_args.args[0])
+        exact.assert_called_once_with("fixture log", expected, test_filter)
+        self.assertEqual(result["tests"], list(expected))
+
+    def test_m4_native_staged_adapter_group_runs_with_its_source_exact_filter(self):
+        test_filter = "SkiPreparation.M4.NativeStagedAdapter"
+        expected = p1.FOCUSED_AUTOMATION_TESTS[test_filter]
+        engine = Path("C:/Unreal/Engine")
+        with mock.patch.object(p1.p0, "native_build", return_value={"status": "PASS"}), \
+                mock.patch.object(p1.p0, "engine_path", return_value=engine), \
+                mock.patch.object(p1.p0, "checked", return_value="fixture log") as checked, \
+                mock.patch.object(p1, "require_exact_automation") as exact:
+            result = p1.focused_automation({}, Path("unused"), test_filter)
+
+        self.assertIn(
+            f"-ExecCmds=Automation RunTests {test_filter};Quit",
+            checked.call_args.args[0])
+        exact.assert_called_once_with("fixture log", expected, test_filter)
+        self.assertEqual(result["tests"], list(expected))
+
+    def test_m6_preflight_group_runs_with_its_source_exact_filter(self):
+        test_filter = "SkiPreparation.M6.TenKmResourcePreflight"
+        expected = p1.FOCUSED_AUTOMATION_TESTS[test_filter]
+        engine = Path("C:/Unreal/Engine")
+        with mock.patch.object(p1.p0, "native_build", return_value={"status": "PASS"}), \
+                mock.patch.object(p1.p0, "engine_path", return_value=engine), \
+                mock.patch.object(p1.p0, "checked", return_value="fixture log") as checked, \
+                mock.patch.object(p1, "require_exact_automation") as exact:
+            result = p1.focused_automation({}, Path("unused"), test_filter)
+
+        self.assertIn(
+            f"-ExecCmds=Automation RunTests {test_filter};Quit",
+            checked.call_args.args[0])
+        exact.assert_called_once_with("fixture log", expected, test_filter)
+        self.assertEqual(result["tests"], list(expected))
+
+    def test_unknown_group_fails_before_building(self):
+        with mock.patch.object(p1.p0, "native_build") as build, \
+                self.assertRaisesRegex(RuntimeError, "Unknown or unregistered"):
+            p1.focused_automation({}, Path("unused"), "SkiPreparation.M4.StagedTerrain.Unknown")
+        build.assert_not_called()
 
 
 class ExactCTestEvidenceTests(unittest.TestCase):
@@ -186,6 +549,9 @@ class ShippingMcpEvidenceTests(unittest.TestCase):
         self.write_target(["ModelContextProtocol"])
         with self.assertRaisesRegex(RuntimeError, "entered"):
             p1.shipping_target_module_proof(self.root)
+        self.write_target(["webbrowserwidget"])
+        with self.assertRaisesRegex(RuntimeError, "entered"):
+            p1.shipping_target_module_proof(self.root)
         self.write_target([], TargetType="Editor")
         with self.assertRaisesRegex(RuntimeError, "Shipping Game"):
             p1.shipping_target_module_proof(self.root)
@@ -193,7 +559,8 @@ class ShippingMcpEvidenceTests(unittest.TestCase):
 
 class ProcessNetworkAuditTests(unittest.TestCase):
     valid = {"method": "GetExtendedTcpTable process-attributed polling", "snapshots": 10,
-             "listen_ports": [], "remote_endpoints": []}
+             "listen_ports": [], "remote_endpoints": [],
+             "all_observed_pids_exited": True, "last_live_pids": []}
 
     def test_observed_quiet_process_passes(self):
         p1.validate_tcp_audit(self.valid, require_no_connections=True)
@@ -201,12 +568,528 @@ class ProcessNetworkAuditTests(unittest.TestCase):
     def test_missing_listener_and_offline_connection_evidence_fail_closed(self):
         cases = [
             ({**self.valid, "snapshots": 0}, True),
+            ({**self.valid, "all_observed_pids_exited": False}, True),
+            ({**self.valid, "last_live_pids": [42]}, True),
             ({**self.valid, "listen_ports": [8000]}, False),
             ({**self.valid, "remote_endpoints": ["203.0.113.1:443"]}, True),
         ]
         for audit, offline in cases:
             with self.subTest(audit=audit), self.assertRaises(RuntimeError):
                 p1.validate_tcp_audit(audit, require_no_connections=offline)
+
+    def test_audit_waits_for_child_after_launcher_exits(self):
+        class Launcher:
+            pid = 101
+            _handle = 901
+            returncode = None
+            polls = 0
+
+            def poll(self):
+                self.polls += 1
+                if self.polls >= 2:
+                    self.returncode = 0
+                return self.returncode
+
+        launcher = Launcher()
+        root_identity = (101, 1001)
+        child_identity = (202, 2002)
+        generations = [({root_identity, child_identity}, {root_identity, child_identity}),
+                       ({root_identity, child_identity}, {child_identity}),
+                       ({root_identity, child_identity}, {child_identity}),
+                       ({root_identity, child_identity}, set())]
+
+        def process_snapshot(*_args):
+            p1._PROCESS_IMAGES.update({
+                root_identity: "SkiAreaDesignChallenge.exe",
+                child_identity: "SkiAreaDesignChallenge.exe",
+            })
+            return generations.pop(0)
+
+        def child_rows(pid):
+            if pid == 202 and launcher.polls >= 2:
+                return [{"state": 5, "local": "127.0.0.1:5000",
+                         "remote": "203.0.113.1:443"},
+                        {"state": 2, "local": "127.0.0.1:1985",
+                         "remote": "0.0.0.0:0"}]
+            return []
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(p1.p0, "RUN_OUTPUT", Path(folder)), \
+                mock.patch.dict(p1._PROCESS_IMAGES,
+                                {root_identity: "SkiAreaDesignChallenge.exe",
+                                 child_identity: "SkiAreaDesignChallenge.exe"}, clear=True), \
+                mock.patch.object(p1.subprocess, "Popen", return_value=launcher), \
+                mock.patch.object(p1, "_windows_process_creation_time_from_handle",
+                                  return_value=root_identity[1]), \
+                mock.patch.object(p1, "_windows_process_creation_time",
+                                  side_effect=lambda pid: {101: 1001, 202: 2002}[pid]), \
+                mock.patch.object(p1, "_windows_process_descendants",
+                                  side_effect=process_snapshot), \
+                mock.patch.object(p1, "_windows_ipv4_tcp_rows",
+                                  side_effect=child_rows), \
+                mock.patch.object(p1, "_windows_ipv6_tcp_rows", return_value=[]), \
+                mock.patch.object(p1.time, "sleep"):
+            audit = p1.checked_with_tcp_audit(["launcher.exe"], timeout=1,
+                                              log="audit.log",
+                                              include_listener_owners=True)
+        self.assertEqual(audit["snapshots"], 4)
+        self.assertEqual(audit["observed_pids"], [101, 202])
+        self.assertEqual(audit["observed_process_identities"], [
+            {"pid": 101, "creation_time_filetime": 1001,
+             "image": "SkiAreaDesignChallenge.exe"},
+            {"pid": 202, "creation_time_filetime": 2002,
+             "image": "SkiAreaDesignChallenge.exe"},
+        ])
+        self.assertEqual(audit["remote_endpoints"], ["203.0.113.1:443"])
+        self.assertEqual(audit["listen_ports"], [1985])
+        self.assertEqual(audit["listener_owners"], [{
+            "pid": 202, "process_creation_time_filetime": 2002,
+            "image": "SkiAreaDesignChallenge.exe",
+            "local": "127.0.0.1:1985",
+        }])
+        self.assertTrue(audit["all_observed_pids_exited"])
+        self.assertEqual(audit["sampling_mode"], "sampled")
+        self.assertIn("may be missed", audit["sampling_limitation"])
+
+    def test_timeout_cleanup_verifies_creation_identity_before_terminating(self):
+        with mock.patch.object(p1, "_windows_open_process_handle", return_value=44), \
+                mock.patch.object(p1, "_windows_process_creation_time_from_handle",
+                                  return_value=2002), \
+                mock.patch.object(p1, "_windows_terminate_process_handle",
+                                  return_value=True) as terminate, \
+                mock.patch.object(p1, "_windows_close_process_handle"):
+            self.assertFalse(p1._windows_terminate_if_same_process(202, 2001))
+            terminate.assert_not_called()
+
+            self.assertTrue(p1._windows_terminate_if_same_process(202, 2002))
+            terminate.assert_called_once_with(44)
+
+    def test_audit_timeout_uses_the_observed_child_identity_for_cleanup(self):
+        class RunningLauncher:
+            pid = 101
+            _handle = 901
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout):
+                return self.returncode
+
+        root_identity = (101, 1001)
+        child_identity = (202, 2002)
+        launcher = RunningLauncher()
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(p1.p0, "RUN_OUTPUT", Path(folder)), \
+                mock.patch.object(p1.subprocess, "Popen", return_value=launcher), \
+                mock.patch.object(p1, "_windows_process_creation_time_from_handle",
+                                  return_value=1001), \
+                mock.patch.object(p1, "_windows_process_creation_time",
+                                  side_effect=lambda pid: {101: 1001, 202: 2002}[pid]), \
+                mock.patch.object(p1, "_windows_process_descendants",
+                                  return_value=({root_identity, child_identity},
+                                                {root_identity, child_identity})), \
+                mock.patch.object(p1, "_windows_ipv4_tcp_rows", return_value=[]), \
+                mock.patch.object(p1, "_windows_ipv6_tcp_rows", return_value=[]), \
+                mock.patch.object(p1, "_windows_terminate_if_same_process",
+                                  return_value=True) as terminate_child, \
+                mock.patch.object(p1.time, "monotonic", side_effect=[0, 1]), \
+                mock.patch.object(p1.time, "sleep"):
+            with self.assertRaises(p1.p0.TimedOut):
+                p1.checked_with_tcp_audit(["launcher.exe"], timeout=0, log="timeout.log")
+
+        terminate_child.assert_called_once_with(202, 2002)
+        self.assertEqual(launcher.returncode, -9)
+
+
+class FrontendReceiptEscapeAuditTests(unittest.TestCase):
+    content_id = "a" * 64
+
+    def make_audit(self, *, remote_endpoints=(), endpoint_owners=()):
+        return {"method": "GetExtendedTcpTable process-attributed polling",
+                "snapshots": 10, "listen_ports": [],
+                "remote_endpoints": list(remote_endpoints),
+                "endpoint_owners": list(endpoint_owners),
+                "all_observed_pids_exited": True, "last_live_pids": [],
+                "sampling_mode": "sampled", "poll_interval_milliseconds": 10,
+                "sampling_limitation": p1.TCP_AUDIT_SAMPLING_LIMITATION}
+
+    def run_frontend_smoke(self, escape_audit):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        run_output = root / "run"
+        run_output.mkdir()
+        launcher = root / "SkiAreaDesignChallenge.exe"
+        commands = []
+        primary_audit = self.make_audit()
+
+        def run_audited_child(command, **kwargs):
+            commands.append((command, kwargs))
+            receipt_arg = next(part.split("=", 1)[1] for part in command
+                               if part.startswith("-SkiP1Receipt="))
+            receipt_path = Path(receipt_arg)
+            if receipt_path.parent == (run_output / "isolated-data"):
+                receipt_path.write_text(json.dumps({
+                    "token": next(part.split("=", 1)[1] for part in command
+                                  if part.startswith("-SkiP1Token=")),
+                    "scenario": "frontend", "passed": True, "nativeTitle": True,
+                    "nativePickerPlaceholder": True, "installedIdForwarded": True,
+                    "browserWidgetAbsent": True, "mountainTravel": True,
+                    "offlineReopen": True, "contentId": self.content_id,
+                }), encoding="utf-8")
+                return primary_audit
+            return escape_audit
+
+        with mock.patch.object(p1, "verify_package_report",
+                               return_value=({"invocation": "fixture"}, launcher)), \
+                mock.patch.object(p1, "checked_with_tcp_audit",
+                                  side_effect=run_audited_child) as checked, \
+                mock.patch.object(p1, "validate_tcp_audit",
+                                  wraps=p1.validate_tcp_audit) as validate:
+            result = p1.smoke("Development", "source-digest", "frontend", None,
+                              run_output)
+        return result, commands, checked, validate
+
+    def test_frontend_escape_probe_is_audited_rejects_connections_and_is_in_receipt(self):
+        escape_audit = self.make_audit()
+        result, commands, checked, validate = self.run_frontend_smoke(escape_audit)
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(commands[1][1]["allow_nonzero_exit"])
+        self.assertEqual(validate.call_count, 2)
+        self.assertTrue(all(call.kwargs["require_no_connections"]
+                            for call in validate.call_args_list))
+        self.assertEqual(result["receipt_path_escape_audit"], escape_audit)
+        self.assertEqual(result["process_network_audit"]["sampling_mode"], "sampled")
+        self.assertIn("shorter-lived endpoints may be missed", result["network_policy"])
+
+    def test_frontend_escape_probe_rejects_sampled_remote_connection(self):
+        escape_audit = self.make_audit(
+            remote_endpoints=("203.0.113.2:443",),
+            endpoint_owners=({"pid": 7, "image": "SkiAreaDesignChallenge.exe",
+                              "remote": "203.0.113.2:443"},))
+        with self.assertRaisesRegex(RuntimeError, "receipt-path escape probe.*connections"):
+            self.run_frontend_smoke(escape_audit)
+
+
+class DevelopmentPickerTraceAuditTests(unittest.TestCase):
+    @staticmethod
+    def trace_audit(local="127.0.0.1:1985", *, pid=7,
+                    image="SkiAreaDesignChallenge.exe", remotes=()):
+        host_port = p1._tcp_endpoint_host_port(local)
+        ports = [host_port[1]] if host_port else []
+        endpoint_owners = [
+            {"pid": 7, "image": "SkiAreaDesignChallenge.exe", "remote": remote}
+            for remote in remotes]
+        return {
+            "method": "GetExtendedTcpTable process-attributed polling",
+            "root_pid": 7, "observed_pids": [7] if pid == 7 else [7, pid],
+            "process_images": {"7": "SkiAreaDesignChallenge.exe",
+                               **({str(pid): image} if pid != 7 else {})},
+            "snapshots": 12, "all_observed_pids_exited": True,
+            "last_live_pids": [], "listen_ports": ports,
+            "listener_owners": [{"pid": pid, "image": image, "local": local}],
+            "remote_endpoints": list(remotes), "endpoint_owners": endpoint_owners,
+        }
+
+    def validate(self, audit, *, configuration="Development", scenario="picker-viewport"):
+        return p1.validate_development_picker_viewport_tcp_audit(
+            audit, configuration=configuration, scenario=scenario,
+            expected_image="SkiAreaDesignChallenge.exe")
+
+    def test_exact_development_trace_listener_passes_and_marks_zero_remote_network(self):
+        result = self.validate(self.trace_audit())
+        self.assertTrue(result["developmentTraceListenerObserved"])
+        self.assertEqual(result["developmentTraceListenerPolicyException"],
+                         p1.DEVELOPMENT_TRACE_LISTENER_POLICY)
+        self.assertEqual(result["networkRemoteEndpoints"], [])
+        self.assertTrue(result["networkRemoteZero"])
+
+    def test_exact_ipv6_loopback_trace_listener_passes(self):
+        result = self.validate(self.trace_audit("[::1]:1985"))
+        self.assertTrue(result["developmentTraceListenerObserved"])
+
+    def test_wrong_port_non_loopback_and_child_helper_listeners_fail(self):
+        invalid_listener = (
+            self.trace_audit("127.0.0.1:1986"),
+            self.trace_audit("0.0.0.0:1985"),
+            self.trace_audit("[::]:1985"),
+        )
+        for audit in invalid_listener:
+            with self.subTest(listener=audit["listener_owners"]), \
+                    self.assertRaisesRegex(RuntimeError, "listener outside"):
+                self.validate(audit)
+        child_helper = self.trace_audit("127.0.0.1:1985", pid=8,
+                                        image="UnrealTraceServer.exe")
+        with self.assertRaisesRegex(RuntimeError, "child helper processes"):
+            self.validate(child_helper)
+        wrong_root_image = self.trace_audit()
+        wrong_root_image["process_images"]["7"] = "UnrealTraceServer.exe"
+        with self.assertRaisesRegex(RuntimeError, "root image is not the packaged app"):
+            self.validate(wrong_root_image)
+
+    def test_picker_exception_rejects_every_remote_endpoint_including_loopback(self):
+        audit = self.trace_audit(remotes=("127.0.0.1:1985",))
+        with self.assertRaisesRegex(RuntimeError, "remote TCP endpoints are forbidden"):
+            self.validate(audit)
+
+    def test_picker_exception_requires_observed_listener_and_exited_process_tree(self):
+        no_listener = self.trace_audit()
+        no_listener["listen_ports"] = []
+        no_listener["listener_owners"] = []
+        with self.assertRaisesRegex(RuntimeError, "listener was not observed"):
+            self.validate(no_listener)
+        with self.assertRaisesRegex(RuntimeError, "TCP audit is missing or was not observed"):
+            self.validate({**self.trace_audit(), "all_observed_pids_exited": False})
+
+    def test_listener_exception_is_development_picker_only_and_zero_listener_policies_stay_strict(self):
+        audit = self.trace_audit()
+        for configuration, scenario in (("Shipping", "picker-viewport"),
+                                         ("Development", "ui-layout"),
+                                         ("Development", "frontend")):
+            with self.subTest(configuration=configuration, scenario=scenario), \
+                    self.assertRaisesRegex(RuntimeError, "restricted to picker-viewport"):
+                self.validate(audit, configuration=configuration, scenario=scenario)
+        with self.assertRaisesRegex(RuntimeError, "opened TCP listeners"):
+            p1.validate_tcp_audit(audit, require_no_connections=True, label="frontend")
+
+    def test_picker_smoke_receipt_prominently_records_trace_exception_and_zero_remotes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            run_output = root / "run"
+            run_output.mkdir()
+            launcher = root / "SkiAreaDesignChallenge.exe"
+            audits = []
+
+            def run_capture(command, **_kwargs):
+                option = lambda prefix: next(
+                    value.split("=", 1)[1] for value in command
+                    if value.startswith(prefix))
+                receipt = Path(option("-SkiP1Receipt="))
+                receipt.write_text(json.dumps({
+                    "token": option("-SkiP1Token="), "scenario": "picker-viewport",
+                }), encoding="utf-8")
+                audit = self.trace_audit()
+                audits.append(audit)
+                return audit
+
+            def capture(receipt, token, width, height, screenshot):
+                return {"resolution": [width, height], "screenshot": str(screenshot)}
+
+            with mock.patch.object(p1, "verify_package_report",
+                                   return_value=({"invocation": "fixture"}, launcher)), \
+                    mock.patch.object(p1, "checked_with_tcp_audit", side_effect=run_capture), \
+                    mock.patch.object(p1, "require_picker_viewport_capture", side_effect=capture):
+                result = p1.smoke("Development", "source-digest", "picker-viewport",
+                                  None, run_output)
+
+        receipt = result["receipt"]
+        self.assertTrue(receipt["developmentTraceListenerObserved"])
+        self.assertEqual(receipt["developmentTraceListenerPolicyException"],
+                         p1.DEVELOPMENT_TRACE_LISTENER_POLICY)
+        self.assertTrue(receipt["networkRemoteZero"])
+        self.assertEqual(receipt["networkRemoteEndpoints"], [])
+        self.assertEqual(len(audits), len(p1.PICKER_VIEWPORT_RESOLUTIONS))
+        self.assertTrue(all(audit["listener_owners"][0]["local"] == "127.0.0.1:1985"
+                            for audit in receipt["childNetworkAudits"]))
+        self.assertIn("remote TCP endpoints: zero", result["network_policy"])
+
+
+class FocusedUiAutomationRegistryTests(unittest.TestCase):
+    def test_ui_filter_matches_all_registered_p1_ui_tests_exactly(self):
+        source = (ROOT / "Source/SkiPresentation/Private/Tests/P1PresentationTests.cpp").read_text(
+            encoding="utf-8")
+        registered = re.findall(
+            r'"(MountainPlanner\.P1\.Presentation\.UI\.[^"]+)"', source)
+
+        self.assertCountEqual(p1.UI_TESTS, registered)
+        self.assertEqual(len(p1.UI_TESTS), len(set(p1.UI_TESTS)))
+        self.assertTrue(set(p1.UI_TESTS).issubset(p1.P1_TESTS))
+        self.assertFalse(set(p1.UI_TESTS).intersection(p1.SITE_PICKER_TESTS))
+
+
+class PickerViewportVisualDiagnosticTests(unittest.TestCase):
+    @staticmethod
+    def audit(local="0.0.0.0:1985"):
+        audit = DevelopmentPickerTraceAuditTests.trace_audit(local)
+        audit["process_return_code"] = 0
+        return audit
+
+    def run_visual_diagnostic(self, *, unexpected=False):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        run_output = root / "run"
+        run_output.mkdir()
+        launcher = root / "SkiAreaDesignChallenge.exe"
+        calls = []
+        validated = []
+
+        def run_child(command, **kwargs):
+            calls.append((command, kwargs))
+            option = lambda prefix: next(
+                value.split("=", 1)[1] for value in command if value.startswith(prefix))
+            receipt_path = Path(option("-SkiP1Receipt="))
+            screenshot_path = Path(option("-SkiP1Screenshot="))
+            receipt_path.write_text(json.dumps({
+                "token": option("-SkiP1Token="), "scenario": "picker-viewport",
+                "stepStates": {name: {"captured": True}
+                               for name in ("step1", "step2", "step3")},
+            }), encoding="utf-8")
+            screenshot_path.write_bytes(b"full rendered viewport fixture")
+            audit = self.audit()
+            if unexpected and len(calls) == 1:
+                audit["remote_endpoints"] = ["198.51.100.40:443"]
+                audit["endpoint_owners"] = [{
+                    "pid": 7, "image": "SkiAreaDesignChallenge.exe",
+                    "remote": "198.51.100.40:443"}]
+                audit["listener_owners"].append({
+                    "pid": 7, "image": "SkiAreaDesignChallenge.exe",
+                    "local": "127.0.0.1:1986"})
+                audit["listen_ports"] = [1985, 1986]
+            return audit
+
+        def validate_capture(receipt, token, width, height, screenshot):
+            self.assertEqual(receipt["token"], token)
+            self.assertEqual(receipt["stepStates"], {
+                name: {"captured": True} for name in ("step1", "step2", "step3")})
+            self.assertTrue(screenshot.is_file())
+            result = {**receipt, "resolution": [width, height],
+                      "screenshot": str(screenshot)}
+            validated.append(result)
+            return result
+
+        with mock.patch.object(
+                p1, "verify_package_report",
+                return_value=({"invocation": "fixture"}, launcher)), \
+                mock.patch.object(p1, "checked_with_tcp_audit", side_effect=run_child), \
+                mock.patch.object(p1, "require_picker_viewport_capture",
+                                  side_effect=validate_capture):
+            result = p1.picker_viewport_visual(
+                "Development", "source-digest", run_output)
+        return result, calls, validated
+
+    def test_known_unrestricted_trace_bind_fails_network_but_all_five_visuals_are_attempted(self):
+        result, calls, validated = self.run_visual_diagnostic()
+
+        self.assertEqual(len(calls), 5)
+        command_resolutions = [
+            [next(value for value in command if value.startswith("-ResX=")),
+             next(value for value in command if value.startswith("-ResY="))]
+            for command, _kwargs in calls
+        ]
+        self.assertEqual(command_resolutions, [
+            [f"-ResX={width}", f"-ResY={height}"]
+            for width, height in p1.PICKER_VIEWPORT_RESOLUTIONS
+        ])
+        for command, _kwargs in calls:
+            self.assertIn("-windowed", command)
+            self.assertIn("-RenderOffScreen", command)
+            self.assertIn("-ForceRes", command)
+            self.assertNotIn("-NullRHI", command)
+            self.assertEqual(command[command.index("-windowed") + 1:
+                                     command.index("-windowed") + 3],
+                             ["-RenderOffScreen", "-ForceRes"])
+        self.assertEqual(len(validated), 5)
+        self.assertEqual([call[1].get("allow_nonzero_exit") for call in calls],
+                         [True] * 5)
+        self.assertEqual([call[1].get("include_listener_owners") for call in calls],
+                         [True] * 5)
+        self.assertTrue(result["visualCapturePass"])
+        self.assertEqual(result["networkAuditStatus"], "FAIL")
+        self.assertEqual(result["status"], "FAIL")
+        self.assertFalse(result["releaseGatePass"])
+        self.assertFalse(result["releaseAcceptanceEligible"])
+        self.assertEqual(len(result["runs"]), 5)
+        self.assertEqual(len(result["captures"]), 5)
+        self.assertTrue(all(set(capture["stepStates"]) == {"step1", "step2", "step3"}
+                            for capture in result["captures"]))
+        self.assertTrue(all(run["processNetworkAudit"]["listener_owners"][0]["local"]
+                            == "0.0.0.0:1985" for run in result["runs"]))
+        self.assertTrue(any("listener outside" in failure["finding"]
+                            for failure in result["networkAuditFailures"]))
+
+    def test_offscreen_flag_is_scoped_away_from_release_smoke_scenarios(self):
+        source = (ROOT / "Tools/Build/p1.py").read_text(encoding="utf-8")
+        smoke_begin = source.index("def smoke(")
+        diagnostic_begin = source.index("def picker_viewport_visual(", smoke_begin)
+        visual_diagnostic_source = source[diagnostic_begin:source.index(
+            "\ndef visual(", diagnostic_begin)]
+        smoke_source = source[smoke_begin:diagnostic_begin]
+
+        self.assertIn('"-RenderOffScreen"', visual_diagnostic_source)
+        self.assertIn('"-ForceRes"', visual_diagnostic_source)
+        self.assertNotIn('"-NullRHI"', visual_diagnostic_source)
+        self.assertEqual(smoke_source.count('"-RenderOffScreen"'), 1)
+        self.assertNotIn('"-ForceRes"', smoke_source)
+        self.assertIn(
+            'if scenario == "frontend":\n'
+            '        command.extend(("-RenderOffScreen", "-NullRHI"))',
+            smoke_source)
+        picker_smoke_source = smoke_source[
+            smoke_source.index('elif scenario == "picker-viewport":'):]
+        self.assertNotIn('"-RenderOffScreen"', picker_smoke_source)
+
+    def test_unexpected_remote_and_extra_listener_are_retained_and_rejected(self):
+        result, calls, _validated = self.run_visual_diagnostic(unexpected=True)
+        first_run = result["runs"][0]
+
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(first_run["processNetworkAudit"]["remote_endpoints"],
+                         ["198.51.100.40:443"])
+        self.assertEqual(first_run["processNetworkAudit"]["listener_owners"][1]["local"],
+                         "127.0.0.1:1986")
+        self.assertTrue(any("Remote TCP endpoints observed" in failure["finding"]
+                            for failure in result["networkAuditFailures"]))
+        self.assertTrue(any("Unexpected or additional TCP listener(s)" in failure["finding"]
+                            for failure in result["networkAuditFailures"]))
+        self.assertTrue(result["visualCapturePass"])
+        self.assertEqual(result["networkAuditStatus"], "FAIL")
+
+    def test_shipping_is_rejected_before_package_or_process_access(self):
+        with mock.patch.object(p1, "verify_package_report") as verify:
+            with self.assertRaisesRegex(RuntimeError, "Development-only"):
+                p1.picker_viewport_visual("Shipping", "unused", Path("unused"))
+        verify.assert_not_called()
+
+    def test_cli_failure_report_is_separate_from_release_smoke_receipt(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        output = Path(temporary.name) / "p1"
+        output.mkdir()
+        smoke_report = output / "smoke-Development-picker-viewport.json"
+        smoke_report.write_text('{"releaseSmoke":"unchanged"}', encoding="utf-8")
+        generic_smoke_report = output / "smoke-Development.json"
+        generic_smoke_report.write_text('{"genericSmoke":"unchanged"}', encoding="utf-8")
+        diagnostic = {
+            "status": "FAIL", "kind": "non_release_picker_viewport_visual_diagnostic",
+            "releaseGatePass": False, "releaseAcceptanceEligible": False,
+            "networkAuditStatus": "FAIL", "visualCapturePass": True,
+        }
+        source = {"sha256": "a" * 64, "files": {}}
+        with mock.patch.object(p1, "OUTPUT", output), \
+                mock.patch.object(p1.p0, "doctor", return_value={"missing": []}), \
+                mock.patch.object(p1.p0, "source_snapshot", return_value=source), \
+                mock.patch.object(p1.p0, "verify_frozen"), \
+                mock.patch.object(p1, "picker_viewport_visual", return_value=diagnostic), \
+                mock.patch.object(sys, "argv", ["p1.py", "picker-viewport-visual"]), \
+                mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("builtins.print"):
+            exit_code = p1._main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(smoke_report.read_text(encoding="utf-8"),
+                         '{"releaseSmoke":"unchanged"}')
+        self.assertEqual(generic_smoke_report.read_text(encoding="utf-8"),
+                         '{"genericSmoke":"unchanged"}')
+        diagnostic_path = output / "picker-viewport-visual-Development.json"
+        self.assertTrue(diagnostic_path.is_file())
+        report = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["command"], "picker-viewport-visual")
+        self.assertFalse(report["result"]["releaseGatePass"])
+        self.assertEqual(report["result"]["networkAuditStatus"], "FAIL")
 
 
 class TerrainCoreEvidenceTests(unittest.TestCase):
@@ -263,6 +1146,270 @@ class TerrainCoreEvidenceTests(unittest.TestCase):
         ):
             with self.subTest(receipt=receipt), self.assertRaises(RuntimeError):
                 p1.require_acquisition_port_guard(receipt)
+
+
+class PickerViewportCaptureTests(unittest.TestCase):
+    @staticmethod
+    def make_rgba_png(width, height):
+        def chunk(name, data):
+            payload = name + data
+            return (len(data).to_bytes(4, "big") + payload
+                    + (zlib.crc32(payload) & 0xffffffff).to_bytes(4, "big"))
+
+        header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+        row = b"\x00" + (b"\x20\x40\x80\xff" * width)
+        pixels = zlib.compress(row * height)
+        return (p1.PNG_SIGNATURE + chunk(b"IHDR", header)
+                + chunk(b"IDAT", pixels) + chunk(b"IEND", b""))
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir=ROOT / "test-results/p1")
+        self.root = Path(self.temporary.name)
+        self.screenshot = self.root / "picker.png"
+        width, height = 1280, 720
+        png = self.make_rgba_png(width, height)
+        self.screenshot.write_bytes(png)
+        self.png = png
+        self.receipt = {
+            "token": "picker-token", "scenario": "picker-viewport",
+            "resolution": [width, height], "viewport": [width, height],
+            "captureKind": "rendered-viewport-png", "capturedStep": "name-resort",
+            "capturedScrollPosition": "end", "nativePickerVisible": True,
+            "mapWidgetPresent": True, "networkDisabled": True,
+            "topContentVisible": True, "bottomContentReachable": True,
+            "visualReviewRequired": True, "screenshotPath": str(self.screenshot),
+            "screenshotSha256": hashlib.sha256(png).hexdigest(),
+            "scrollAtStart": 0.0, "scrollAtEnd": 440.0, "scrollMaximum": 440.0,
+            "rects": {
+                "map": [0, 0, width, height], "panel": [24, 24, 440, 672],
+                "scroll": [32, 250, 420, 440], "heading": [32, 32, 420, 40],
+                "subtitle": [32, 80, 420, 30], "steps": [32, 120, 420, 100],
+                "stepItems": [[32, 120 + index * 25, 420, 24]
+                              for index in range(4)],
+            },
+            "texts": {
+                "heading": "SKI AREA DESIGN CHALLENGE\nNew resort",
+                "subtitle": "Find the mountain you want to make your own.",
+                "steps": ["✓  1  Choose location", "✓  2  Define boundary",
+                          "●  3  Name resort", "○  4  Download"],
+            },
+            "stepStates": {
+                "step1": {
+                    "locationVisible": True, "boundaryVisible": False, "nameVisible": False,
+                    "selectSiteInitiallyDisabled": True, "selectSiteEnabledAfterSearch": True,
+                    "locationQuery": "47.25, -121.55",
+                    "activeLabel": "●  1  Choose location",
+                    "searchStatus": "Centered at 47.25000°, -121.55000°. Select site to define its boundary.",
+                    "texts": {
+                        "locationHeading": "Search a place or enter lat, lon / DMS",
+                        "searchButton": "Search / go to coordinates",
+                        "selectSiteButton": "Select site",
+                    },
+                    "rects": {
+                        "locationControls": [40, 260, 400, 210],
+                        "locationHeading": [40, 260, 400, 30],
+                        "locationSearch": [40, 295, 400, 36],
+                        "searchButton": [40, 335, 400, 40],
+                        "selectSiteButton": [40, 420, 400, 40],
+                    },
+                },
+                "step2": {
+                    "locationVisible": False, "boundaryVisible": True, "nameVisible": False,
+                    "activeLabel": "●  2  Define boundary", "scrollAtStart": 0.0,
+                    "texts": {
+                        "boundaryHeading": "Define your boundary",
+                        "boundaryInstructions": "Drag on the map to draw a 2–4 km site.",
+                        "boundaryStatus": "Drag on the map to draw the site boundary.",
+                        "previewStatus": "M3 will add coverage and source-quality details.",
+                    },
+                    "rects": {
+                        "boundaryHeading": [40, 260, 400, 30],
+                        "boundaryInstructions": [40, 295, 400, 50],
+                        "clearBoundary": [40, 350, 400, 40],
+                        "boundaryStatus": [40, 395, 400, 30],
+                        "previewStatus": [40, 430, 400, 30],
+                    },
+                },
+                "step3": {
+                    "locationVisible": False, "boundaryVisible": True, "nameVisible": True,
+                    "selectionValid": True, "downloadEnabled": False,
+                    "activeLabel": "●  3  Name resort",
+                    "texts": {
+                        "boundaryHeading": "Define your boundary",
+                        "boundaryInstructions": "Drag on the map to draw a 2–4 km site.",
+                        "resortNameHeading": "Name your resort",
+                        "downloadLabel": "Download unavailable until M5",
+                    },
+                    "rects": {
+                        "boundaryControls": [40, 260, 400, 200],
+                        "boundaryHeading": [40, 260, 400, 30],
+                        "boundaryInstructions": [40, 295, 400, 50],
+                        "nameControls": [40, 465, 400, 180],
+                        "resortNameHeading": [40, 465, 400, 30],
+                        "nameBox": [40, 500, 400, 36],
+                        "downloadButton": [40, 540, 400, 36],
+                        "downloadLabel": [50, 548, 380, 20],
+                    },
+                    "scrollAtEnd": 440.0, "scrollMaximum": 440.0,
+                    "bottomRects": {
+                        "nameControls": [40, 465, 400, 180],
+                        "resortNameHeading": [40, 465, 400, 30],
+                        "nameBox": [40, 500, 400, 36],
+                        "downloadButton": [40, 540, 400, 36],
+                        "downloadLabel": [50, 548, 380, 20],
+                    },
+                },
+            },
+        }
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_rendered_picker_capture_receipt_and_screenshot_are_bound(self):
+        self.assertEqual(p1.PICKER_VIEWPORT_RESOLUTIONS,
+                         ((1280, 720), (1920, 1080), (2560, 1080),
+                          (2560, 1440), (576, 1024)))
+        result = p1.require_picker_viewport_capture(
+            self.receipt, "picker-token", 1280, 720, self.screenshot)
+        self.assertEqual(result["screenshot"], str(self.screenshot))
+
+    def test_zero_or_subpixel_overflow_is_at_end_with_native_step3_proof(self):
+        step3 = self.receipt["stepStates"]["step3"]
+        for maximum in (0.0, 0.5, 1.0):
+            with self.subTest(maximum=maximum):
+                receipt = {
+                    **self.receipt,
+                    "scrollAtEnd": 0.0,
+                    "scrollMaximum": maximum,
+                    "stepStates": {**self.receipt["stepStates"],
+                                   "step3": {**step3, "scrollAtEnd": 0.0,
+                                             "scrollMaximum": maximum}},
+                }
+                result = p1.require_picker_viewport_capture(
+                    receipt, "picker-token", 1280, 720, self.screenshot)
+                self.assertEqual(result["scrollMaximum"], maximum)
+
+    def test_zero_overflow_requires_visible_name_and_disabled_download_receipt(self):
+        step3 = self.receipt["stepStates"]["step3"]
+        hidden_name = {**step3, "nameVisible": False}
+        enabled_download = {**step3, "downloadEnabled": True}
+        missing_download = {
+            **step3,
+            "bottomRects": {name: rect for name, rect in step3["bottomRects"].items()
+                            if name != "downloadButton"},
+        }
+        outside_scroll = {
+            **step3,
+            "bottomRects": {**step3["bottomRects"],
+                            "nameBox": [40, 800, 400, 36]},
+        }
+        invalid_receipts = (
+            {**self.receipt, "bottomContentReachable": False},
+            {**self.receipt, "capturedScrollPosition": "start"},
+            {**self.receipt, "stepStates": {**self.receipt["stepStates"],
+                "step3": hidden_name}},
+            {**self.receipt, "stepStates": {**self.receipt["stepStates"],
+                "step3": enabled_download}},
+            {**self.receipt, "stepStates": {**self.receipt["stepStates"],
+                "step3": missing_download}},
+            {**self.receipt, "stepStates": {**self.receipt["stepStates"],
+                "step3": outside_scroll}},
+        )
+        for receipt in invalid_receipts:
+            with self.subTest(receipt=receipt), self.assertRaises(RuntimeError):
+                p1.require_picker_viewport_capture(
+                    receipt, "picker-token", 1280, 720, self.screenshot)
+
+    def test_scroll_extent_must_be_valid_and_real_overflow_must_reach_end(self):
+        step3 = self.receipt["stepStates"]["step3"]
+
+        def with_scroll(maximum, offset):
+            return {
+                **self.receipt,
+                "scrollAtEnd": offset,
+                "scrollMaximum": maximum,
+                "stepStates": {**self.receipt["stepStates"],
+                               "step3": {**step3, "scrollAtEnd": offset,
+                                         "scrollMaximum": maximum}},
+            }
+
+        within_tolerance = p1.require_picker_viewport_capture(
+            with_scroll(20.0, 19.0), "picker-token", 1280, 720, self.screenshot)
+        self.assertEqual(within_tolerance["scrollMaximum"], 20.0)
+        for receipt in (with_scroll(-0.1, 0.0),
+                        with_scroll(0.5, 2.0),
+                        with_scroll(20.0, 18.0),
+                        with_scroll(float("nan"), 0.0)):
+            with self.subTest(receipt=receipt), self.assertRaises(RuntimeError):
+                p1.require_picker_viewport_capture(
+                    receipt, "picker-token", 1280, 720, self.screenshot)
+
+    def test_native_harness_drives_real_picker_steps_and_names_the_capture_step(self):
+        source = (ROOT / "Source/SkiPresentation/Private/SkiBootstrapGameMode.cpp").read_text(
+            encoding="utf-8")
+        begin = source.index("bool ASkiBootstrapGameMode::BeginP1PickerViewportSmoke()")
+        step1 = source.index("void ASkiBootstrapGameMode::InspectP1PickerViewportTop()")
+        step2 = source.index("void ASkiBootstrapGameMode::InspectP1PickerViewportBoundary()")
+        step3 = source.index("void ASkiBootstrapGameMode::InspectP1PickerViewportName()")
+        self.assertLess(begin, source.index("NewResortButton->OnClicked.Broadcast();", begin))
+        transition = source[step1:step2]
+        expected_order = (
+            'LocationSearch->SetText(FText::FromString(TEXT("47.25, -121.55")))',
+            "SearchButton->OnClicked.Broadcast()",
+            "SelectSiteButton->OnClicked.Broadcast()",
+        )
+        positions = [transition.index(item) for item in expected_order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("CreateViewportSmokeBoundary(SmokeToken)", source[step2:step3])
+        self.assertIn("capturedStep", source)
+        self.assertIn("name-resort", source)
+        self.assertIn("capturedScrollPosition", source)
+        self.assertIn("stepStates", source)
+
+    def test_capture_fails_closed_for_wrong_viewport_visual_or_scroll_evidence(self):
+        invalid_receipts = (
+            {**self.receipt, "resolution": [576, 1024]},
+            {**self.receipt, "visualReviewRequired": False},
+            {**self.receipt, "networkDisabled": False},
+            {**self.receipt, "scrollAtEnd": 10.0},
+            {**self.receipt, "capturedStep": "location"},
+            {**self.receipt, "stepStates": {**self.receipt["stepStates"],
+                "step3": {**self.receipt["stepStates"]["step3"],
+                          "texts": {**self.receipt["stepStates"]["step3"]["texts"],
+                                    "downloadLabel": ""}}}},
+            {**self.receipt, "stepStates": {**self.receipt["stepStates"],
+                "step3": {**self.receipt["stepStates"]["step3"],
+                          "bottomRects": {**self.receipt["stepStates"]["step3"]["bottomRects"],
+                                          "downloadButton": [40, 800, 400, 36]}}}},
+        )
+        for receipt in invalid_receipts:
+            with self.subTest(receipt=receipt), self.assertRaises(RuntimeError):
+                p1.require_picker_viewport_capture(
+                    receipt, "picker-token", 1280, 720, self.screenshot)
+        self.screenshot.write_bytes(b"not a png")
+        with self.assertRaisesRegex(RuntimeError, "screenshot does not match"):
+            p1.require_picker_viewport_capture(
+                self.receipt, "picker-token", 1280, 720, self.screenshot)
+
+    def test_capture_rejects_incomplete_or_corrupt_png_data(self):
+        header_only = (p1.PNG_SIGNATURE + (13).to_bytes(4, "big") + b"IHDR"
+                       + struct.pack(">IIBBBBB", 1280, 720, 8, 6, 0, 0, 0))
+        truncated = self.png[:-1]
+        bad_crc = bytearray(self.png)
+        bad_crc[29] ^= 1
+        for label, png in (("header-only", header_only), ("truncated", truncated),
+                           ("crc", bytes(bad_crc))):
+            with self.subTest(png=label):
+                self.screenshot.write_bytes(png)
+                receipt = {**self.receipt,
+                           "screenshotSha256": hashlib.sha256(png).hexdigest()}
+                with self.assertRaisesRegex(RuntimeError, "screenshot does not match"):
+                    p1.require_picker_viewport_capture(
+                        receipt, "picker-token", 1280, 720, self.screenshot)
+
+    def test_picker_viewport_smoke_is_development_only(self):
+        with self.assertRaisesRegex(RuntimeError, "Development-only"):
+            p1.smoke("Shipping", "unused", "picker-viewport", None, self.root)
 
 
 class EvidenceLedgerTests(unittest.TestCase):
@@ -393,7 +1540,7 @@ class ShippingEvidenceBindingTests(unittest.TestCase):
             "Configuration": "Shipping", "TargetType": "Game", "IsTestTarget": False,
             "Project": "../../SkiAreaDesignChallenge.uproject",
             "Launch": "$(ProjectDir)/Binaries/Win64/SkiAreaDesignChallenge-Win64-Shipping.exe",
-            "BuildPlugins": ["WebBrowserWidget"],
+            "BuildPlugins": [],
         }), encoding="utf-8")
         self.rules = self.root / "Source/SkiAreaDesignChallenge.Target.cs"
         self.rules.parent.mkdir(parents=True)
@@ -444,6 +1591,11 @@ class ShippingEvidenceBindingTests(unittest.TestCase):
              "Project": "../../SkiAreaDesignChallenge.uproject",
              "Launch": "$(ProjectDir)/Binaries/Win64/SkiAreaDesignChallenge-Win64-Shipping.exe",
              "BuildPlugins": ["ModelContextProtocol"]},
+            {"TargetName": "SkiAreaDesignChallenge", "Platform": "Win64",
+             "Configuration": "Shipping", "TargetType": "Game", "IsTestTarget": False,
+             "Project": "../../SkiAreaDesignChallenge.uproject",
+             "Launch": "$(ProjectDir)/Binaries/Win64/SkiAreaDesignChallenge-Win64-Shipping.exe",
+             "BuildPlugins": ["WebBrowserWidget"]},
         ]
         for target in attacks:
             with self.subTest(target=target):
@@ -720,7 +1872,8 @@ class NetworkPolicyTests(unittest.TestCase):
     def audit(self, owners):
         return {"method": "GetExtendedTcpTable process-attributed polling", "snapshots": 3,
                 "listen_ports": [], "remote_endpoints": [o["remote"] for o in owners],
-                "endpoint_owners": owners}
+                "endpoint_owners": owners, "all_observed_pids_exited": True,
+                "last_live_pids": []}
 
     def test_zero_policy_names_owning_image(self):
         audit = self.audit([{"pid": 7, "image": "UnrealCEFSubProcess.exe",
@@ -729,35 +1882,26 @@ class NetworkPolicyTests(unittest.TestCase):
             p1.validate_tcp_audit(audit, require_no_connections=True,
                                   label="ui-layout 1280x720 ready")
 
-    def test_selector_policy_allows_only_browser_to_tile_host(self):
+    def test_native_package_rejects_browser_files(self):
         with tempfile.TemporaryDirectory() as folder:
-            user = Path(folder)
-            ok = self.audit([{"pid": 7, "image": "EpicWebHelper.exe",
-                              "remote": "[2a04:4e42::347]:443", "first_seen_ms": 1.0}])
-            p1.validate_selector_audit(ok, user, label="selector",
-                                       tile_addresses={"2a04:4e42::347"})
-            for owner in ({"pid": 7, "image": "EpicWebHelper.exe",
-                           "remote": "[2607:f8b0::54]:443"},
-                          {"pid": 8, "image": "SkiAreaDesignChallenge.exe",
-                           "remote": "[2a04:4e42::347]:443"}):
-                with self.subTest(owner=owner), self.assertRaises(RuntimeError):
-                    p1.validate_selector_audit(self.audit([{**owner, "first_seen_ms": 1.0}]),
-                                               user, label="selector",
-                                               tile_addresses={"2a04:4e42::347"})
+            root = Path(folder)
+            p1.assert_no_browser_bundle(root)
+            helper = root / "Engine/Binaries/ThirdParty/CEF3/EpicWebHelper.exe"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"browser")
+            with self.assertRaisesRegex(RuntimeError, "Browser helper"):
+                p1.assert_no_browser_bundle(root)
 
-    def test_selector_policy_rejects_recorded_google_contact(self):
+    def test_native_package_rejects_browser_path_inside_archive(self):
         with tempfile.TemporaryDirectory() as folder:
-            state = Path(folder) / "Saved/webcache_1/Default/Network/Network Persistent State"
-            state.parent.mkdir(parents=True)
-            state.write_text(json.dumps({"net": {"http_server_properties": {"servers": [
-                {"server": "https://accounts.google.com"}]}}}), encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "accounts.google.com"):
-                p1.validate_selector_audit(self.audit([]), Path(folder), label="selector",
-                                           tile_addresses=set())
+            root = Path(folder)
+            (root / "assets.pak").write_bytes(b"prefix/Content/P1Selector/index.html")
+            with self.assertRaisesRegex(RuntimeError, "Browser helper"):
+                p1.assert_no_browser_bundle(root)
 
-    def test_non_selecting_state_rejects_browser_profile(self):
+    def test_native_frontend_rejects_browser_profile(self):
         with tempfile.TemporaryDirectory() as folder:
             p1.require_no_browser_profile(Path(folder), "ready")
             (Path(folder) / "Saved/webcache_6613").mkdir(parents=True)
-            with self.assertRaisesRegex(RuntimeError, "outside the Selecting state"):
+            with self.assertRaisesRegex(RuntimeError, "after native frontend cutover"):
                 p1.require_no_browser_profile(Path(folder), "ready")

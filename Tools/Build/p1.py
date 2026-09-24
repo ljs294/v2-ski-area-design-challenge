@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from datetime import datetime, timezone
+import ipaddress
 import importlib.util
 import hashlib
 import json
@@ -19,6 +20,7 @@ import time
 import uuid
 import zipfile
 import struct
+import zlib
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,8 +37,21 @@ ACQUISITION_TESTS = (
     "MountainPlanner.P1.Preparation.Acquisition.Stitch",
     "MountainPlanner.P1.Preparation.Acquisition.ActivationFence",
 )
+PLACE_SEARCH_TESTS = (
+    "MountainPlanner.P1.Preparation.PlaceSearch.NormalizationCacheAndBounds",
+    "MountainPlanner.P1.Preparation.PlaceSearch.PacingCancellationAndBounds",
+)
+SITE_PICKER_TESTS = (
+    "MountainPlanner.P1.Presentation.SitePicker.CancellationToken",
+    "MountainPlanner.P1.Presentation.SitePicker.ZeroOverflowIsAlreadyAtEnd",
+)
+PRESENTATION_INSTALLED_TERRAIN_TESTS = (
+    "MountainPlanner.P1.Presentation.InstalledTerrain.VerifiedMountainHandoff",
+    "MountainPlanner.P1.Presentation.InstalledTerrain.SiteContextSummary",
+)
 UI_TESTS = (
     "MountainPlanner.P1.Presentation.UI.ResponsiveLayout",
+    "MountainPlanner.P1.Presentation.UI.SitePickerPanelLayout",
 )
 TERRAINCORE_TESTS = (
     "MountainPlanner.P1.TerrainCore.AdversarialCache",
@@ -48,11 +63,21 @@ TERRAINCORE_TESTS = (
     "MountainPlanner.P1.TerrainCore.SaddleAndSpatialLod",
     "MountainPlanner.P1.TerrainCore.EditPersistence",
 )
+TERRAIN_SCRATCH_TESTS = (
+    "MountainPlanner.P1.TerrainScratch.BitExactIndexedLodsAndProvenance",
+    "MountainPlanner.P1.TerrainScratch.BoundsAndMalformedInputs",
+    "MountainPlanner.P1.TerrainScratch.CancellationInvalidatesStore",
+    "MountainPlanner.P1.TerrainScratch.MultiBlockEdgesAndClamp",
+)
 TERRAINCORE_NATIVE_TESTS = (
     "SkiDomain.CoverEcology",
+    "SkiDomain.ElevationSources",
+    "SkiDomain.PlaceCoordinates",
     "SkiDomain.Revision",
+    "SkiDomain.SiteSelection",
     "SkiDomain.Terrain",
     "SkiDomain.TerrainCore",
+    "SkiDomain.TerrainQuality",
 )
 P1_PRODUCT_TESTS = (
     "MountainPlanner.P1.Product.CoverEcology.CompositeActivation",
@@ -63,15 +88,98 @@ P1_PRODUCT_TESTS = (
     "MountainPlanner.P1.Product.Medium.ScriptedProvider",
     "MountainPlanner.P1.Product.WorldCoverCog.AnalyticalClasses",
 )
+FOCUSED_AUTOMATION_TESTS = {
+    "MountainPlanner.M3.S1mXmlReader": (
+        "MountainPlanner.M3.S1mXmlReader.BoundedSafetyPreflight",
+        "MountainPlanner.M3.S1mXmlReader.UnpinnedSchemaFailsClosed",
+    ),
+    "SkiPreparation.M4.StagedTerrain": (
+        "SkiPreparation.M4.StagedTerrain.CancelResumeReceipt",
+        "SkiPreparation.M4.StagedTerrain.EnforcesResourceLimits",
+        "SkiPreparation.M4.StagedTerrain.RejectsLibraryActivation",
+        "SkiPreparation.M4.StagedTerrain.RejectsMountainTransition",
+        "SkiPreparation.M4.StagedTerrain.RejectsStaleETag",
+        "SkiPreparation.M4.StagedTerrain.StageOrderingAndNoActivation",
+    ),
+    "SkiPreparation.M4.NativeStagedAdapter": (
+        "SkiPreparation.M4.NativeStagedAdapter.UnsupportedGeographyFailsClosed",
+        "SkiPreparation.M4.NativeStagedAdapter.RejectsNonNavd88Datum",
+        "SkiPreparation.M4.NativeStagedAdapter.MissingS1mXmlAndGpkgFailClosed",
+        "SkiPreparation.M4.NativeStagedAdapter.TnmBboxAndCogDoNotProveFullSiteCoverage",
+        "SkiPreparation.M4.NativeStagedAdapter.StaleCatalogEtagFailsSourcePreflight",
+        "SkiPreparation.M4.NativeStagedAdapter.SourcePreflightBindsStrongEtagAndExactSize",
+    ),
+    "MountainPlanner.M5.InstalledTerrain": (
+        "MountainPlanner.M5.InstalledTerrain.CompositeActivationAndLegacyRead",
+    ),
+    "MountainPlanner.M5.SiteContext": (
+        "MountainPlanner.M5.SiteContext.CompositeReceiptGateAndLegacyRead",
+        "MountainPlanner.M5.SiteContext.PyramidStoreAndIntegrity",
+        "MountainPlanner.M5.SiteContext.VectorSchema2PartsAndLegacy",
+        "MountainPlanner.M5.SiteContextCompositeAssembler.AtomicInstallAndPathMapping",
+    ),
+    "MountainPlanner.M5.TerrainCoreRepository": (
+        "MountainPlanner.M5.TerrainCoreRepository.LegacyProvenanceUnavailable",
+        "MountainPlanner.M5.TerrainCoreRepository.VerifiedProvenanceSidecar",
+    ),
+    "MountainPlanner.M5.ImageryPyramid": (
+        "MountainPlanner.M5.ImageryPyramid.Cancellation",
+        "MountainPlanner.M5.ImageryPyramid.ExactContentVerification",
+        "MountainPlanner.M5.ImageryPyramid.LayoutAndStorage",
+    ),
+    "MountainPlanner.M5.OsmVectorPackage": (
+        "MountainPlanner.M5.OsmVectorPackage.GeometryIdsBoundsAndAttribution",
+        "MountainPlanner.M5.OsmVectorPackage.HashStorageAndDeterminism",
+        "MountainPlanner.M5.OsmVectorPackage.ProviderGatewaySeamAndCancellation",
+        "MountainPlanner.M5.OsmVectorPackage.RequiredLayersAndLegacyIndependentParsing",
+    ),
+    "MountainPlanner.M5.OverpassVectorProvider": (
+        "MountainPlanner.M5.OverpassVectorProvider.BoundedQueryAndDeterministicNormalization",
+        "MountainPlanner.M5.OverpassVectorProvider.RejectsMalformedDuplicateAndMissingData",
+        "MountainPlanner.M5.OverpassVectorProvider.ResponseBoundsAndCancellation",
+    ),
+    "MountainPlanner.M5.ImageryAcquisition": (
+        "MountainPlanner.M5.ImageryAcquisition.BudgetsCancellationAndNoData",
+        "MountainPlanner.M5.ImageryAcquisition.ProductionGatewayEntryPointCancellation",
+        "MountainPlanner.M5.ImageryAcquisition.ScriptedReprojectionAndHash",
+    ),
+    "SkiPreparation.M6.TenKmResourcePreflight": (
+        "SkiPreparation.M6.TenKmResourcePreflight.DetectsOverflowAndInsufficientDisk",
+        "SkiPreparation.M6.TenKmResourcePreflight.FailsClosedOnUnknownCoverageAndSize",
+        "SkiPreparation.M6.TenKmResourcePreflight.LedgerAtTwoAndFourKm",
+        "SkiPreparation.M6.TenKmResourcePreflight.TenKmLedgerReportsCurrentImageryCap",
+    ),
+}
 DEFAULT_TERRAINCORE_CACHE_BYTES = 512 * 1024 * 1024
+PICKER_VIEWPORT_RESOLUTIONS = ((1280, 720), (1920, 1080), (2560, 1080),
+                              (2560, 1440), (576, 1024))
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MAX_PICKER_PNG_BYTES = 64 * 1024 * 1024
+MAX_PICKER_PNG_DECODED_BYTES = 64 * 1024 * 1024
+SHA256_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
+DEVELOPMENT_TRACE_LISTENER_PORT = 1985
+DEVELOPMENT_TRACE_LISTENER_POLICY = (
+    "Development picker-viewport only: packaged app process may listen on "
+    "127.0.0.1 or ::1 port 1985 for in-process Unreal Trace; remote TCP endpoints remain forbidden; "
+    "TCP is sampled every nominal 10 ms, so shorter-lived endpoints may be missed"
+)
+TCP_AUDIT_SAMPLING_LIMITATION = (
+    "Sampled process-attributed TCP polling at a nominal 10 ms interval; an endpoint that "
+    "opens and closes between snapshots may be missed."
+)
 FORBIDDEN_SHIPPING_PLUGINS = (
     "ModelContextProtocol", "EditorToolset", "AutomationTestToolset",
-    "SlateInspectorToolset", "UMGToolSet",
+    "SlateInspectorToolset", "UMGToolSet", "WebBrowserWidget",
 )
-P1_TESTS = tuple(sorted(TIFF_TESTS + ACQUISITION_TESTS + UI_TESTS + TERRAINCORE_TESTS + P1_PRODUCT_TESTS + (
-    "MountainPlanner.P1.Preparation.PackageAndProtocol",
-    "MountainPlanner.P1.Preparation.ProviderDiagnostics",
-)))
+P1_TESTS = tuple(sorted(
+    TIFF_TESTS + ACQUISITION_TESTS + PLACE_SEARCH_TESTS + SITE_PICKER_TESTS
+    + PRESENTATION_INSTALLED_TERRAIN_TESTS
+    + UI_TESTS + TERRAINCORE_TESTS + TERRAIN_SCRATCH_TESTS + P1_PRODUCT_TESTS
+    + (
+        "MountainPlanner.P1.Preparation.PackageContract",
+        "MountainPlanner.P1.Preparation.ProviderDiagnostics",
+    )
+))
 
 spec = importlib.util.spec_from_file_location("p0_harness", ROOT / "Tools/Build/p0.py")
 if spec is None or spec.loader is None:
@@ -90,7 +198,7 @@ def required_inputs() -> dict:
         "Source/SkiPreparation/Public/SkiPreparation/CoverEcologyStore.h",
         "Source/SkiPreparation/Public/SkiPreparation/WorldCoverCogDecoder.h",
         "Source/SkiPreparation/Public/SkiPreparation/TerrainAcquisition.h",
-        "Source/SkiPreparation/Public/SkiPreparation/SelectorProtocol.h",
+        "Source/SkiPreparation/Public/SkiPreparation/SkiSiteSelection.h",
         "Source/SkiTerrainRuntime/Public/SkiTerrainRuntime/SkiTerrainActor.h",
         "Source/SkiTerrainRuntime/Public/SkiTerrainRuntime/TerrainCoreTileCache.h",
         "Source/SkiTerrainRuntime/Public/SkiTerrainRuntime/TerrainCoreLodController.h",
@@ -100,10 +208,6 @@ def required_inputs() -> dict:
         "Source/SkiApplication/Public/SkiApplication/TerrainCoreSession.h",
         "Source/SkiDomain/Public/SkiDomain/TerrainCore.h",
         "Source/SkiDomain/Public/SkiDomain/CoverEcology.h",
-        "Content/P1Selector/index.html",
-        "Content/P1Selector/maplibre-gl.js",
-        "Content/P1Selector/maplibre-gl.css",
-        "Content/P1Selector/MAPLIBRE-LICENSE.txt",
         "Content/P1Fixtures/usgs-tiled-nodata-synthetic.tif.base64",
         "Content/P1Fixtures/worldcover-class-cog-synthetic.tif.base64",
         "Tools/Preparation/generate_tiff_fixture.py",
@@ -129,11 +233,10 @@ def required_inputs() -> dict:
     codex_config = (ROOT / ".codex/config.toml").read_text(encoding="utf-8")
     if '[mcp_servers.unreal-mcp]' not in codex_config or 'url = "http://127.0.0.1:8000/mcp"' not in codex_config:
         raise p0.Failed("Project-local Unreal MCP endpoint is missing or is not loopback-only")
-    selector = (ROOT / "Content/P1Selector/index.html").read_text(encoding="utf-8")
-    if 'src="maplibre-gl.js"' not in selector or "Content-Security-Policy" not in selector:
-        raise p0.Failed("Selector is not pinned to the staged local MapLibre bundle")
+    if plugins.get("WebBrowserWidget", {}).get("Enabled"):
+        raise p0.Failed("CEF WebBrowserWidget remains enabled after native frontend cutover")
     return {"status": "PASS", "required_inputs": required,
-            "selector_bundle_bytes": sum((ROOT / value).stat().st_size for value in required if value.startswith("Content/P1Selector/"))}
+            "frontend": "native Unreal"}
 
 
 def retained_checks() -> dict:
@@ -239,7 +342,8 @@ def shipping_target_module_proof(root: Path = ROOT) -> dict:
             or receipt.get("TargetType") != "Game" \
             or receipt.get("IsTestTarget") is not False:
         raise p0.Failed("UBT receipt does not identify the Shipping Game target")
-    present = sorted(set(plugins).intersection(FORBIDDEN_SHIPPING_PLUGINS))
+    forbidden_folded = {name.casefold() for name in FORBIDDEN_SHIPPING_PLUGINS}
+    present = sorted(name for name in plugins if name.casefold() in forbidden_folded)
     if present:
         raise p0.Failed("Editor MCP/toolset plugins entered the Shipping target: "
                         + ", ".join(present))
@@ -258,7 +362,9 @@ def shipping_target_module_proof(root: Path = ROOT) -> dict:
 def validate_tcp_audit(audit: dict, *, require_no_connections: bool,
                        label: str = "Packaged process") -> None:
     if audit.get("method") != "GetExtendedTcpTable process-attributed polling" \
-            or audit.get("snapshots", 0) < 1:
+            or audit.get("snapshots", 0) < 1 \
+            or audit.get("all_observed_pids_exited") is not True \
+            or audit.get("last_live_pids") != []:
         raise p0.Failed(f"{label}: TCP audit is missing or was not observed")
     if audit.get("listen_ports"):
         raise p0.Failed(f"{label}: opened TCP listeners: {audit['listen_ports']}")
@@ -270,46 +376,103 @@ def validate_tcp_audit(audit: dict, *, require_no_connections: bool,
             f"{label}: attempted TCP connections under a zero-network policy: {detail}")
 
 
-SELECTOR_TILE_HOSTS = ("tile.openstreetmap.org",)
-CEF_HELPER_IMAGES = ("epicwebhelper.exe", "unrealcefsubprocess.exe")
+def _tcp_endpoint_host_port(endpoint: str) -> tuple[str, int] | None:
+    if not isinstance(endpoint, str):
+        return None
+    if endpoint.startswith("["):
+        end = endpoint.find("]")
+        if end < 0 or endpoint[end + 1:end + 2] != ":":
+            return None
+        host, port_text = endpoint[1:end], endpoint[end + 2:]
+    else:
+        host, separator, port_text = endpoint.rpartition(":")
+        if not separator or ":" in host:
+            return None
+    try:
+        return host, int(port_text)
+    except ValueError:
+        return None
 
 
-def resolved_addresses(hosts: tuple[str, ...]) -> set[str]:
-    addresses = set()
-    for host in hosts:
+def validate_development_picker_viewport_tcp_audit(
+        audit: dict, *, configuration: str, scenario: str, expected_image: str,
+        label: str = "picker-viewport") -> dict:
+    """Allow only the packaged app's Development Unreal Trace listener for picker QA."""
+    if configuration != "Development" or scenario != "picker-viewport":
+        raise p0.Failed(
+            "Development Trace listener exception is restricted to picker-viewport")
+
+    # Reuse the strict lifetime check while validating connections and listeners below.
+    validate_tcp_audit({**audit, "listen_ports": [], "remote_endpoints": [],
+                        "endpoint_owners": []}, require_no_connections=True, label=label)
+    remote_endpoints = audit.get("remote_endpoints")
+    endpoint_owners = audit.get("endpoint_owners")
+    if not isinstance(remote_endpoints, list) or not isinstance(endpoint_owners, list):
+        raise p0.Failed(f"{label}: TCP audit lacks remote-connection evidence")
+    if remote_endpoints or endpoint_owners:
+        owners = endpoint_owners
+        detail = ", ".join(f"{owner.get('image')}#{owner.get('pid')}->{owner.get('remote')}"
+                           for owner in owners if isinstance(owner, dict))
+        raise p0.Failed(f"{label}: remote TCP endpoints are forbidden: "
+                        f"{detail or remote_endpoints}")
+
+    root_pid = audit.get("root_pid")
+    observed_pids = audit.get("observed_pids")
+    process_images = audit.get("process_images")
+    if type(root_pid) is not int or not isinstance(observed_pids, list) \
+            or any(type(pid) is not int for pid in observed_pids) \
+            or root_pid not in observed_pids or not isinstance(process_images, dict):
+        raise p0.Failed(f"{label}: TCP audit lacks packaged-process attribution")
+    child_pids = sorted(set(observed_pids) - {root_pid})
+    if child_pids:
+        raise p0.Failed(f"{label}: unexpected packaged child helper processes: {child_pids}")
+    root_image = process_images.get(str(root_pid), "")
+    if not isinstance(expected_image, str) or not expected_image \
+            or str(root_image).casefold() != Path(expected_image).name.casefold():
+        raise p0.Failed(
+            f"{label}: TCP audit root image is not the packaged app: {root_image}")
+
+    listener_owners = audit.get("listener_owners")
+    listen_ports = audit.get("listen_ports")
+    if not isinstance(listener_owners, list) or not listener_owners \
+            or not isinstance(listen_ports, list):
+        raise p0.Failed(f"{label}: expected the Development Unreal Trace listener was not observed")
+    observed_ports = set()
+    for owner in listener_owners:
+        if not isinstance(owner, dict):
+            raise p0.Failed(f"{label}: malformed TCP listener owner")
+        local = _tcp_endpoint_host_port(owner.get("local"))
+        if local is None:
+            raise p0.Failed(f"{label}: malformed TCP listener endpoint: {owner.get('local')}")
+        host, port = local
         try:
-            for info in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP):
-                addresses.add(info[4][0])
-        except OSError:
-            continue
-    return addresses
+            address = ipaddress.ip_address(host)
+        except ValueError as error:
+            raise p0.Failed(
+                f"{label}: malformed TCP listener address: {owner.get('local')}") from error
+        if port != DEVELOPMENT_TRACE_LISTENER_PORT \
+                or address not in (ipaddress.ip_address("127.0.0.1"),
+                                   ipaddress.ip_address("::1")) \
+                or owner.get("pid") != root_pid \
+                or str(owner.get("image", "")).casefold() != Path(expected_image).name.casefold():
+            raise p0.Failed(
+                f"{label}: listener outside the packaged app's loopback Unreal Trace exception: "
+                f"{owner.get('image')}#{owner.get('pid')}@{owner.get('local')}")
+        observed_ports.add(port)
+    if listen_ports != sorted(observed_ports):
+        raise p0.Failed(f"{label}: TCP listener summary does not match owner records")
 
-
-def endpoint_address(remote: str) -> str:
-    address = remote.rsplit(":", 1)[0]
-    return address[1:-1] if address.startswith("[") else address
-
-
-def validate_selector_audit(audit: dict, user_dir: Path, *, label: str,
-                            tile_addresses: set[str] | None = None) -> None:
-    """CEF may contact only the approved OSM tile host."""
-    validate_tcp_audit(audit, require_no_connections=False, label=label)
-    allowed = tile_addresses if tile_addresses is not None else resolved_addresses(SELECTOR_TILE_HOSTS)
-    for owner in audit.get("endpoint_owners") or []:
-        image = str(owner.get("image", "")).lower()
-        remote = str(owner.get("remote", ""))
-        if image not in CEF_HELPER_IMAGES:
-            raise p0.Failed(f"{label}: unexpected process {owner.get('image')} connected to {remote}")
-        if endpoint_address(remote) not in allowed or not remote.endswith(":443"):
-            raise p0.Failed(f"{label}: CEF connected outside the OSM allow-list: {remote}")
-    hosts = cef_contacted_hosts(user_dir)
-    if any(host != "https://tile.openstreetmap.org" for host in hosts):
-        raise p0.Failed(f"{label}: browser profile recorded contacts outside the allow-list: {hosts}")
+    return {
+        "developmentTraceListenerObserved": True,
+        "developmentTraceListenerPolicyException": DEVELOPMENT_TRACE_LISTENER_POLICY,
+        "networkRemoteEndpoints": [],
+        "networkRemoteZero": True,
+    }
 
 
 def require_no_browser_profile(user_dir: Path, label: str) -> None:
     if any(user_dir.rglob("webcache_*")):
-        raise p0.Failed(f"{label}: a CEF browser profile was created outside the Selecting state")
+        raise p0.Failed(f"{label}: a browser profile was created after native frontend cutover")
 
 
 def exact_tree_manifest(directory: Path) -> dict:
@@ -359,6 +522,412 @@ def require_acquisition_port_guard(receipt: dict) -> None:
             or type(calls) is not int or calls != 0:
         raise p0.Failed(
             "Offline reopen lacks production acquisition-port denial with zero calls")
+
+
+def require_offline_reopen_receipt(receipt: dict, content_id: str,
+                                   edit_set_id: str) -> None:
+    if receipt.get("scenario") != "offline-reopen" \
+            or receipt.get("contentId") != content_id \
+            or receipt.get("editSetId") != edit_set_id \
+            or receipt.get("ready") is not True \
+            or receipt.get("picked") is not True \
+            or receipt.get("reopened") is not True:
+        raise p0.Failed(
+            "Packaged offline-reopen receipt identities or qualification steps do not match the request")
+    if receipt.get("offlineReopen") is not True \
+            or receipt.get("editDeltaReconstructed") is not True:
+        raise p0.Failed(
+            "Packaged offline-reopen receipt lacks reopen or reconstructed edit-delta proof")
+    require_acquisition_port_guard(receipt)
+
+
+def _decode_png_scanlines(data: bytes, rows: list[tuple[int, int]],
+                          bit_depth: int, color_type: int,
+                          palette_entries: int | None) -> bool:
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+    bytes_per_pixel = max(1, (channels * bit_depth + 7) // 8)
+    offset = 0
+
+    for pass_width, pass_height in rows:
+        if pass_width == 0 or pass_height == 0:
+            continue
+        row_bytes = (pass_width * channels * bit_depth + 7) // 8
+        previous = bytearray(row_bytes)
+        for _ in range(pass_height):
+            if offset + row_bytes + 1 > len(data):
+                return False
+            filter_type = data[offset]
+            offset += 1
+            if filter_type > 4:
+                return False
+            encoded = data[offset:offset + row_bytes]
+            offset += row_bytes
+            decoded = bytearray(row_bytes)
+            for index, value in enumerate(encoded):
+                left = decoded[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+                above = previous[index]
+                upper_left = (previous[index - bytes_per_pixel]
+                              if index >= bytes_per_pixel else 0)
+                if filter_type == 0:
+                    predictor = 0
+                elif filter_type == 1:
+                    predictor = left
+                elif filter_type == 2:
+                    predictor = above
+                elif filter_type == 3:
+                    predictor = (left + above) // 2
+                else:
+                    estimate = left + above - upper_left
+                    distances = (abs(estimate - left), abs(estimate - above),
+                                 abs(estimate - upper_left))
+                    predictor = (left if distances[0] <= distances[1]
+                                 and distances[0] <= distances[2]
+                                 else above if distances[1] <= distances[2]
+                                 else upper_left)
+                decoded[index] = (value + predictor) & 0xff
+
+            if color_type == 3:
+                if palette_entries is None:
+                    return False
+                mask = (1 << bit_depth) - 1
+                for pixel in range(pass_width):
+                    bit_offset = pixel * bit_depth
+                    palette_index = (decoded[bit_offset // 8]
+                                     >> (8 - bit_depth - bit_offset % 8)) & mask
+                    if palette_index >= palette_entries:
+                        return False
+            previous = decoded
+
+    return offset == len(data)
+
+
+def _valid_png_image(png: bytes, expected_width: int, expected_height: int) -> bool:
+    """Validate PNG chunks, CRCs, zlib pixels, and scanline filters with bounded output."""
+    if not (0 < expected_width <= 2560 and 0 < expected_height <= 1440
+            and expected_width * expected_height <= 2560 * 1440
+            and len(png) <= MAX_PICKER_PNG_BYTES
+            and png.startswith(PNG_SIGNATURE)):
+        return False
+
+    offset = len(PNG_SIGNATURE)
+    saw_ihdr = False
+    saw_plte = False
+    saw_idat = False
+    idat_closed = False
+    saw_iend = False
+    palette_entries = None
+    decoder = None
+    decoded = bytearray()
+    expected_decoded_bytes = 0
+    rows: list[tuple[int, int]] = []
+    bit_depth = 0
+    color_type = 0
+    compressed_bytes = 0
+
+    try:
+        while offset < len(png):
+            if len(png) - offset < 12:
+                return False
+            chunk_length = struct.unpack_from(">I", png, offset)[0]
+            chunk_type = png[offset + 4:offset + 8]
+            chunk_end = offset + 12 + chunk_length
+            if chunk_end > len(png) or not all(
+                    65 <= byte <= 90 or 97 <= byte <= 122 for byte in chunk_type) \
+                    or chunk_type[2] & 0x20:
+                return False
+            chunk_data_start = offset + 8
+            chunk_data_end = chunk_data_start + chunk_length
+            chunk_data = png[chunk_data_start:chunk_data_end]
+            actual_crc = zlib.crc32(chunk_type + chunk_data) & 0xffffffff
+            expected_crc = struct.unpack_from(">I", png, chunk_data_end)[0]
+            if actual_crc != expected_crc:
+                return False
+
+            if not saw_ihdr:
+                if chunk_type != b"IHDR" or chunk_length != 13:
+                    return False
+            elif chunk_type == b"IHDR":
+                return False
+
+            if chunk_type == b"IHDR":
+                width, height, bit_depth, color_type, compression, filtering, interlace = \
+                    struct.unpack(">IIBBBBB", chunk_data)
+                valid_depths = {
+                    0: (1, 2, 4, 8, 16),
+                    2: (8, 16),
+                    3: (1, 2, 4, 8),
+                    4: (8, 16),
+                    6: (8, 16),
+                }
+                if width != expected_width or height != expected_height \
+                        or color_type not in valid_depths \
+                        or bit_depth not in valid_depths[color_type] \
+                        or compression != 0 or filtering != 0 or interlace not in (0, 1):
+                    return False
+                channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+                if interlace == 0:
+                    passes = ((0, 0, 1, 1),)
+                else:
+                    passes = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8),
+                              (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2),
+                              (0, 1, 1, 2))
+                pixel_bytes = 0
+                for start_x, start_y, step_x, step_y in passes:
+                    pass_width = (max(0, (width - start_x + step_x - 1) // step_x))
+                    pass_height = (max(0, (height - start_y + step_y - 1) // step_y))
+                    if pass_width and pass_height:
+                        row_bytes = (pass_width * channels * bit_depth + 7) // 8
+                        rows.append((pass_width, pass_height))
+                        pixel_bytes += row_bytes * pass_height
+                        expected_decoded_bytes += (row_bytes + 1) * pass_height
+                if pixel_bytes <= 0 \
+                        or expected_decoded_bytes > MAX_PICKER_PNG_DECODED_BYTES:
+                    return False
+                decoder = zlib.decompressobj()
+                saw_ihdr = True
+            elif chunk_type == b"PLTE":
+                if saw_idat or saw_plte or color_type in (0, 4) \
+                        or chunk_length == 0 or chunk_length > 768 \
+                        or chunk_length % 3:
+                    return False
+                palette_entries = chunk_length // 3
+                if color_type == 3 and palette_entries > (1 << bit_depth):
+                    return False
+                saw_plte = True
+            elif chunk_type == b"IDAT":
+                if idat_closed or (color_type == 3 and not saw_plte) or decoder is None:
+                    return False
+                saw_idat = True
+                compressed_bytes += chunk_length
+                if compressed_bytes > MAX_PICKER_PNG_BYTES:
+                    return False
+                decoded.extend(decoder.decompress(
+                    chunk_data, expected_decoded_bytes + 1 - len(decoded)))
+                if len(decoded) > expected_decoded_bytes \
+                        or decoder.unconsumed_tail or decoder.unused_data:
+                    return False
+            elif chunk_type == b"IEND":
+                if not saw_idat or chunk_length != 0 or chunk_end != len(png):
+                    return False
+                saw_iend = True
+            else:
+                if saw_idat:
+                    idat_closed = True
+                if not (chunk_type[0] & 0x20):
+                    return False
+
+            if saw_idat and chunk_type != b"IDAT":
+                idat_closed = True
+            offset = chunk_end
+            if chunk_type == b"IEND":
+                break
+
+        if not saw_ihdr or not saw_idat or not saw_iend or not compressed_bytes \
+                or decoder is None or not decoder.eof or decoder.unused_data \
+                or decoder.unconsumed_tail or len(decoded) != expected_decoded_bytes:
+            return False
+        return _decode_png_scanlines(decoded, rows, bit_depth, color_type, palette_entries)
+    except (OverflowError, struct.error, zlib.error):
+        return False
+
+
+def require_picker_viewport_capture(receipt: dict, token: str, width: int,
+                                    height: int, screenshot: Path) -> dict:
+    """Validate a Development picker PNG and step-specific native UMG evidence."""
+    rects = receipt.get("rects", {})
+    texts = receipt.get("texts", {})
+    states = receipt.get("stepStates", {})
+    step1 = states.get("step1", {}) if isinstance(states, dict) else {}
+    step2 = states.get("step2", {}) if isinstance(states, dict) else {}
+    step3 = states.get("step3", {}) if isinstance(states, dict) else {}
+    step1_rects = step1.get("rects", {}) if isinstance(step1, dict) else {}
+    step2_rects = step2.get("rects", {}) if isinstance(step2, dict) else {}
+    step3_rects = step3.get("rects", {}) if isinstance(step3, dict) else {}
+    bottom_rects = step3.get("bottomRects", {}) if isinstance(step3, dict) else {}
+    step1_texts = step1.get("texts", {}) if isinstance(step1, dict) else {}
+    step2_texts = step2.get("texts", {}) if isinstance(step2, dict) else {}
+    step3_texts = step3.get("texts", {}) if isinstance(step3, dict) else {}
+
+    def valid_rect(value: object) -> bool:
+        return (isinstance(value, list) and len(value) == 4
+                and all(type(part) in (int, float) and math.isfinite(part) for part in value)
+                and value[2] > 0 and value[3] > 0)
+
+    def inside(inner: object, outer: object, tolerance: float = 1.0) -> bool:
+        return (valid_rect(inner) and valid_rect(outer)
+                and inner[0] >= outer[0] - tolerance
+                and inner[1] >= outer[1] - tolerance
+                and inner[0] + inner[2] <= outer[0] + outer[2] + tolerance
+                and inner[1] + inner[3] <= outer[1] + outer[3] + tolerance)
+
+    def scroll_is_at_end(offset: object, maximum: object) -> bool:
+        return (type(offset) in (int, float) and type(maximum) in (int, float)
+                and math.isfinite(offset) and math.isfinite(maximum)
+                and maximum >= 0.0 and offset >= -1.0 and offset <= maximum + 1.0
+                and (maximum <= 1.0 or offset >= maximum - 1.0))
+
+    rect_names = ("panel", "map", "scroll", "heading", "subtitle", "steps")
+    step1_names = ("locationControls", "locationHeading", "locationSearch",
+                   "searchButton", "selectSiteButton")
+    step2_names = ("boundaryHeading", "boundaryInstructions", "clearBoundary",
+                   "boundaryStatus", "previewStatus")
+    step3_names = ("boundaryControls", "boundaryHeading", "boundaryInstructions",
+                   "nameControls", "resortNameHeading", "nameBox", "downloadButton",
+                   "downloadLabel")
+    bottom_names = ("nameControls", "resortNameHeading", "nameBox", "downloadButton",
+                    "downloadLabel")
+    step_items = rects.get("stepItems") if isinstance(rects, dict) else None
+    step3_bottom_visible = (
+        receipt.get("bottomContentReachable") is True
+        and step3.get("locationVisible") is False
+        and step3.get("boundaryVisible") is True
+        and step3.get("nameVisible") is True
+        and step3.get("selectionValid") is True
+        and step3.get("downloadEnabled") is False
+    )
+    step3_bottom_rects_contained = (
+        isinstance(step3_rects, dict)
+        and all(valid_rect(step3_rects.get(name)) for name in bottom_names)
+        and inside(step3_rects["resortNameHeading"], step3_rects["nameControls"])
+        and inside(step3_rects["nameBox"], step3_rects["nameControls"])
+        and inside(step3_rects["downloadButton"], step3_rects["nameControls"])
+        and inside(step3_rects["downloadLabel"], step3_rects["downloadButton"])
+        and isinstance(bottom_rects, dict)
+        and all(valid_rect(bottom_rects.get(name)) for name in bottom_names)
+        and isinstance(rects, dict) and valid_rect(rects.get("scroll"))
+        and all(inside(bottom_rects[name], rects["scroll"]) for name in bottom_names)
+        and inside(bottom_rects.get("resortNameHeading"), bottom_rects.get("nameControls"))
+        and inside(bottom_rects.get("nameBox"), bottom_rects.get("nameControls"))
+        and inside(bottom_rects.get("downloadButton"), bottom_rects.get("nameControls"))
+        and inside(bottom_rects.get("downloadLabel"), bottom_rects.get("downloadButton"))
+    )
+    native_scroll_at_end = (
+        receipt.get("capturedScrollPosition") == "end"
+        and scroll_is_at_end(receipt.get("scrollAtEnd"), receipt.get("scrollMaximum"))
+        and scroll_is_at_end(step3.get("scrollAtEnd"), step3.get("scrollMaximum"))
+        and type(receipt.get("scrollAtEnd")) in (int, float)
+        and type(step3.get("scrollAtEnd")) in (int, float)
+        and type(receipt.get("scrollMaximum")) in (int, float)
+        and type(step3.get("scrollMaximum")) in (int, float)
+        and abs(step3["scrollAtEnd"] - receipt["scrollAtEnd"]) <= 1.0
+        and abs(step3["scrollMaximum"] - receipt["scrollMaximum"]) <= 1.0
+    )
+    if not isinstance(rects, dict) or not isinstance(texts, dict) \
+            or receipt.get("token") != token or receipt.get("scenario") != "picker-viewport" \
+            or receipt.get("resolution") != [width, height] \
+            or receipt.get("viewport") != [width, height] \
+            or receipt.get("captureKind") != "rendered-viewport-png" \
+            or receipt.get("capturedStep") != "name-resort" \
+            or receipt.get("capturedScrollPosition") != "end" \
+            or receipt.get("nativePickerVisible") is not True \
+            or receipt.get("mapWidgetPresent") is not True \
+            or receipt.get("networkDisabled") is not True \
+            or receipt.get("topContentVisible") is not True \
+            or receipt.get("bottomContentReachable") is not True \
+            or receipt.get("visualReviewRequired") is not True \
+            or not isinstance(texts.get("heading"), str) or "New resort" not in texts["heading"] \
+            or texts.get("subtitle") != "Find the mountain you want to make your own." \
+            or not isinstance(texts.get("steps"), list) or len(texts["steps"]) != 4 \
+            or not all(isinstance(label, str) and label for label in texts["steps"]) \
+            or not all(label in text for text, label in zip(
+                texts["steps"], ("Choose location", "Define boundary", "Name resort", "Download"))) \
+            or not isinstance(step_items, list) or len(step_items) != 4 \
+            or not all(valid_rect(value) for value in step_items) \
+            or not all(valid_rect(rects.get(name)) for name in rect_names) \
+            or not isinstance(states, dict) or not all(isinstance(state, dict)
+                                                        for state in (step1, step2, step3)) \
+            or step1.get("locationVisible") is not True \
+            or step1.get("boundaryVisible") is not False or step1.get("nameVisible") is not False \
+            or step1.get("selectSiteInitiallyDisabled") is not True \
+            or step1.get("selectSiteEnabledAfterSearch") is not True \
+            or step1.get("locationQuery") != "47.25, -121.55" \
+            or not isinstance(step1.get("searchStatus"), str) \
+            or "Centered at" not in step1["searchStatus"] \
+            or not isinstance(step1.get("activeLabel"), str) \
+            or "Choose location" not in step1["activeLabel"] \
+            or not isinstance(step1_texts, dict) \
+            or not isinstance(step1_texts.get("locationHeading"), str) \
+            or "Search a place" not in step1_texts["locationHeading"] \
+            or not isinstance(step1_texts.get("searchButton"), str) \
+            or "Search / go to coordinates" not in step1_texts["searchButton"] \
+            or not isinstance(step1_texts.get("selectSiteButton"), str) \
+            or "Select site" not in step1_texts["selectSiteButton"] \
+            or not isinstance(step2_texts, dict) \
+            or step2.get("locationVisible") is not False \
+            or step2.get("boundaryVisible") is not True or step2.get("nameVisible") is not False \
+            or not isinstance(step2.get("activeLabel"), str) \
+            or "Define boundary" not in step2["activeLabel"] \
+            or not isinstance(step2_texts.get("boundaryHeading"), str) \
+            or "Define your boundary" not in step2_texts["boundaryHeading"] \
+            or not isinstance(step2_texts.get("boundaryInstructions"), str) \
+            or "Drag on the map" not in step2_texts["boundaryInstructions"] \
+            or type(step2.get("scrollAtStart")) not in (int, float) \
+            or step2["scrollAtStart"] > 1.0 \
+            or not isinstance(step3_texts, dict) \
+            or step3.get("locationVisible") is not False \
+            or step3.get("boundaryVisible") is not True or step3.get("nameVisible") is not True \
+            or step3.get("selectionValid") is not True or step3.get("downloadEnabled") is not False \
+            or not isinstance(step3.get("activeLabel"), str) \
+            or "Name resort" not in step3["activeLabel"] \
+            or not isinstance(step3_texts.get("boundaryHeading"), str) \
+            or "Define your boundary" not in step3_texts["boundaryHeading"] \
+            or not isinstance(step3_texts.get("resortNameHeading"), str) \
+            or "Name your resort" not in step3_texts["resortNameHeading"] \
+            or not isinstance(step3_texts.get("downloadLabel"), str) \
+            or "Download unavailable" not in step3_texts["downloadLabel"] \
+            or not isinstance(step1_rects, dict) or not isinstance(step2_rects, dict) \
+            or not isinstance(step3_rects, dict) or not isinstance(bottom_rects, dict) \
+            or not all(valid_rect(rects.get(name)) for name in rect_names) \
+            or not all(valid_rect(step1_rects.get(name)) for name in step1_names) \
+            or not all(valid_rect(step2_rects.get(name)) for name in step2_names) \
+            or not all(valid_rect(step3_rects.get(name)) for name in step3_names) \
+            or not all(valid_rect(bottom_rects.get(name)) for name in bottom_names) \
+            or type(receipt.get("scrollAtStart")) not in (int, float) \
+            or not math.isfinite(receipt["scrollAtStart"]) \
+            or receipt["scrollAtStart"] > 1.0 \
+            or not native_scroll_at_end \
+            or not step3_bottom_visible \
+            or not step3_bottom_rects_contained:
+        raise p0.Failed(f"Native picker viewport {width}x{height} receipt is invalid")
+
+    if not inside(rects["panel"], rects["map"]) \
+            or not all(inside(rects[name], rects["panel"])
+                       for name in ("heading", "subtitle", "steps", "scroll")) \
+            or any(not inside(value, rects["steps"]) for value in step_items) \
+            or not inside(step1_rects["locationControls"], rects["scroll"]) \
+            or any(not inside(step1_rects[name], step1_rects["locationControls"])
+                   for name in step1_names[1:]) \
+            or any(not inside(step2_rects[name], rects["scroll"]) for name in step2_names) \
+            or any(not inside(bottom_rects[name], rects["scroll"]) for name in bottom_names) \
+            or not inside(bottom_rects["downloadLabel"], bottom_rects["downloadButton"]):
+        raise p0.Failed(f"Native picker viewport {width}x{height} has out-of-bounds content")
+    if rects["map"][0] < -1 or rects["map"][1] < -1 \
+            or rects["map"][0] + rects["map"][2] > width + 1 \
+            or rects["map"][1] + rects["map"][3] > height + 1 \
+            or rects["panel"][0] < -1 or rects["panel"][1] < -1 \
+            or rects["panel"][0] + rects["panel"][2] > width + 1 \
+            or rects["panel"][1] + rects["panel"][3] > height + 1:
+        raise p0.Failed(f"Native picker viewport {width}x{height} leaves the viewport")
+
+    supplied_screenshot = receipt.get("screenshotPath")
+    if not isinstance(supplied_screenshot, str) \
+            or Path(supplied_screenshot).resolve() != screenshot.resolve() \
+            or not screenshot.is_file():
+        raise p0.Failed(f"Native picker viewport {width}x{height} screenshot is missing")
+    try:
+        with screenshot.open("rb") as image:
+            png = image.read(MAX_PICKER_PNG_BYTES + 1)
+    except OSError as error:
+        raise p0.Failed(
+            f"Native picker viewport {width}x{height} screenshot is unreadable: {error}") from error
+    screenshot_sha = hashlib.sha256(png).hexdigest()
+    if len(png) > MAX_PICKER_PNG_BYTES \
+            or not _valid_png_image(png, width, height) \
+            or receipt.get("screenshotSha256") != screenshot_sha:
+        raise p0.Failed(
+            f"Native picker viewport {width}x{height} screenshot does not match its receipt or is not a complete, valid PNG")
+    receipt["screenshot"] = str(screenshot)
+    return receipt
 
 
 def _windows_ipv4_tcp_rows(pid: int) -> list[dict]:
@@ -426,11 +995,88 @@ def _windows_ipv6_tcp_rows(pid: int) -> list[dict]:
     return rows
 
 
-_PROCESS_IMAGES: dict[int, str] = {}
+_PROCESS_IMAGES: dict[tuple[int, int], str] = {}
 
 
-def _windows_process_descendants(root_pid: int, known: set[int]) -> set[int]:
-    """Track a packaged bootstrap process and any child game/helper processes it creates."""
+class _WindowsFileTime(ctypes.Structure):
+    _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
+
+
+def _windows_process_creation_time_from_handle(handle) -> int:
+    """Return a process object's creation FILETIME using its already-open handle."""
+    kernel = ctypes.windll.kernel32
+    kernel.GetProcessTimes.argtypes = [ctypes.c_void_p,
+                                       ctypes.POINTER(_WindowsFileTime),
+                                       ctypes.POINTER(_WindowsFileTime),
+                                       ctypes.POINTER(_WindowsFileTime),
+                                       ctypes.POINTER(_WindowsFileTime)]
+    kernel.GetProcessTimes.restype = ctypes.c_int
+    created = _WindowsFileTime()
+    exited = _WindowsFileTime()
+    kernel_time = _WindowsFileTime()
+    user_time = _WindowsFileTime()
+    if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                  ctypes.byref(kernel_time), ctypes.byref(user_time)):
+        raise p0.Failed("GetProcessTimes failed during packaged TCP audit")
+    return (int(created.high) << 32) | int(created.low)
+
+
+def _windows_open_process_handle(pid: int, access: int):
+    kernel = ctypes.windll.kernel32
+    kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    return kernel.OpenProcess(access, False, pid)
+
+
+def _windows_close_process_handle(handle) -> None:
+    kernel = ctypes.windll.kernel32
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    kernel.CloseHandle(handle)
+
+
+def _windows_process_creation_time(pid: int) -> int | None:
+    """Return the current PID's creation FILETIME, or None if it has already exited."""
+    handle = _windows_open_process_handle(pid, 0x1000)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        kernel = ctypes.windll.kernel32
+        kernel.GetLastError.restype = ctypes.c_ulong
+        error = int(kernel.GetLastError())
+        if error == 87:  # ERROR_INVALID_PARAMETER: the PID exited after the process snapshot.
+            return None
+        raise p0.Failed(
+            f"OpenProcess failed while identifying packaged descendant {pid}: {error}")
+    try:
+        return _windows_process_creation_time_from_handle(handle)
+    finally:
+        _windows_close_process_handle(handle)
+
+
+def _windows_terminate_process_handle(handle) -> bool:
+    kernel = ctypes.windll.kernel32
+    kernel.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel.TerminateProcess.restype = ctypes.c_int
+    return bool(kernel.TerminateProcess(handle, 1))
+
+
+def _windows_terminate_if_same_process(pid: int, creation_time: int) -> bool:
+    """Terminate only the process object whose PID and creation time were audited."""
+    handle = _windows_open_process_handle(
+        pid, 0x0001 | 0x1000)  # PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        if _windows_process_creation_time_from_handle(handle) != creation_time:
+            return False
+        return _windows_terminate_process_handle(handle)
+    finally:
+        _windows_close_process_handle(handle)
+
+
+def _windows_process_descendants(
+        root_identity: tuple[int, int], known: set[tuple[int, int]]) \
+        -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
+    """Return observed (PID, creation-time) identities and live identities this snapshot."""
     class ProcessEntry(ctypes.Structure):
         _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
                     ("th32ProcessID", ctypes.c_ulong), ("th32DefaultHeapID", ctypes.c_void_p),
@@ -447,101 +1093,146 @@ def _windows_process_descendants(root_pid: int, known: set[int]) -> set[int]:
     if snapshot == ctypes.c_void_p(-1).value:
         raise p0.Failed("CreateToolhelp32Snapshot failed during packaged TCP audit")
     parents = {}
+    images = {}
     try:
         entry = ProcessEntry()
         entry.dwSize = ctypes.sizeof(ProcessEntry)
         present = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
         while present:
-            parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
-            _PROCESS_IMAGES[int(entry.th32ProcessID)] = str(entry.szExeFile)
+            pid = int(entry.th32ProcessID)
+            parents[pid] = int(entry.th32ParentProcessID)
+            images[pid] = str(entry.szExeFile)
             present = kernel.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel.CloseHandle(snapshot)
-    tracked = set(known) | {root_pid}
+    tracked = set(known) | {root_identity}
+    current_by_pid: dict[int, tuple[int, int]] = {}
+    for pid in {tracked_pid for tracked_pid, _ in tracked}.intersection(parents):
+        creation_time = _windows_process_creation_time(pid)
+        identity = (pid, creation_time) if creation_time is not None else None
+        if identity in tracked:
+            current_by_pid[pid] = identity
+            _PROCESS_IMAGES[identity] = images[pid]
     changed = True
     while changed:
         changed = False
         for candidate, parent in parents.items():
-            if parent in tracked and candidate not in tracked:
-                tracked.add(candidate)
+            if parent in current_by_pid and candidate not in current_by_pid:
+                creation_time = _windows_process_creation_time(candidate)
+                if creation_time is None:
+                    continue
+                identity = (candidate, creation_time)
+                tracked.add(identity)
+                current_by_pid[candidate] = identity
+                _PROCESS_IMAGES[identity] = images[candidate]
                 changed = True
-    return tracked
+    return tracked, set(current_by_pid.values())
 
 
-def checked_with_tcp_audit(command: list[str], *, timeout: float, log: str) -> dict:
+def checked_with_tcp_audit(command: list[str], *, timeout: float, log: str,
+                           include_listener_owners: bool = False,
+                           allow_nonzero_exit: bool = False) -> dict:
     """Run one packaged process while independently polling its owned TCP table."""
+    if os.name != "nt":
+        raise p0.Blocked("Process-attributed packaged TCP audit requires Windows")
     log_path = p0.RUN_OUTPUT / log
     log_path.parent.mkdir(parents=True, exist_ok=True)
     options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
     began = time.monotonic()
     snapshots = 0
     observed = set()
-    tracked_pids = set()
-    first_seen: dict[tuple[int, str], float] = {}
+    tracked_processes: set[tuple[int, int]] = set()
+    first_seen: dict[tuple[tuple[int, int], str], float] = {}
+    _PROCESS_IMAGES.clear()
     with log_path.open("w", encoding="utf-8") as stream:
         process = subprocess.Popen(command, cwd=ROOT, stdout=stream,
                                    stderr=subprocess.STDOUT, text=True, **options)
+        root_identity = None
         try:
-            while process.poll() is None:
-                tracked_pids = _windows_process_descendants(process.pid, tracked_pids)
-                for tracked_pid in tracked_pids:
-                    for row in (_windows_ipv4_tcp_rows(tracked_pid)
-                                + _windows_ipv6_tcp_rows(tracked_pid)):
-                        observed.add((tracked_pid, row["state"], row["local"], row["remote"]))
-                        key = (tracked_pid, row["remote"])
-                        if row["state"] != 2 and not row["remote"].endswith(":0")                                 and key not in first_seen:
+            root_identity = (process.pid,
+                             _windows_process_creation_time_from_handle(process._handle))
+            tracked_processes.add(root_identity)
+            while True:
+                tracked_processes, live_processes = _windows_process_descendants(
+                    root_identity, tracked_processes)
+                for identity in live_processes:
+                    tracked_pid, creation_time = identity
+                    if _windows_process_creation_time(tracked_pid) != creation_time:
+                        continue
+                    rows = (_windows_ipv4_tcp_rows(tracked_pid)
+                            + _windows_ipv6_tcp_rows(tracked_pid))
+                    if _windows_process_creation_time(tracked_pid) != creation_time:
+                        continue
+                    for row in rows:
+                        observed.add((identity, row["state"], row["local"], row["remote"]))
+                        key = (identity, row["remote"])
+                        if row["state"] != 2 and not row["remote"].endswith(":0") \
+                                and key not in first_seen:
                             first_seen[key] = round((time.monotonic() - began) * 1000.0, 1)
                 snapshots += 1
+                if process.poll() is not None and not live_processes:
+                    break
                 if time.monotonic() - began > timeout:
                     raise p0.TimedOut(f"Timed out after {timeout}s: {command[0]}")
                 time.sleep(0.01)
         except BaseException:
-            if os.name == "nt":
+            for tracked_pid, creation_time in sorted(tracked_processes, reverse=True):
+                if root_identity is not None \
+                        and (tracked_pid, creation_time) == root_identity:
+                    # Popen.kill uses its retained process handle, so it cannot hit a reused PID.
+                    if process.poll() is None:
+                        process.kill()
+                    continue
                 try:
-                    subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   timeout=2, creationflags=subprocess.CREATE_NO_WINDOW)
-                except (OSError, subprocess.TimeoutExpired):
-                    process.kill()
-            elif process.poll() is None:
+                    _windows_terminate_if_same_process(tracked_pid, creation_time)
+                except (OSError, p0.Failed):
+                    pass
+            if process.poll() is None:
                 process.kill()
             process.wait(timeout=2)
             raise
-    if process.returncode != 0:
+    if process.returncode != 0 and not allow_nonzero_exit:
         output = log_path.read_text(encoding="utf-8", errors="replace")
         raise p0.Failed(f"Exit {process.returncode}: {command[0]}\n{output[-3000:]}")
     listen_ports = sorted({int(local.rsplit(":", 1)[1]) for _, state, local, _ in observed
                            if state == 2})
     remote_endpoints = sorted({remote for _, state, _, remote in observed
                                if state != 2 and not remote.endswith(":0")})
+    observed_identities = sorted(tracked_processes)
+    root_image = _PROCESS_IMAGES.get(root_identity, "unknown")
+    process_images = {str(pid): image for (pid, _), image in
+                      sorted((identity, _PROCESS_IMAGES.get(identity, "unknown"))
+                             for identity in tracked_processes)}
+    process_images[str(root_identity[0])] = root_image
     audit = {"method": "GetExtendedTcpTable process-attributed polling",
-            "root_pid": process.pid, "observed_pids": sorted(tracked_pids),
+            "root_pid": process.pid, "root_process_creation_time": root_identity[1],
+            "observed_pids": sorted({pid for pid, _ in observed_identities}),
+            "observed_process_identities": [
+                {"pid": pid, "creation_time_filetime": creation_time,
+                 "image": _PROCESS_IMAGES.get((pid, creation_time), "unknown")}
+                for pid, creation_time in observed_identities],
+            "all_observed_pids_exited": True, "last_live_pids": [],
+            "all_observed_processes_exited": True,
             "snapshots": snapshots,
-            "poll_interval_milliseconds": 10, "listen_ports": listen_ports,
+            "poll_interval_milliseconds": 10, "sampling_mode": "sampled",
+            "sampling_limitation": TCP_AUDIT_SAMPLING_LIMITATION,
+            "listen_ports": listen_ports,
             "remote_endpoints": remote_endpoints,
             "endpoint_owners": [
-                {"pid": pid, "image": _PROCESS_IMAGES.get(pid, "unknown"),
-                 "remote": remote, "first_seen_ms": first_seen[(pid, remote)]}
-                for pid, remote in sorted(first_seen)],
-             "process_images": {str(pid): _PROCESS_IMAGES.get(pid, "unknown")
-                                for pid in sorted(tracked_pids)}}
+                {"pid": identity[0], "process_creation_time_filetime": identity[1],
+                 "image": _PROCESS_IMAGES.get(identity, "unknown"),
+                 "remote": remote, "first_seen_ms": first_seen[(identity, remote)]}
+                for identity, remote in sorted(first_seen)],
+            "process_images": process_images,
+            "process_return_code": process.returncode}
+    if include_listener_owners:
+        audit["listener_owners"] = [
+            {"pid": identity[0], "process_creation_time_filetime": identity[1],
+             "image": _PROCESS_IMAGES.get(identity, "unknown"), "local": local}
+            for identity, state, local, _ in sorted(observed) if state == 2]
     log_path.with_suffix(".tcp-audit.json").write_text(
         json.dumps(audit, indent=2) + "\n", encoding="utf-8")
     return audit
-
-
-def cef_contacted_hosts(user_dir: Path) -> list[str]:
-    """Hosts Chromium recorded as contacted in an isolated CEF profile (diagnostic only)."""
-    hosts = set()
-    for state in user_dir.rglob("Network Persistent State"):
-        try:
-            data = json.loads(state.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, ValueError):
-            continue
-        for server in data.get("net", {}).get("http_server_properties", {}).get("servers", []):
-            if isinstance(server, dict) and isinstance(server.get("server"), str):
-                hosts.add(server["server"])
-    return sorted(hosts)
 
 
 def automation(environment: dict, run_output: Path) -> dict:
@@ -556,6 +1247,25 @@ def automation(environment: dict, run_output: Path) -> dict:
     require_exact_automation(output, P1_TESTS, "MountainPlanner.P1")
     return {"status": "PASS", "kind": "unreal_automation", "filter": "MountainPlanner.P1",
             "tests": list(P1_TESTS)}
+
+
+def focused_automation(environment: dict, run_output: Path, test_filter: str) -> dict:
+    """Build and run one registered focused automation group with exact result checking."""
+    expected = FOCUSED_AUTOMATION_TESTS.get(test_filter)
+    if not expected:
+        raise p0.Failed(f"Unknown or unregistered focused automation group: {test_filter}")
+    build = p0.native_build(environment, "Editor", "Development")
+    engine = p0.engine_path(environment)
+    group_name = test_filter.rsplit(".", 1)[-1].lower()
+    output = p0.checked([
+        str(engine / "Engine/Binaries/Win64/UnrealEditor-Cmd.exe"), str(PROJECT),
+        f"-ExecCmds=Automation RunTests {test_filter};Quit",
+        "-TestExit=Automation Test Queue Empty", "-unattended", "-nop4", "-NullRHI",
+        "-stdout", "-FullStdOutLogOutput",
+    ], timeout=300, log=f"focused-{group_name}-automation.log")
+    require_exact_automation(output, expected, test_filter)
+    return {"status": "PASS", "kind": "focused_automation", "filter": test_filter,
+            "tests": list(expected), "build": build}
 
 
 def tiff(environment: dict, run_output: Path) -> dict:
@@ -694,6 +1404,7 @@ def verify_package_report(configuration: str, source_digest: str) -> tuple[dict,
               if path.is_file() and any(name in path.name.lower() for name in forbidden)]
     if leaked:
         raise p0.Failed("Editor-only MCP/toolset modules leaked into package: " + ", ".join(leaked[:10]))
+    assert_no_browser_bundle(package_root)
     if configuration == "Shipping":
         recorded_proof = report["result"].get("shipping_mcp_proof")
         current_proof = shipping_target_module_proof()
@@ -702,20 +1413,57 @@ def verify_package_report(configuration: str, source_digest: str) -> tuple[dict,
     return report, launcher
 
 
+def assert_no_browser_bundle(package_root: Path) -> None:
+    forbidden = ("cef3", "epicwebhelper", "unrealcefsubprocess", "p1selector", "maplibre-gl")
+    leaked = []
+    markers = tuple(name.encode("ascii") for name in forbidden)
+    for path in package_root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(package_root).as_posix()
+        if any(name in relative.lower() for name in forbidden):
+            leaked.append(relative)
+            continue
+        if path.suffix.lower() not in (".pak", ".utoc"):
+            continue
+        # Archive indexes retain logical paths even when the payload is compressed.
+        # Keep a suffix between reads so a marker split across chunks is detected.
+        with path.open("rb") as stream:
+            suffix = b""
+            while chunk := stream.read(1024 * 1024):
+                window = (suffix + chunk).lower()
+                if any(marker in window for marker in markers):
+                    leaked.append(relative)
+                    break
+                suffix = window[-32:]
+    if leaked:
+        raise p0.Failed("Browser helper or selector content leaked into native package: "
+                        + ", ".join(leaked[:10]))
+
+
+def parse_sha256_id(value: str) -> str:
+    if not SHA256_ID_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError("must be exactly 64 lowercase hexadecimal characters")
+    return value
+
+
 def smoke(configuration: str, source_digest: str, scenario: str, content_id: str | None,
-          run_output: Path) -> dict:
+          run_output: Path, edit_set_id: str | None = None) -> dict:
+    if scenario == "picker-viewport" and configuration != "Development":
+        raise p0.Failed("Native picker viewport screenshots are Development-only")
     package_report, launcher = verify_package_report(configuration, source_digest)
     token = str(uuid.uuid4())
     data_root = ((run_output / "isolated-data") if scenario in
-                 ("terraincore-regression", "medium-regression", "ui-layout",
-                  "performance-regression")
+                 ("frontend", "terraincore-regression", "medium-regression", "ui-layout",
+                  "picker-viewport", "performance-regression")
                  else (OUTPUT / "isolated-data" / configuration)).resolve()
     data_root.mkdir(parents=True, exist_ok=True)
     unreal_user_dir = data_root / "unreal-user" / token
     unreal_user_dir.mkdir(parents=True, exist_ok=True)
     receipt = data_root / f"{token}.receipt.json"
-    smoke_flag = ("-SkiP1SelectorSmoke" if scenario == "selector" else
+    smoke_flag = ("-SkiM1FrontEndSmoke" if scenario == "frontend" else
                   "-SkiP1UiLayoutSmoke" if scenario == "ui-layout" else
+                  "-SkiP1PickerViewportSmoke" if scenario == "picker-viewport" else
                   "-SkiP1PerformanceSmoke" if scenario == "performance-regression"
                   else "-SkiP1Smoke")
     smoke_width, smoke_height = ((2560, 1440) if scenario == "performance-regression"
@@ -725,10 +1473,15 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                f"-SkiP1Scenario={scenario}", f"-UserDir={unreal_user_dir}",
                "-windowed", f"-ResX={smoke_width}", f"-ResY={smoke_height}",
                "-unattended", "-nosplash"]
+    if scenario == "frontend":
+        command.extend(("-RenderOffScreen", "-NullRHI"))
     if scenario == "offline-reopen":
-        if not content_id or len(content_id) != 64:
+        if not content_id or not SHA256_ID_PATTERN.fullmatch(content_id):
             raise p0.Failed("Offline reopen requires the exact contentId from an import receipt")
-        command.append(f"-SkiP1ContentId={content_id}")
+        if not edit_set_id or not SHA256_ID_PATTERN.fullmatch(edit_set_id):
+            raise p0.Failed("Offline reopen requires the exact editSetId from an import receipt")
+        command.extend((f"-SkiP1ContentId={content_id}",
+                        f"-SkiP1EditSetId={edit_set_id}"))
 
     def collect_failure_context(reason: str, user_dir: Path | None = None) -> str:
         source_dir = user_dir if user_dir is not None else unreal_user_dir
@@ -757,7 +1510,6 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
             "reason": reason,
             "isolated_user_dir": str(source_dir),
             "copied_files": copied,
-            "cef_contacted_hosts": cef_contacted_hosts(source_dir),
         }, indent=2) + "\n", encoding="utf-8")
         return str(destination)
 
@@ -906,14 +1658,10 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                     audit = checked_with_tcp_audit(
                         child_command, timeout=120,
                         log=f"p1-ui-layout-{width}x{height}-{state}-{child_token}.log")
-                    if state == "selecting":
-                        validate_selector_audit(
-                            audit, child_user_dir, label=f"ui-layout {width}x{height} {state}")
-                    else:
-                        validate_tcp_audit(audit, require_no_connections=True,
-                                           label=f"ui-layout {width}x{height} {state}")
-                        require_no_browser_profile(
-                            child_user_dir, f"ui-layout {width}x{height} {state}")
+                    validate_tcp_audit(audit, require_no_connections=True,
+                                       label=f"ui-layout {width}x{height} {state}")
+                    require_no_browser_profile(
+                        child_user_dir, f"ui-layout {width}x{height} {state}")
                 except p0.Failed as error:
                     context = collect_failure_context(
                         f"ui-layout {width}x{height} {state}: {error}", child_user_dir)
@@ -943,6 +1691,63 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
         observed = {"token": token, "scenario": scenario, "layoutValid": True,
                     "inputIsolation": True, "recoveryActionsReachable": True,
                     "layouts": layouts, "processNetworkAudit": audits[-1],
+                    "childNetworkAudits": audits}
+    elif scenario == "picker-viewport":
+        captures = []
+        audits = []
+        for width, height in PICKER_VIEWPORT_RESOLUTIONS:
+            child_token = str(uuid.uuid4())
+            child_receipt = data_root / f"{child_token}.receipt.json"
+            child_screenshot = data_root / f"{child_token}.png"
+            child_user_dir = data_root / "unreal-user" / child_token
+            child_user_dir.mkdir(parents=True, exist_ok=True)
+            child_command = [str(launcher), "-SkiP1PickerViewportSmoke",
+                             f"-SkiP1Token={child_token}",
+                             f"-SkiP1Receipt={child_receipt}",
+                             f"-SkiP1Screenshot={child_screenshot}",
+                             f"-SkiP1DataRoot={data_root}",
+                             f"-UserDir={child_user_dir}", "-windowed",
+                             f"-ResX={width}", f"-ResY={height}",
+                             "-unattended", "-nosplash"]
+            label = f"picker-viewport {width}x{height}"
+            try:
+                audit = checked_with_tcp_audit(
+                    child_command, timeout=45,
+                    log=f"p1-picker-viewport-{width}x{height}-{child_token}.log",
+                    include_listener_owners=True)
+                trace_policy = validate_development_picker_viewport_tcp_audit(
+                    audit, configuration=configuration, scenario=scenario,
+                    expected_image=launcher.name, label=label)
+                audit.update(trace_policy)
+            except p0.Failed as error:
+                context = collect_failure_context(f"{label}: {error}", child_user_dir)
+                raise p0.Failed(f"{error}; packaged failure context: {context}") from error
+            if not child_receipt.is_file():
+                raise p0.Failed(f"{label} omitted its tokened receipt")
+            try:
+                child = json.loads(child_receipt.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError) as error:
+                raise p0.Failed(f"{label} receipt is unreadable: {error}") from error
+            child = require_picker_viewport_capture(
+                child, child_token, width, height, child_screenshot)
+            child.update(trace_policy)
+            child["processNetworkAudit"] = audit
+            captures.append(child)
+            audits.append(audit)
+        observed = {"token": token, "scenario": scenario,
+                    "captureKind": "rendered-viewport-png",
+                    "capturedStep": "name-resort",
+                    "capturedScrollPosition": "end",
+                    "visualReviewRequired": True,
+                    "developmentTraceListenerObserved": all(
+                        capture.get("developmentTraceListenerObserved") is True
+                        for capture in captures),
+                    "developmentTraceListenerPolicyException":
+                        DEVELOPMENT_TRACE_LISTENER_POLICY,
+                    "networkRemoteEndpoints": [], "networkRemoteZero": all(
+                        capture.get("networkRemoteZero") is True for capture in captures),
+                    "resolutions": [list(size) for size in PICKER_VIEWPORT_RESOLUTIONS],
+                    "captures": captures, "processNetworkAudit": audits[-1],
                     "childNetworkAudits": audits}
     elif scenario == "medium-regression":
         def run_medium_child(child_scenario: str, child_token: str,
@@ -1050,20 +1855,18 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
         }
     else:
         observed = None
+    receipt_path_escape_audit = None
 
     if observed is None:
         try:
             process_audit = checked_with_tcp_audit(
                 command, timeout=120, log=f"p1-{scenario}-{token}.log")
-            if scenario != "selector":
-                validate_tcp_audit(process_audit,
-                                   require_no_connections=scenario == "offline-reopen",
-                                   label=scenario)
-                if scenario in ("geotiff-regression", "acquisition-regression",
-                                "offline-reopen", "performance-regression"):
-                    require_no_browser_profile(unreal_user_dir, scenario)
-            else:
-                validate_selector_audit(process_audit, unreal_user_dir, label="selector")
+            validate_tcp_audit(process_audit,
+                               require_no_connections=scenario in ("frontend", "offline-reopen"),
+                               label=scenario)
+            if scenario in ("frontend", "geotiff-regression", "acquisition-regression",
+                            "offline-reopen", "performance-regression"):
+                require_no_browser_profile(unreal_user_dir, scenario)
         except p0.Failed as error:
             context = collect_failure_context(str(error))
             raise p0.Failed(f"{error}; packaged failure context: {context}") from error
@@ -1071,17 +1874,30 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
             context = collect_failure_context("Packaged player exited without its tokened P1 receipt")
             raise p0.Failed(f"Packaged player exited without its tokened P1 receipt; context: {context}")
         observed = json.loads(receipt.read_text(encoding="utf-8-sig"))
-    if scenario == "selector":
-        if observed.get("token") != token or observed.get("selector") is not True \
-                or observed.get("profile") != "medium" \
-                or observed.get("closedBeforeAcceptance") is not True \
-                or observed.get("bridgeUnbound") is not True \
-                or observed.get("cefBrowserClosed") is not True \
-                or observed.get("windowReleased") is not True \
-                or observed.get("blockedNavigation", 0) < 1 \
-                or observed.get("popupDelegateProbeDenied") is not True \
-                or observed.get("blockedPopup", 0) < 1:
-            raise p0.Failed("Packaged selector receipt is stale or CEF/WebGL/bridge validation failed")
+    if scenario == "frontend":
+        if observed.get("token") != token or observed.get("scenario") != "frontend" \
+                or not observed.get("passed") or not observed.get("nativeTitle") \
+                or not observed.get("nativePickerPlaceholder") \
+                or not observed.get("installedIdForwarded") \
+                or not observed.get("browserWidgetAbsent") \
+                or not observed.get("mountainTravel") \
+                or not observed.get("offlineReopen") \
+                or not re.fullmatch(r"[0-9a-f]{64}", observed.get("contentId", "")):
+            raise p0.Failed("Packaged native frontend receipt is invalid")
+        outside_receipt = run_output / f"{token}.receipt.json"
+        escape_command = [f"-SkiP1Receipt={outside_receipt}"
+                          if value.startswith("-SkiP1Receipt=") else value
+                          for value in command]
+        receipt_path_escape_audit = checked_with_tcp_audit(
+            escape_command, timeout=30,
+            log=f"p1-frontend-receipt-path-escape-{token}.log",
+            allow_nonzero_exit=True)
+        validate_tcp_audit(receipt_path_escape_audit, require_no_connections=True,
+                           label="frontend receipt-path escape probe")
+        # Unreal's Windows GUI launcher does not reliably propagate RequestExitWithStatus
+        # through the outer launcher process. The security invariant is no outside write.
+        if outside_receipt.exists():
+            raise p0.Failed("Packaged frontend accepted a receipt outside its data root")
     elif scenario == "geotiff-regression":
         if observed.get("token") != token or observed.get("scenario") != scenario \
                 or not observed.get("decoded") \
@@ -1117,6 +1933,18 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
                 or not observed.get("inputIsolation") or actual_pairs != expected_pairs \
                 or len(layouts) != len(expected_pairs):
             raise p0.Failed("Packaged UI-layout regression receipt is invalid")
+    elif scenario == "picker-viewport":
+        captures = observed.get("captures", [])
+        actual_resolutions = [capture.get("resolution") for capture in captures]
+        expected_resolutions = [list(size) for size in PICKER_VIEWPORT_RESOLUTIONS]
+        if observed.get("token") != token or observed.get("scenario") != scenario \
+                or observed.get("captureKind") != "rendered-viewport-png" \
+                or observed.get("visualReviewRequired") is not True \
+                or actual_resolutions != expected_resolutions \
+                or len(captures) != len(expected_resolutions):
+            raise p0.Failed("Packaged native picker viewport matrix is invalid")
+    elif scenario == "offline-reopen":
+        require_offline_reopen_receipt(observed, content_id, edit_set_id)
     elif scenario == "terraincore-regression":
         content_id = observed.get("contentId", "")
         edit_set_id = observed.get("editSetId", "")
@@ -1204,15 +2032,163 @@ def smoke(configuration: str, source_digest: str, scenario: str, content_id: str
     verify_package_report(configuration, source_digest)
     return {"status": "PASS", "kind": "packaged_p1", "scenario": scenario,
             "receipt": observed, "package_invocation": package_report["invocation"],
+            "receipt_path_escape_audit": receipt_path_escape_audit,
             "process_network_audit": (observed.get("processNetworkAudit")
                                       if scenario in ("terraincore-regression", "medium-regression",
-                                                      "ui-layout")
+                                                      "ui-layout", "picker-viewport")
                                       else process_audit),
-            "network_policy": ("production acquisition port denied; process-attributed TCP "
-                               "observation found no listeners or remote endpoints"
+            "network_policy": ("Frontend and receipt-path escape smoke runs require zero sampled "
+                               "TCP listeners or remote endpoints at a nominal 10 ms interval; "
+                               "shorter-lived endpoints may be missed"
+                               if scenario == "frontend" else
+                               "Development picker-viewport permits only the packaged app's "
+                               "loopback Unreal Trace listener on port 1985; remote TCP endpoints: "
+                               "zero; sampled at a nominal 10 ms, so shorter-lived endpoints may be missed"
+                               if scenario == "picker-viewport" else
+                               "production acquisition port denied; sampled process-attributed TCP "
+                               "polling at a nominal 10 ms found no listeners or remote endpoints; "
+                               "shorter-lived endpoints may be missed"
                                if scenario in ("offline-reopen", "terraincore-regression",
                                                "medium-regression")
                                else "fixture-only")}
+
+
+def _picker_viewport_visual_network_findings(audit: dict, *, label: str,
+                                              expected_image: str) -> list[str]:
+    """Report the unchanged release audit result plus any extra observed endpoints."""
+    findings = []
+    try:
+        validate_development_picker_viewport_tcp_audit(
+            audit, configuration="Development", scenario="picker-viewport",
+            expected_image=expected_image, label=label)
+    except p0.Failed as error:
+        findings.append(str(error))
+
+    remotes = audit.get("remote_endpoints")
+    if isinstance(remotes, list) and remotes:
+        findings.append("Remote TCP endpoints observed: " + ", ".join(map(str, remotes)))
+
+    owners = audit.get("listener_owners")
+    if isinstance(owners, list):
+        unique = {}
+        for owner in owners:
+            if not isinstance(owner, dict):
+                findings.append("Malformed TCP listener owner was observed")
+                continue
+            local = owner.get("local")
+            identity = (owner.get("pid"), owner.get("image"), local)
+            unique[identity] = owner
+        known_trace = [owner for owner in unique.values()
+                       if _tcp_endpoint_host_port(owner.get("local"))
+                       == ("0.0.0.0", DEVELOPMENT_TRACE_LISTENER_PORT)]
+        unexpected = [owner for owner in unique.values() if owner not in known_trace]
+        if len(known_trace) > 1:
+            findings.append("More than one process owns the known 0.0.0.0:1985 Trace listener")
+        if unexpected:
+            detail = ", ".join(
+                f"{owner.get('image')}#{owner.get('pid')}@{owner.get('local')}"
+                for owner in unexpected)
+            findings.append("Unexpected or additional TCP listener(s): " + detail)
+    elif audit.get("listen_ports"):
+        findings.append("TCP listener ports were observed without owner records: "
+                        + str(audit["listen_ports"]))
+    return findings
+
+
+def picker_viewport_visual(configuration: str, source_digest: str,
+                           run_output: Path) -> dict:
+    """Capture picker visuals for diagnosis while retaining every failed release audit."""
+    if configuration != "Development":
+        raise p0.Failed("picker-viewport-visual is Development-only and cannot relax Shipping")
+    package_report, launcher = verify_package_report(configuration, source_digest)
+    data_root = (run_output / "picker-viewport-visual-data").resolve()
+    data_root.mkdir(parents=True, exist_ok=True)
+    runs = []
+    captures = []
+    network_failures = []
+    capture_failures = []
+
+    for width, height in PICKER_VIEWPORT_RESOLUTIONS:
+        token = str(uuid.uuid4())
+        child_receipt = data_root / f"{token}.receipt.json"
+        child_screenshot = data_root / f"{token}.png"
+        child_user_dir = data_root / "unreal-user" / token
+        child_user_dir.mkdir(parents=True, exist_ok=True)
+        child_command = [str(launcher), "-SkiP1PickerViewportSmoke",
+                         f"-SkiP1Token={token}", f"-SkiP1Receipt={child_receipt}",
+                         f"-SkiP1Screenshot={child_screenshot}",
+                         f"-SkiP1DataRoot={data_root}", f"-UserDir={child_user_dir}",
+                         "-windowed", "-RenderOffScreen", "-ForceRes",
+                         f"-ResX={width}", f"-ResY={height}",
+                         "-unattended", "-nosplash"]
+        label = f"picker-viewport-visual {width}x{height}"
+        run = {"resolution": [width, height], "token": token,
+               "processAttempted": True, "captureReceipt": None,
+               "processNetworkAudit": None, "processAuditError": None,
+               "networkAuditFindings": [], "captureError": None}
+
+        # allow_nonzero_exit keeps the complete process-tree audit available for the
+        # final report, even when the packaged process itself exits unsuccessfully.
+        try:
+            audit = checked_with_tcp_audit(
+                child_command, timeout=45,
+                log=f"p1-picker-viewport-visual-{width}x{height}-{token}.log",
+                include_listener_owners=True, allow_nonzero_exit=True)
+            run["processNetworkAudit"] = audit
+            findings = _picker_viewport_visual_network_findings(
+                audit, label=label, expected_image=launcher.name)
+            run["networkAuditFindings"] = findings
+            network_failures.extend({"resolution": [width, height], "finding": finding}
+                                    for finding in findings)
+            if audit.get("process_return_code") != 0:
+                capture_failures.append({
+                    "resolution": [width, height],
+                    "reason": f"Packaged process exited with code {audit.get('process_return_code')}"})
+        except Exception as error:
+            run["processAuditError"] = str(error)
+            network_failures.append({"resolution": [width, height],
+                                     "finding": f"TCP audit unavailable: {error}"})
+            capture_failures.append({"resolution": [width, height], "reason": str(error)})
+
+        # Always inspect the tokened screenshot receipt after the process attempt. A
+        # rejected network audit never short-circuits the remaining viewport captures.
+        try:
+            if not child_receipt.is_file():
+                raise p0.Failed(f"{label} omitted its tokened receipt")
+            child = json.loads(child_receipt.read_text(encoding="utf-8-sig"))
+            run["captureReceipt"] = child
+            validated = require_picker_viewport_capture(
+                child, token, width, height, child_screenshot)
+            run["captureReceipt"] = validated
+            captures.append(validated)
+        except Exception as error:
+            run["captureError"] = str(error)
+            capture_failures.append({"resolution": [width, height], "reason": str(error)})
+        runs.append(run)
+
+    visual_capture_pass = (len(runs) == len(PICKER_VIEWPORT_RESOLUTIONS)
+                           and len(captures) == len(PICKER_VIEWPORT_RESOLUTIONS)
+                           and not capture_failures)
+    network_audit_status = "FAIL" if network_failures else "PASS"
+    status = "FAIL" if network_failures or not visual_capture_pass else "DIAGNOSTIC"
+    verify_package_report(configuration, source_digest)
+    return {
+        "status": status,
+        "kind": "non_release_picker_viewport_visual_diagnostic",
+        "releaseGatePass": False,
+        "releaseAcceptanceEligible": False,
+        "releaseAcceptanceScopes": [],
+        "networkAuditStatus": network_audit_status,
+        "networkAuditFailures": network_failures,
+        "visualCapturePass": visual_capture_pass,
+        "captureFailures": capture_failures,
+        "attemptedResolutions": [list(size) for size in PICKER_VIEWPORT_RESOLUTIONS],
+        "captures": captures,
+        "runs": runs,
+        "visualReviewRequired": True,
+        "nonReleaseReason": "Diagnostic output is not an M2/M6 release acceptance receipt.",
+        "package_invocation": package_report["invocation"],
+    }
 
 
 def visual(configuration: str, source_digest: str) -> dict:
@@ -1292,12 +2268,16 @@ def visual(configuration: str, source_digest: str) -> dict:
 
 def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["freeze", "freeze-check", "doctor", "check", "domain", "build", "automation", "tiff", "acquisition", "ui", "terraincore", "p1", "assets", "package", "smoke", "visual"])
+    parser.add_argument("command", choices=["freeze", "freeze-check", "doctor", "check", "domain", "build", "automation", "automation-focused", "tiff", "acquisition", "ui", "terraincore", "p1", "assets", "package", "smoke", "picker-viewport-visual", "visual"])
     parser.add_argument("--engine-root")
+    parser.add_argument("--group", choices=tuple(FOCUSED_AUTOMATION_TESTS),
+                        help="exact registered M3/M4/M5/M6 automation filter for automation-focused")
     parser.add_argument("--configuration", choices=["Development", "Shipping"], default="Development")
     parser.add_argument("--target", choices=["Editor", "Game"], default="Editor")
-    parser.add_argument("--scenario", choices=["selector", "import", "offline-reopen", "geotiff-regression", "acquisition-regression", "ui-layout", "terraincore-regression", "medium-regression", "performance-regression"], default="import")
-    parser.add_argument("--content-id")
+    parser.add_argument("--scenario", choices=["frontend", "import", "offline-reopen", "geotiff-regression", "acquisition-regression", "ui-layout", "picker-viewport", "terraincore-regression", "medium-regression", "performance-regression"], default="import")
+    parser.add_argument("--content-id", type=parse_sha256_id)
+    parser.add_argument("--edit-set-id", type=parse_sha256_id,
+                        help="64-character lowercase editSetId from the import receipt; used by offline-reopen")
     args = parser.parse_args()
     OUTPUT.mkdir(parents=True, exist_ok=True)
     invocation = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
@@ -1344,6 +2324,10 @@ def _main() -> int:
             result = p0.native_build(environment, args.target, args.configuration)
         elif args.command == "automation":
             result = automation(environment, run_output)
+        elif args.command == "automation-focused":
+            if args.group is None:
+                parser.error("automation-focused requires --group")
+            result = focused_automation(environment, run_output, args.group)
         elif args.command == "tiff":
             result = tiff(environment, run_output)
         elif args.command == "acquisition":
@@ -1364,10 +2348,16 @@ def _main() -> int:
             if set(receipt["assets"]) != set(ASSETS):
                 raise p0.Blocked("Generate the separately owned P1 assets before packaging")
             result = p0.package(environment, args.configuration)
+            assert_no_browser_bundle(Path(result["directory"]) / "Windows")
             if args.configuration == "Shipping":
                 result["shipping_mcp_proof"] = shipping_target_module_proof()
         elif args.command == "smoke":
-            result = smoke(args.configuration, before["sha256"], args.scenario, args.content_id, run_output)
+            result = smoke(args.configuration, before["sha256"], args.scenario,
+                           args.content_id, run_output, edit_set_id=args.edit_set_id)
+        elif args.command == "picker-viewport-visual":
+            result = picker_viewport_visual(args.configuration, before["sha256"], run_output)
+            if result.get("status") == "FAIL":
+                code = 1
         else:
             result = visual(args.configuration, before["sha256"])
         after = p0.source_snapshot()
@@ -1385,7 +2375,8 @@ def _main() -> int:
     (run_output / "report.json").write_text(serialized, encoding="utf-8")
     (run_output / "source-manifest.json").write_text(
         json.dumps(before, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    latest = args.command + ("-" + args.configuration if args.command in ("package", "smoke", "visual") else "")
+    latest = args.command + ("-" + args.configuration if args.command in (
+        "package", "smoke", "picker-viewport-visual", "visual") else "")
     (OUTPUT / f"{latest}.json").write_text(serialized, encoding="utf-8")
     if args.command == "freeze":
         freeze_path.parent.mkdir(parents=True, exist_ok=True)

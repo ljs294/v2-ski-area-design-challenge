@@ -67,13 +67,13 @@ python Tools/Build/p1.py build
 python Tools/Build/p1.py automation
 python Tools/Build/p1.py assets
 python Tools/Build/p1.py package --configuration Development
-python Tools/Build/p1.py smoke --configuration Development --scenario selector
+python Tools/Build/p1.py smoke --configuration Development --scenario frontend
 python Tools/Build/p1.py smoke --configuration Development --scenario import
-python Tools/Build/p1.py smoke --configuration Development --scenario offline-reopen --content-id <content-id-from-import-receipt>
+python Tools/Build/p1.py smoke --configuration Development --scenario offline-reopen --content-id <content-id-from-import-receipt> --edit-set-id <edit-set-id-from-import-receipt>
 python Tools/Build/p1.py package --configuration Shipping
-python Tools/Build/p1.py smoke --configuration Shipping --scenario selector
+python Tools/Build/p1.py smoke --configuration Shipping --scenario frontend
 python Tools/Build/p1.py smoke --configuration Shipping --scenario import
-python Tools/Build/p1.py smoke --configuration Shipping --scenario offline-reopen --content-id <content-id-from-import-receipt>
+python Tools/Build/p1.py smoke --configuration Shipping --scenario offline-reopen --content-id <content-id-from-import-receipt> --edit-set-id <edit-set-id-from-import-receipt>
 python Tools/Build/p1.py smoke --configuration Shipping --scenario terraincore-regression
 ```
 

@@ -110,6 +110,83 @@ bool BuildCircularTerrainCoreEdit(const SkiDomain::TerrainCoreManifest& Metadata
 }
 }
 
+bool SkiTerrainRuntime::TrySampleTerrainCorePhotoVertexColor(
+    const FSkiTerrainPhotoTile* PhotoTile, const uint64 ExpectedGeneration,
+    const SkiApplication::TerrainCoreTileKey& ExpectedKey,
+    const double TileLocalU, const double TileLocalV,
+    FVector3f& OutLinearColor) noexcept
+{
+    constexpr uint64 ExpectedPixelCount =
+        static_cast<uint64>(TerrainCorePhotoTileSide) * TerrainCorePhotoTileSide;
+    if (!PhotoTile || PhotoTile->Generation != ExpectedGeneration
+        || PhotoTile->Key.Lod != ExpectedKey.Lod || PhotoTile->Key.X != ExpectedKey.X
+        || PhotoTile->Key.Y != ExpectedKey.Y
+        || PhotoTile->BgraPixels.Num() != static_cast<int32>(ExpectedPixelCount)
+        || !FMath::IsFinite(TileLocalU) || !FMath::IsFinite(TileLocalV)
+        || TileLocalU < 0.0 || TileLocalU > 1.0
+        || TileLocalV < 0.0 || TileLocalV > 1.0)
+    {
+        return false;
+    }
+
+    const double PixelX = TileLocalU * (TerrainCorePhotoTileSide - 1U);
+    const double PixelY = TileLocalV * (TerrainCorePhotoTileSide - 1U);
+    const uint32 X0 = static_cast<uint32>(FMath::FloorToInt(PixelX));
+    const uint32 Y0 = static_cast<uint32>(FMath::FloorToInt(PixelY));
+    const uint32 X1 = FMath::Min(X0 + 1U, TerrainCorePhotoTileSide - 1U);
+    const uint32 Y1 = FMath::Min(Y0 + 1U, TerrainCorePhotoTileSide - 1U);
+    const float BlendX = static_cast<float>(PixelX - X0);
+    const float BlendY = static_cast<float>(PixelY - Y0);
+    const auto DecodeLinear = [PhotoTile](const uint32 X, const uint32 Y)
+    {
+        const uint32 Index = Y * TerrainCorePhotoTileSide + X;
+        return FLinearColor::FromSRGBColor(PhotoTile->BgraPixels[Index]);
+    };
+    const FLinearColor C00 = DecodeLinear(X0, Y0);
+    const FLinearColor C10 = DecodeLinear(X1, Y0);
+    const FLinearColor C01 = DecodeLinear(X0, Y1);
+    const FLinearColor C11 = DecodeLinear(X1, Y1);
+    const auto Bilinear = [BlendX, BlendY](const float V00, const float V10,
+        const float V01, const float V11)
+    {
+        const float North = FMath::Lerp(V00, V10, BlendX);
+        const float South = FMath::Lerp(V01, V11, BlendX);
+        return FMath::Lerp(North, South, BlendY);
+    };
+    const FVector3f Sample(Bilinear(C00.R, C10.R, C01.R, C11.R),
+        Bilinear(C00.G, C10.G, C01.G, C11.G),
+        Bilinear(C00.B, C10.B, C01.B, C11.B));
+    if (!FMath::IsFinite(Sample.X) || !FMath::IsFinite(Sample.Y)
+        || !FMath::IsFinite(Sample.Z))
+    {
+        return false;
+    }
+    OutLinearColor = Sample;
+    return true;
+}
+
+const TCHAR* SkiTerrainRuntime::TerrainMaterialAssetPathForMode(
+    const ESkiTerrainViewMode Mode, const FName LightingPreset) noexcept
+{
+    if (Mode == ESkiTerrainViewMode::Photo)
+    {
+        return TEXT("/Game/P1Generated/M_Photo.M_Photo");
+    }
+    if (Mode != ESkiTerrainViewMode::Presentation)
+    {
+        return TEXT("/Game/P1Generated/M_Overlay.M_Overlay");
+    }
+    if (LightingPreset == TEXT("LowAngle"))
+    {
+        return TEXT("/Game/P1Generated/M_Terrain_LowAngle.M_Terrain_LowAngle");
+    }
+    if (LightingPreset == TEXT("Overcast"))
+    {
+        return TEXT("/Game/P1Generated/M_Terrain_Overcast.M_Terrain_Overcast");
+    }
+    return TEXT("/Game/P1Generated/M_Terrain_ClearMidday.M_Terrain_ClearMidday");
+}
+
 ASkiTerrainActor::ASkiTerrainActor()
 {
     PrimaryActorTick.bCanEverTick = true;
@@ -211,6 +288,7 @@ void ASkiTerrainActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
     CoreMeshBuildsInFlight.Reset();
     CoreFailedMeshKeys.Reset();
     CoreDesiredKeys.Reset();
+    ClearTerrainCorePhotoTiles();
     CoreCache.Reset();
     CoreSession.Reset();
     CoreBaseRepository.reset();
@@ -230,6 +308,7 @@ void ASkiTerrainActor::SetTerrainSession(TSharedPtr<SkiApplication::TerrainSessi
     CoreCache.Reset();
     CoreSession.Reset();
     CoreCacheGeneration = 0;
+    ClearTerrainCorePhotoTiles();
     CoreBaseRepository.reset();
     CoreEdits = {};
     CoreLodController.Reset();
@@ -252,6 +331,26 @@ void ASkiTerrainActor::ClearTiles()
     Tiles.Reset();
     TileKeys.Reset();
     CoreRenderedKeys.Reset();
+}
+
+void ASkiTerrainActor::ClearTerrainCorePhotoTiles(const uint64 Generation)
+{
+    PresentedPhotoTiles.Reset();
+    PhotoTilesGeneration = Generation;
+}
+
+void ASkiTerrainActor::PruneTerrainCorePhotoTiles(const uint64 Generation,
+    const TSet<uint64>& DesiredKeys)
+{
+    if (PhotoTilesGeneration != Generation)
+    {
+        ClearTerrainCorePhotoTiles(Generation);
+        return;
+    }
+    for (auto It = PresentedPhotoTiles.CreateIterator(); It; ++It)
+    {
+        if (!DesiredKeys.Contains(It.Key())) It.RemoveCurrent();
+    }
 }
 
 bool ASkiTerrainActor::PresentTerrainCore(
@@ -292,6 +391,7 @@ bool ASkiTerrainActor::BeginTerrainCoreStreaming(
     bTerrainCoreAutoLod = true;
     CoreAutoLodElapsedSeconds = 0.0F;
     CoreCacheGeneration = Snapshot.Generation;
+    ClearTerrainCorePhotoTiles(Snapshot.Generation);
     CoreDesiredKeys = MoveTemp(Desired);
     CoreMeshBuildsInFlight.Reset();
     CoreFailedMeshKeys.Reset();
@@ -306,6 +406,135 @@ bool ASkiTerrainActor::BeginTerrainCoreStreaming(
     SteepestLocalBounds = FBox(ForceInit);
     bCoreBoundsHaveSamples = false;
     bCoreReadyNotified = false;
+    return true;
+}
+
+bool ASkiTerrainActor::SetTerrainCorePhotoTile(const uint64 ExpectedGeneration,
+    const SkiApplication::TerrainCoreTileKey& Key, TArray<FColor> BgraPixels)
+{
+    if (!IsInGameThread() || !CoreSession || !CoreCache
+        || BgraPixels.Num() != static_cast<int32>(
+            SkiTerrainRuntime::TerrainCorePhotoTileSide
+                * SkiTerrainRuntime::TerrainCorePhotoTileSide))
+    {
+        return false;
+    }
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    if (!Snapshot.CanonicalReady() || Snapshot.Generation != ExpectedGeneration
+        || ExpectedGeneration != CoreCacheGeneration
+        || PhotoTilesGeneration != ExpectedGeneration)
+    {
+        return false;
+    }
+
+    const bool bDesired = Algo::AnyOf(CoreDesiredKeys,
+        [&Key](const SkiApplication::TerrainCoreTileKey& Desired)
+        {
+            return Desired.Lod == Key.Lod && Desired.X == Key.X && Desired.Y == Key.Y;
+        });
+    const bool bExists = Algo::AnyOf(Snapshot.Metadata->Tiles,
+        [&Key](const SkiDomain::TerrainCoreTileDescriptor& Tile)
+        {
+            return Tile.LodIndex == Key.Lod && Tile.TileX == Key.X && Tile.TileY == Key.Y;
+        });
+    if (!bDesired || !bExists) return false;
+
+    SkiTerrainRuntime::FSkiTerrainPhotoTile PhotoTile;
+    PhotoTile.Generation = ExpectedGeneration;
+    PhotoTile.Key = Key;
+    PhotoTile.BgraPixels = MoveTemp(BgraPixels);
+    const uint64 EncodedKey = TerrainCoreRenderKey(Key);
+    PresentedPhotoTiles.Add(EncodedKey, MoveTemp(PhotoTile));
+    // The cache is pruned whenever the desired streamed selection changes, so this
+    // map retains only current-view tiles (at most the existing 256-tile view cap).
+    if (CurrentViewMode == ESkiTerrainViewMode::Photo
+        && CoreRenderedKeys.Contains(EncodedKey))
+    {
+        RebuildPresentedTerrainCorePhotoTile(Key);
+    }
+    return true;
+}
+
+bool ASkiTerrainActor::GetTerrainCorePhotoRequestSnapshot(uint64& OutGeneration,
+    TArray<SkiApplication::TerrainCoreTileKey>& OutDesiredKeys) const
+{
+    OutGeneration = 0;
+    OutDesiredKeys.Reset();
+    constexpr int32 MaximumPhotoRequestTiles = 256;
+    if (!IsInGameThread() || CurrentViewMode != ESkiTerrainViewMode::Photo
+        || !CoreSession || !CoreCache || CoreDesiredKeys.IsEmpty()
+        || CoreDesiredKeys.Num() > MaximumPhotoRequestTiles)
+    {
+        return false;
+    }
+
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    if (!Snapshot.CanonicalReady() || Snapshot.Generation != CoreCacheGeneration
+        || Snapshot.Generation != PhotoTilesGeneration)
+    {
+        return false;
+    }
+
+    for (const SkiApplication::TerrainCoreTileKey& Key : CoreDesiredKeys)
+    {
+        const bool bExists = Algo::AnyOf(Snapshot.Metadata->Tiles,
+            [&Key](const SkiDomain::TerrainCoreTileDescriptor& Tile)
+            {
+                return Tile.LodIndex == Key.Lod && Tile.TileX == Key.X && Tile.TileY == Key.Y;
+            });
+        if (!bExists) return false;
+    }
+
+    OutGeneration = Snapshot.Generation;
+    OutDesiredKeys = CoreDesiredKeys;
+    return true;
+}
+
+bool ASkiTerrainActor::RebuildPresentedTerrainCorePhotoTile(
+    const SkiApplication::TerrainCoreTileKey& Key)
+{
+    if (!IsInGameThread() || CurrentViewMode != ESkiTerrainViewMode::Photo
+        || !CoreSession || !CoreCache)
+    {
+        return false;
+    }
+    const uint64 EncodedKey = TerrainCoreRenderKey(Key);
+    if (!CoreRenderedKeys.Contains(EncodedKey)) return true;
+    const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+    if (!Snapshot.CanonicalReady() || Snapshot.Generation != CoreCacheGeneration
+        || Snapshot.Generation != PhotoTilesGeneration
+        || Snapshot.Revisions.Canonical != PresentedRevision)
+    {
+        return false;
+    }
+    const std::shared_ptr<const SkiApplication::TerrainCoreTilePayload> Payload =
+        CoreCache->FindResident(Key);
+    if (!Payload) return false;
+    SkiDomain::TerrainTileMesh Mesh;
+    if (!SkiTerrainRuntime::BuildTerrainCoreTileMesh(*Payload, *Snapshot.Metadata,
+            Snapshot.Revisions.Canonical, true, 25.0, Mesh))
+    {
+        return false;
+    }
+    if (Mesh.Indices.empty()) return true;
+    if (!CreateTileComponent(Mesh, PresentedOriginHeightM)) return false;
+
+    // Install the new component before dropping its prior version. The exact tile
+    // key preserves neighboring and mixed-LOD meshes during a streamed update.
+    UDynamicMeshComponent* Replacement = Tiles.Last();
+    for (int32 Index = Tiles.Num() - 2; Index >= 0; --Index)
+    {
+        const SkiDomain::TileKey& ExistingKey = TileKeys[Index];
+        if (Tiles[Index] == Replacement || ExistingKey.X != Key.X
+            || ExistingKey.Y != Key.Y || ExistingKey.Lod != Key.Lod)
+        {
+            continue;
+        }
+        if (Tiles[Index]) Tiles[Index]->DestroyComponent();
+        Tiles.RemoveAt(Index);
+        TileKeys.RemoveAt(Index);
+    }
+    SetLightingPreset(CurrentLightingPreset);
     return true;
 }
 
@@ -358,6 +587,7 @@ bool ASkiTerrainActor::PresentTerrainCoreLod(const uint8 Lod,
     {
         CoreCache->ResetGeneration(Snapshot.Generation, Snapshot.Repository);
         CoreCacheGeneration = Snapshot.Generation;
+        ClearTerrainCorePhotoTiles(Snapshot.Generation);
     }
 
     TArray<SkiApplication::TerrainCoreTileKey> Requested;
@@ -373,6 +603,12 @@ bool ASkiTerrainActor::PresentTerrainCoreLod(const uint8 Lod,
     // than constructing an unbounded whole-mountain mesh.
     constexpr int32 MaximumFullViewTiles = 256;
     if (Requested.IsEmpty() || Requested.Num() > MaximumFullViewTiles) return false;
+    TSet<uint64> RequestedPhotoKeys;
+    for (const SkiApplication::TerrainCoreTileKey& Key : Requested)
+    {
+        RequestedPhotoKeys.Add(TerrainCoreRenderKey(Key));
+    }
+    PruneTerrainCorePhotoTiles(Snapshot.Generation, RequestedPhotoKeys);
     // This blocking path is reserved for deterministic regression/support calls. Build
     // the complete replacement transactionally; product UI selections stream via Tick.
     ++CorePresentationSerial;
@@ -531,7 +767,7 @@ bool ASkiTerrainActor::ApplyTerrainCoreSelection(
 {
     if (!CoreSession || !CoreCache || Desired.IsEmpty() || Desired.Num() > 256) return false;
     const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
-    if (!Snapshot.CanonicalReady()) return false;
+    if (!Snapshot.CanonicalReady() || Snapshot.Generation != CoreCacheGeneration) return false;
     TSet<uint64> DesiredSet;
     for (const SkiApplication::TerrainCoreTileKey& Key : Desired)
     {
@@ -543,6 +779,7 @@ bool ASkiTerrainActor::ApplyTerrainCoreSelection(
         if (!bExists || DesiredSet.Contains(TerrainCoreRenderKey(Key))) return false;
         DesiredSet.Add(TerrainCoreRenderKey(Key));
     }
+    PruneTerrainCorePhotoTiles(Snapshot.Generation, DesiredSet);
     const bool bUnchanged = Desired.Num() == CoreDesiredKeys.Num()
         && Algo::AllOf(Desired, [this](const SkiApplication::TerrainCoreTileKey& Key)
         {
@@ -824,6 +1061,37 @@ bool ASkiTerrainActor::CreateTileComponent(const SkiDomain::TerrainTileMesh& Sou
     RenderColors.Reserve(static_cast<int32>(SourceMesh.Vertices.size()));
     SkiDomain::LocalFrame CoverFrame;
     bool bHaveCoverFrame = false;
+    const SkiTerrainRuntime::FSkiTerrainPhotoTile* PhotoTile = nullptr;
+    double PhotoMinU = TNumericLimits<double>::Max();
+    double PhotoMaxU = TNumericLimits<double>::Lowest();
+    double PhotoMinV = TNumericLimits<double>::Max();
+    double PhotoMaxV = TNumericLimits<double>::Lowest();
+    bool bHavePhotoUvBounds = false;
+    if (CurrentViewMode == ESkiTerrainViewMode::Photo && CoreSession
+        && PhotoTilesGeneration == CoreCacheGeneration)
+    {
+        const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
+        if (Snapshot.CanonicalReady() && Snapshot.Generation == PhotoTilesGeneration)
+        {
+            const SkiApplication::TerrainCoreTileKey Key{
+                SourceMesh.Key.Lod, SourceMesh.Key.X, SourceMesh.Key.Y};
+            PhotoTile = PresentedPhotoTiles.Find(TerrainCoreRenderKey(Key));
+            if (PhotoTile)
+            {
+                for (const SkiDomain::TerrainVertex& Vertex : SourceMesh.Vertices)
+                {
+                    if (!FMath::IsFinite(Vertex.U) || !FMath::IsFinite(Vertex.V)) continue;
+                    PhotoMinU = FMath::Min(PhotoMinU, static_cast<double>(Vertex.U));
+                    PhotoMaxU = FMath::Max(PhotoMaxU, static_cast<double>(Vertex.U));
+                    PhotoMinV = FMath::Min(PhotoMinV, static_cast<double>(Vertex.V));
+                    PhotoMaxV = FMath::Max(PhotoMaxV, static_cast<double>(Vertex.V));
+                    bHavePhotoUvBounds = true;
+                }
+                bHavePhotoUvBounds = bHavePhotoUvBounds
+                    && PhotoMaxU > PhotoMinU && PhotoMaxV > PhotoMinV;
+            }
+        }
+    }
     if (bPresentedCoverGeographic && CoreSession)
     {
         const SkiApplication::TerrainCoreSnapshot Snapshot = CoreSession->Snapshot();
@@ -862,6 +1130,20 @@ bool ASkiTerrainActor::CreateTileComponent(const SkiDomain::TerrainTileMesh& Sou
             const uint32 Hue = (SourceMesh.Key.X * 37U + SourceMesh.Key.Y * 67U + SourceMesh.Key.Lod * 101U) % 255U;
             const FLinearColor Hsv = FLinearColor::MakeFromHSV8(static_cast<uint8>(Hue), 210, 235);
             Color = FVector3f(Hsv.R, Hsv.G, Hsv.B);
+        }
+        else if (CurrentViewMode == ESkiTerrainViewMode::Photo)
+        {
+            if (PhotoTile && bHavePhotoUvBounds)
+            {
+                const double TileLocalU = (static_cast<double>(Vertex.U) - PhotoMinU)
+                    / (PhotoMaxU - PhotoMinU);
+                const double TileLocalV = (static_cast<double>(Vertex.V) - PhotoMinV)
+                    / (PhotoMaxV - PhotoMinV);
+                const SkiApplication::TerrainCoreTileKey Key{
+                    SourceMesh.Key.Lod, SourceMesh.Key.X, SourceMesh.Key.Y};
+                SkiTerrainRuntime::TrySampleTerrainCorePhotoVertexColor(PhotoTile,
+                    PhotoTilesGeneration, Key, TileLocalU, TileLocalV, Color);
+            }
         }
         else if (PresentedCover && bPresentedCoverGeographic && PresentedCoverValidity
             && bHaveCoverFrame)
@@ -942,6 +1224,7 @@ bool ASkiTerrainActor::Present(const SkiApplication::TerrainSnapshot& Snapshot, 
     CoreCache.Reset();
     CoreSession.Reset();
     CoreCacheGeneration = 0;
+    ClearTerrainCorePhotoTiles();
     CoreDesiredKeys.Reset();
     CoreMeshBuildsInFlight.Reset();
     CoreFailedMeshKeys.Reset();
@@ -1370,6 +1653,7 @@ bool ASkiTerrainActor::ApplyScratchMutation(const FVector2D& CenterEastNorthM,
         CoreEdits = *CumulativeEdits;
         CoreCache->ResetGeneration(Published.Generation, Published.Repository);
         CoreCacheGeneration = Published.Generation;
+        ClearTerrainCorePhotoTiles(Published.Generation);
         PresentedRevision = Published.Revisions.Canonical;
         return PresentTerrainCoreLod(PresentedLod, 30.0);
     }
@@ -1453,6 +1737,7 @@ void ASkiTerrainActor::ApplyScratchMutationAsync(const FVector2D& CenterEastNort
                         WeakThis->CoreCache->ResetGeneration(Published.Generation,
                             Published.Repository);
                         WeakThis->CoreCacheGeneration = Published.Generation;
+                        WeakThis->ClearTerrainCorePhotoTiles(Published.Generation);
                         WeakThis->PresentedRevision = Published.Revisions.Canonical;
                         ++WeakThis->CorePresentationSerial;
                         WeakThis->CoreMeshBuildsInFlight.Reset();
@@ -1831,13 +2116,8 @@ void ASkiTerrainActor::SetLightingPreset(const FName Preset)
     CurrentLightingPreset = Preset;
     Tags.RemoveAll([](const FName Tag) { return Tag.ToString().StartsWith(TEXT("Lighting:")); });
     Tags.Add(FName(*FString::Printf(TEXT("Lighting:%s"), *Preset.ToString())));
-    const TCHAR* AssetPath = CurrentViewMode != ESkiTerrainViewMode::Presentation
-        ? TEXT("/Game/P1Generated/M_Overlay.M_Overlay")
-        : Preset == TEXT("LowAngle")
-        ? TEXT("/Game/P1Generated/M_Terrain_LowAngle.M_Terrain_LowAngle")
-        : Preset == TEXT("Overcast")
-            ? TEXT("/Game/P1Generated/M_Terrain_Overcast.M_Terrain_Overcast")
-            : TEXT("/Game/P1Generated/M_Terrain_ClearMidday.M_Terrain_ClearMidday");
+    const TCHAR* AssetPath = SkiTerrainRuntime::TerrainMaterialAssetPathForMode(
+        CurrentViewMode, Preset);
     if (UMaterialInterface* Material = LoadObject<UMaterialInterface>(nullptr, AssetPath))
     {
         for (UDynamicMeshComponent* Tile : Tiles) if (Tile) Tile->SetMaterial(0, Material);

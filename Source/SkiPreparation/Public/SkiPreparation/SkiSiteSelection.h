@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "SkiDomain/SiteSelection.h"
 
 namespace SkiPreparation
 {
@@ -8,13 +9,7 @@ namespace SkiPreparation
 SKIPREPARATION_API bool ValidateResortName(const FString& Candidate,
     FString& OutTrimmedName, FString& OutError);
 
-struct SKIPREPARATION_API SiteRectangleM
-{
-    double WestM = 0.0;
-    double SouthM = 0.0;
-    double EastM = 0.0;
-    double NorthM = 0.0;
-};
+using SiteRectangleM = SkiDomain::SiteRectangleM;
 
 enum class SiteCoverage : uint8
 {

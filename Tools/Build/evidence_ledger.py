@@ -14,11 +14,13 @@ import xml.etree.ElementTree as ET
 INVOCATION = re.compile(r"^[0-9]{8}T[0-9]{6}\.[0-9]{6}Z-[0-9a-f]{8}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 TERRAINCORE_CTESTS = (
-    "SkiDomain.CoverEcology", "SkiDomain.Revision", "SkiDomain.Terrain",
-    "SkiDomain.TerrainCore")
+    "SkiDomain.CoverEcology", "SkiDomain.ElevationSources",
+    "SkiDomain.PlaceCoordinates", "SkiDomain.Revision",
+    "SkiDomain.SiteSelection", "SkiDomain.Terrain",
+    "SkiDomain.TerrainCore", "SkiDomain.TerrainQuality")
 FORBIDDEN_SHIPPING_PLUGINS = {
     "modelcontextprotocol", "editortoolset", "automationtesttoolset",
-    "slateinspectortoolset", "umgtoolset"}
+    "slateinspectortoolset", "umgtoolset", "webbrowserwidget"}
 
 
 class EvidenceError(RuntimeError):
